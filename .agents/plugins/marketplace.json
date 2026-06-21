@@ -1,0 +1,20 @@
+{
+  "name": "e-comet-skills",
+  "interface": {
+    "displayName": "e-Comet Skills"
+  },
+  "plugins": [
+    {
+      "name": "e-comet-skills",
+      "source": {
+        "source": "local",
+        "path": "./plugins/e-comet-skills"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

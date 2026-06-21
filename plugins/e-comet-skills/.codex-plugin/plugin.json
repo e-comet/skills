@@ -1,0 +1,36 @@
+{
+  "name": "e-comet-skills",
+  "version": "2026.6.1",
+  "description": "Public WB and e-Comet agent skills with deterministic helper scripts.",
+  "author": {
+    "name": "e-Comet",
+    "url": "https://e-comet.io/"
+  },
+  "homepage": "https://github.com/e-comet/skills",
+  "repository": "https://github.com/e-comet/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "agent-skills",
+    "wildberries",
+    "wb",
+    "e-comet"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "e-Comet Skills",
+    "shortDescription": "WB and e-Comet agent skills",
+    "longDescription": "Public WB and e-Comet agent skills with deterministic helper scripts for operational workflows.",
+    "developerName": "e-Comet",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive"
+    ],
+    "websiteURL": "https://e-comet.io/",
+    "defaultPrompt": [
+      "Find WB image URLs for product IDs"
+    ],
+    "brandColor": "#0F766E",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/logo.png"
+  }
+}
