@@ -1,14 +1,14 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "e-comet-skills",
-  "description": "Public WB and e-Comet agent skills with deterministic helper scripts.",
+  "description": "Public WB and e-Comet agent skills with helper scripts.",
   "owner": {
     "name": "e-Comet"
   },
   "plugins": [
     {
       "name": "e-comet-skills",
-      "description": "Public WB and e-Comet agent skills with deterministic helper scripts.",
+      "description": "Public WB and e-Comet agent skills with helper scripts.",
       "source": "./plugins/e-comet-skills",
       "category": "developer-tools"
     }

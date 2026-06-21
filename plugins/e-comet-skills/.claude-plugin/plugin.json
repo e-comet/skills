@@ -1,7 +1,7 @@
 {
   "name": "e-comet-skills",
   "displayName": "e-Comet Skills",
-  "description": "Public WB and e-Comet agent skills with deterministic helper scripts.",
+  "description": "Public WB and e-Comet agent skills with helper scripts.",
   "repository": "https://github.com/e-comet/skills",
   "license": "Apache-2.0"
 }

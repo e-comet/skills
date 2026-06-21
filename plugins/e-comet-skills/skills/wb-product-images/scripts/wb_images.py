@@ -16,12 +16,14 @@ from typing import Any
 WB_ARTICLE_RE = re.compile(r"^\d{5,10}$")
 TOKEN_SPLIT_RE = re.compile(r"[\s,;]+")
 DEFAULT_MAX_PHOTOS = 15
-DEFAULT_MAX_BASKET = 40
+DEFAULT_MAX_BASKET = 60
 DEFAULT_TIMEOUT_SECONDS = 5.0
 DEFAULT_WORKERS = 8
 BASKET_BATCH_SIZE = 15
 HTTP_USER_AGENT = "e-comet-agent-skills/wb-product-images"
 
+# Mirrors the app's `misc/wb_baskets` media ranges. Keep this as a fast fallback
+# for standalone use; `--basket-config` can supply the live app mapping.
 BASKET_VOLUME_UPPER_BOUNDS = [
     143,
     287,
@@ -48,20 +50,27 @@ BASKET_VOLUME_UPPER_BOUNDS = [
     4133,
     4349,
     4565,
-    4781,
-    4997,
-    5213,
-    5429,
-    5645,
-    5861,
-    6077,
-    6293,
-    6509,
-    6725,
-    6941,
-    7157,
+    4877,
+    5189,
+    5501,
+    5813,
+    6125,
+    6437,
+    6749,
+    7061,
     7373,
-    7589,
+    7685,
+    7997,
+    8309,
+    8741,
+    9173,
+    9605,
+    10373,
+    11141,
+    11909,
+    12677,
+    13445,
+    14213,
 ]
 
 
@@ -214,7 +223,15 @@ def basket_number_for_volume(volume: int) -> int:
         if volume <= upper_bound:
             return basket_number
 
-    return 40
+    return len(BASKET_VOLUME_UPPER_BOUNDS) + 1
+
+
+def fallback_basket_numbers(volume: int, max_basket: int) -> tuple[int, ...]:
+    first_future_basket = len(BASKET_VOLUME_UPPER_BOUNDS) + 1
+    if volume > BASKET_VOLUME_UPPER_BOUNDS[-1] and first_future_basket <= max_basket:
+        return tuple(range(first_future_basket, max_basket + 1)) + tuple(range(1, first_future_basket))
+
+    return tuple(range(1, max_basket + 1))
 
 
 def basket_host(basket_number: int) -> str:
@@ -323,8 +340,9 @@ def find_working_base_url(
         if found:
             return found
 
-    for start in range(1, max_basket + 1, BASKET_BATCH_SIZE):
-        basket_numbers = list(range(start, min(start + BASKET_BATCH_SIZE, max_basket + 1)))
+    fallback_numbers = fallback_basket_numbers(volume, max_basket)
+    for start in range(0, len(fallback_numbers), BASKET_BATCH_SIZE):
+        basket_numbers = fallback_numbers[start : start + BASKET_BATCH_SIZE]
         probe_items = []
 
         for basket_number in basket_numbers:

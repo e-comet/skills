@@ -2,10 +2,10 @@
 name: wb-product-images
 id: wb-product-images
 title: Фото товаров WB
-description: "Находит живые URL фото товаров Wildberries по артикулам WB, product_id, nm_id, nmId или SKU и группирует ссылки по артикулу. Используйте, когда пользователь просит картинки WB, фото артикула, URL фото по nm_id, ссылки на фото SKU или пакетную выгрузку ссылок на фото Wildberries."
+description: "Находит URL фото товаров Wildberries по артикулам WB. Используйте, когда пользователь просит картинки WB, фото артикула, URL фото по nm_id, ссылки на фото SKU или пакетную выгрузку ссылок на фото товаров Вайлдберриз."
 skill_schema_version: 1
 introduced_in: "2026.6.0"
-updated_in: "2026.6.1"
+updated_in: "2026.6.2"
 status: stable
 ---
 
@@ -46,11 +46,12 @@ python3 plugins/e-comet-skills/skills/wb-product-images/scripts/wb_images.py --i
 ## Опции
 
 - `--max-photos N`: проверить номера фото `1..N`; по умолчанию `15`.
-- `--max-basket N`: проверить корзины от `basket-01` до `basket-N`; по умолчанию `40`.
+- `--max-basket N`: проверить корзины от `basket-01` до `basket-N`; по умолчанию `60`.
 - `--size big|tm`: выбрать размер фото WB; по умолчанию `big`.
 - `--format json|markdown`: выбрать формат вывода; по умолчанию `json`.
 - `--basket-config PATH`: необязательный JSON в формате ответа `misc/wb_baskets` из приложения. Если он передан,
-  медиа-хост для volume артикула проверяется перед общим fallback-поиском по корзинам.
+  медиа-хост для volume артикула проверяется перед общим fallback-поиском по корзинам. Без конфига скрипт использует
+  встроенную карту media-корзин и проверяет дополнительные корзины на случай новых диапазонов WB.
 
 ## Как отвечать пользователю
 

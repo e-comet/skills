@@ -10,45 +10,23 @@
 
 ### Claude Cowork
 
-В Claude Desktop откройте `Cowork`, затем:
-
-1. Перейдите в `Customize`.
-2. Откройте `Plugins`.
-3. Нажмите `+` или `Add marketplace`.
-4. Выберите установку marketplace из GitHub-репозитория.
-5. Вставьте URL: `https://github.com/e-comet/skills`.
-6. Откройте marketplace `e-comet-skills`.
-7. Установите плагин `e-Comet Skills`.
-
-Важно: для работы с Wildberries включите сетевой доступ:
-
-```text
-Settings > Capabilities > Allow network egress > Domain allowlist > All domains
-```
-
-Без этого скиллы не смогут обращаться к сайту Wildberries и CDN-ресурсам WB. Если настройка управляется организацией,
-попросите администратора включить ее для вашей команды.
+1. Профиль > `Settings` > `Capabilities` > Вкл. `Allow network egress` > `Domain allowlist` > `All domains`
+2. `Customize` на панели слева > `Plugins` > `Add` > `Add marketplace`
+3. `Add from repository` > поле URL: `https://github.com/e-comet/skills` > `Sync`
+4. Откройте marketplace `e-comet-skills` > установите плагин `e-Comet Skills`
 
 ### Codex Desktop
 
-В Codex Desktop откройте каталог плагинов, затем:
-
-1. Добавьте marketplace из GitHub URL: `https://github.com/e-comet/skills`.
-2. Выберите marketplace `e-comet-skills`.
-3. Установите плагин `e-Comet Skills`.
-4. Начните новый тред, чтобы Codex загрузил установленные скиллы.
-
-Если в вашей версии Codex Desktop нет кнопки добавления marketplace, добавьте его один раз через CLI:
-
-```bash
-codex plugin marketplace add e-comet/skills --ref main
-```
-
-После этого установите `e-Comet Skills` из каталога плагинов в Codex Desktop.
+1. `Settings` на панели слева > `Settings` > `Configuration` > Вкл. `Allow network access`
+2. `Plugins` на панели слева > `+` в правом верхнем углу > `Add marketplace`
+3. Поле `Source`: `https://github.com/e-comet/skills` > `Add marketplace`
+4. `Personal` > `e-Comet Skills` > `Add`
 
 ## Список скиллов
 
-wb-product-images - получение URL фото артикулов ВБ
+**wb-product-images** - получение URL фото артикулов ВБ
+> Сделай HTML галерею фото артикулов ВБ 791050753 и 913357757: строка на артикул, клик открывает полный размер, стрелки переключают фото.
+
 
 ## Ошибки / не работает скилл?
 

@@ -1,7 +1,7 @@
 {
   "name": "e-comet-skills",
-  "version": "2026.6.1",
-  "description": "Public WB and e-Comet agent skills with deterministic helper scripts.",
+  "version": "2026.6.2",
+  "description": "Public WB and e-Comet agent skills with helper scripts.",
   "author": {
     "name": "e-Comet",
     "url": "https://e-comet.io/"
@@ -19,7 +19,7 @@
   "interface": {
     "displayName": "e-Comet Skills",
     "shortDescription": "WB and e-Comet agent skills",
-    "longDescription": "Public WB and e-Comet agent skills with deterministic helper scripts for operational workflows.",
+    "longDescription": "Public WB and e-Comet agent skills with helper scripts.",
     "developerName": "e-Comet",
     "category": "Developer Tools",
     "capabilities": [

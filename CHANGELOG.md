@@ -1,5 +1,18 @@
 # Changelog
 
+## [2026.6.2] - 2026-06-21
+
+### Breaking changes
+- None.
+
+### Fixed
+- Updated `wb-product-images` media basket fallback ranges through `basket-46` so high product IDs resolve to the
+  current WB image CDN host.
+- Added bounded probing beyond the known media ranges for future WB basket growth.
+
+### Changed
+- Clarified public install instructions and plugin descriptions.
+
 ## [2026.6.1] - 2026-06-21
 
 ### Breaking changes

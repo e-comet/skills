@@ -1,4 +1,4 @@
 interface:
   display_name: "WB Product Images"
-  short_description: "Resolve live WB image URLs by product_id, nm_id, or SKU"
-  default_prompt: "Find WB image URLs for product IDs 123456 and 12345678"
+  short_description: "Find WB image URLs by SKU"
+  default_prompt: "Find images for WB products 123456 and 12345678"
