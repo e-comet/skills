@@ -1,4 +1,4 @@
 interface:
   display_name: "WB Search Positions"
   short_description: "Live WB search results and article positions"
-  default_prompt: "Find WB article 503093790 position for query 'ковролин'"
+  default_prompt: "Find WB article 791050753 position for query 'тушенка'"

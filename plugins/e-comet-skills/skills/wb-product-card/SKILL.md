@@ -31,7 +31,7 @@ status: experimental
 1. Вызовите MCP tool `browser_job`:
 
    ```json
-   { "job_type": "product_card", "articles": [503093790, 207597124] }
+   { "job_type": "product_card", "articles": [791050753, 913357757] }
    ```
 
    До 50 артикулов, дубликаты схлопываются. Ответ: `trigger_url`, `job_ids` (один родительский

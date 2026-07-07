@@ -1,4 +1,4 @@
 interface:
   display_name: "WB Product Card"
   short_description: "Live WB product card: price, rating, stock"
-  default_prompt: "Show WB stock by warehouse for article 503093790"
+  default_prompt: "Show WB stock by warehouse for article 791050753"
