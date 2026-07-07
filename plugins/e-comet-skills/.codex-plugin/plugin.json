@@ -1,6 +1,6 @@
 {
   "name": "e-comet-skills",
-  "version": "2026.6.2",
+  "version": "2026.7.0",
   "description": "Public WB and e-Comet agent skills with helper scripts.",
   "author": {
     "name": "e-Comet",
@@ -16,6 +16,7 @@
     "e-comet"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "e-Comet Skills",
     "shortDescription": "WB and e-Comet agent skills",
@@ -27,7 +28,9 @@
     ],
     "websiteURL": "https://e-comet.io/",
     "defaultPrompt": [
-      "Find WB image URLs for product IDs"
+      "Find WB image URLs for product IDs",
+      "Show WB stock by warehouse for an article",
+      "Find my WB article position in search"
     ],
     "brandColor": "#0F766E",
     "composerIcon": "./assets/icon.png",

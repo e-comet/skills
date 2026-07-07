@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "e-comet": {
+      "type": "http",
+      "url": "https://mcp.e-comet.io/mcp"
+    }
+  }
+}

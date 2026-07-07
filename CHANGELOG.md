@@ -1,5 +1,20 @@
 # Changelog
 
+## [2026.7.0] - 2026-07-07
+
+### Breaking changes
+- None.
+
+### Added
+- Added the `wb-product-card` skill: live WB product card data (price, rating, stock by warehouse and size,
+  merged articles) fetched through the user's browser via the e-Comet extension.
+- Added the `wb-search-by-query` skill: live WB search results and article positions by query phrase.
+- Bundled the e-Comet MCP server (`https://mcp.e-comet.io/mcp`) into the plugin for both Claude Cowork and
+  Codex Desktop — no manual MCP setup; authentication is an email-code OAuth login on first use.
+
+### Changed
+- Public README now marks each skill with its requirements (MCP server / e-Comet browser extension).
+
 ## [2026.6.2] - 2026-06-21
 
 ### Breaking changes
