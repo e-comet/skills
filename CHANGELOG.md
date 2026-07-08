@@ -1,9 +1,6 @@
 # Changelog
 
-## [2026.7.0] - 2026-07-07
-
-### Breaking changes
-- None.
+## [2026.7.0] - 2026-07-08
 
 ### Added
 - Added the `wb-product-card` skill: live WB product card data (price, rating, stock by warehouse and size,
@@ -16,9 +13,6 @@
 - Public README now marks each skill with its requirements (MCP server / e-Comet browser extension).
 
 ## [2026.6.2] - 2026-06-21
-
-### Breaking changes
-- None.
 
 ### Fixed
 - Updated `wb-product-images` media basket fallback ranges through `basket-46` so high product IDs resolve to the
@@ -40,9 +34,6 @@
 - Added e-Comet icon and logo assets for Codex plugin presentation.
 
 ## [2026.6.0] - 2026-06-21
-
-### Breaking changes
-- None.
 
 ### Added
 - Added the initial `wb-product-images` skill for resolving live Wildberries image URLs by article, product ID, nm ID,
