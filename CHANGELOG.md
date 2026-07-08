@@ -1,5 +1,13 @@
 # Changelog
 
+## [2026.7.1] - 2026-07-08
+
+### Changed
+- Migrated `wb-product-card` and `wb-search-by-query` to the new extension agent API: jobs are handed to the
+  extension via postMessage-RPC `submit` on any wildberries.ru tab (no navigation to the trigger URL), and results
+  are read via the same RPC — works from isolated JS worlds without CDP; `readAll` fetches small batches in one call.
+- Documented the new Wildberries login requirement (`wb_not_authenticated` setup error) in both browser skills.
+
 ## [2026.7.0] - 2026-07-08
 
 ### Added
