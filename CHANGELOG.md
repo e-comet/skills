@@ -1,5 +1,17 @@
 # Changelog
 
+## [2026.7.2] - 2026-07-09
+
+### Changed
+- Moved shared browser-job instructions and postMessage-RPC snippets for `wb-product-card` and `wb-search-by-query`
+  into plugin-root `shared/browser-job/`, removing duplicated skill-local scripts.
+- Browser skills now read results with the extension's `summary` API (ready-to-present product/search objects with
+  warehouse names and search positions; new shared `agent_summary.js`), falling back to raw bodies only for fields
+  the summary lacks.
+- Documented the DOM mailbox transport (`#ecomet-agent-bridge`) as the Codex default without CDP, transport caching
+  via `ECOMET_AGENT_TRANSPORT`, and job snapshot semantics (re-read the same job instead of re-running `browser_job`).
+- Search answers now mark promoted (ad) positions via the summary `promoted` flag.
+
 ## [2026.7.1] - 2026-07-08
 
 ### Changed
