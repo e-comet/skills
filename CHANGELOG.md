@@ -1,5 +1,9 @@
 # Changelog
 
+## [2026.7.3] - 2026-07-10
+
+Documented how public pull requests are incorporated into release snapshots.
+
 ## [2026.7.2] - 2026-07-09
 
 ### Changed
