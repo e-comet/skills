@@ -9,31 +9,49 @@ Use this shared contract for e-Comet skills that fetch Wildberries data through 
 - **e-Comet browser extension**: installed and authenticated with an extension key.
 - **Wildberries login**: the user is logged in on wildberries.ru in the same browser. Jobs without WB login fail with
   `wb_not_authenticated`.
-- **User Chrome with the extension**: use the browser exposed by `agent.browsers.get("extension")`, not the agent's
-  built-in browser.
+- **The user's own Chrome, connected via the e-Comet extension** — pick this in your browser tool (in Codex: "Chrome
+  via extension"), NOT the in-app/built-in browser. The in-app browser may have full CDP but has no user profile and no
+  e-Comet extension, so there is no RPC/mailbox and nothing works. Only the user's Chrome carries the extension; CDP
+  alone does not mean the extension is reachable.
 - **A wildberries.ru tab**: open any wildberries.ru tab, for example `https://www.wildberries.ru/`, and talk to the
   extension there through one of the two transports below.
 
 The e-Comet server signs jobs but does not fetch WB data and does not see WB responses. The extension runs the WB
 requests in the user's browser; the agent submits the job and reads results through an RPC on the wildberries.ru tab.
 
-Let the extension do all the work through this API. Do NOT scrape the WB page DOM, parse raw WB JSON by hand, or
-recompute prices/stocks/positions yourself — `summary` returns ready-to-present data.
+Rules for the agent:
+
+- **Do the whole flow yourself, in the user's Chrome (via the extension).** Open the wildberries.ru tab, `submit`,
+  poll, and read results yourself. NEVER hand the user the `trigger_url`, ask them to open a link, or offload the
+  fetch. Do NOT use the agent's in-app/isolated browser — even one with full CDP has no e-Comet extension, so there is
+  no RPC/mailbox and the job returns nothing.
+- **Do not invent setup/auth errors.** Real errors come ONLY from `submit` (reject) or `progress().setupError`. Never
+  tell the user "e-Comet is not authenticated" (or similar) without actually seeing such an error — submit the job and
+  read the status first; if there is an error, its `message` is already user-ready.
+- **Let the extension do the work through this API.** Do NOT scrape the WB page DOM, parse raw WB JSON by hand, or
+  recompute prices/stocks/positions yourself — `summary` returns ready-to-present data.
 
 ## Transports
 
-The API is identical in both transports (`submit` / `progress` / `list` / `read` / `readAll` / `summary`); pick by
-what your runtime can do:
+Same API in both transports (`submit` / `progress` / `list` / `read` / `readAll` / `summary`). There is a **required
+order — do NOT skip to the fallback:**
 
-| Agent runtime | Transport |
-| --- | --- |
-| Claude (and any agent whose `evaluate` runs real JS via CDP) | **postMessage-RPC** — run the snippets from `scripts/` |
-| Codex default (no "Full CDP access") | **DOM mailbox** — drive the `#ecomet-agent-bridge` element |
-| Codex with "Full CDP access" enabled | postMessage-RPC (faster) |
+1. **Try postMessage-RPC FIRST — always.** Run `agent_submit.js` (or a `capabilities` probe) in the current
+   wildberries.ru tab via your JS-execution tool (Codex `javascript_tool`, CDP `Runtime.evaluate`, etc.).
+2. Got a result back → postMessage-RPC works. Use it for the whole job and cache it (below).
+3. **Only** if step 1 actually fails — the snippet cannot execute (no JS eval available) or no `ecomet-agent-rpc-result`
+   arrives within the timeout — switch to the **DOM mailbox** (`#ecomet-agent-bridge`).
 
-Probe once, then cache your working transport across sessions (`ECOMET_AGENT_TRANSPORT=postmessage|dom` in your
-environment, or your agent's persistent memory/config). If a cached transport starts failing (extension updated,
-CDP access toggled), re-probe and overwrite the cache.
+The DOM mailbox is a **fallback, not a default**. Do NOT pick it just because the `#ecomet-agent-bridge` element is
+present or "obviously available" — that does NOT prove postMessage is unavailable. **Never fall back without an actual
+postMessage error or timeout.** Skipping the probe is a mistake: postMessage-RPC is faster and returns many units per
+call; the DOM mailbox is slower and one response at a time. State which transport you used and why ("postMessage worked"
+/ "postMessage timed out → DOM").
+
+Why this order: postMessage-RPC needs the agent to run JS on the page — CDP, on by default in Claude, and in Codex only
+if the user enabled "Full CDP access" (which you cannot read or toggle, so you MUST actually try it rather than assume).
+The DOM mailbox needs no CDP. Cache the working transport across sessions (`ECOMET_AGENT_TRANSPORT=postmessage|dom`, or
+your agent's persistent memory); re-probe and overwrite if it starts failing.
 
 ### postMessage-RPC (snippets)
 

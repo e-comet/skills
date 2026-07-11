@@ -1,5 +1,12 @@
 # Changelog
 
+## [2026.7.4] - 2026-07-11
+
+### Changed
+- Browser skills now always probe postMessage-RPC before falling back to the DOM mailbox, run the complete flow in
+  the user's extension-connected Chrome, and report setup/authentication errors only after receiving them from the
+  extension.
+
 ## [2026.7.3] - 2026-07-10
 
 Documented how public pull requests are incorporated into release snapshots.
