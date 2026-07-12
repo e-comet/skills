@@ -44,9 +44,12 @@ order — do NOT skip to the fallback:**
 
 The DOM mailbox is a **fallback, not a default**. Do NOT pick it just because the `#ecomet-agent-bridge` element is
 present or "obviously available" — that does NOT prove postMessage is unavailable. **Never fall back without an actual
-postMessage error or timeout.** Skipping the probe is a mistake: postMessage-RPC is faster and returns many units per
-call; the DOM mailbox is slower and one response at a time. State which transport you used and why ("postMessage worked"
-/ "postMessage timed out → DOM").
+postMessage error or timeout.** A transient error right after navigation (CDP `Raw CDP is unavailable while Browser Use
+is resolving a paused document response`, or `window.addEventListener is not a function`) is NOT such a failure — the
+tab is still loading. Wait for readiness (step 2 above) and **retry postMessage** on the same or a fresh idle tab;
+switch to the DOM mailbox only after postMessage fails on a READY tab. Skipping the probe is a mistake: postMessage-RPC
+is faster and returns many units per call; the DOM mailbox is slower and one response at a time. State which transport
+you used and why ("postMessage worked" / "postMessage timed out → DOM").
 
 Why this order: postMessage-RPC needs the agent to run JS on the page — CDP, on by default in Claude, and in Codex only
 if the user enabled "Full CDP access" (which you cannot read or toggle, so you MUST actually try it rather than assume).
@@ -97,10 +100,17 @@ One response lives in the mailbox at a time — read the body before sending the
 ## Workflow
 
 1. Call `browser_job` with the skill-specific payload.
-2. Open or reuse a wildberries.ru tab in the user's Chrome with the e-Comet extension.
+2. Open or reuse a wildberries.ru tab in the user's Chrome with the e-Comet extension. **Wait for the page to be ready
+   before any RPC/evaluate** — after navigating, wait for `domcontentloaded` (or until `document.readyState` is
+   `interactive`/`complete`). Do NOT run `goto()` and the RPC snippet back-to-back: on a tab still resolving its
+   document response, CDP `Runtime.evaluate` fails with `Raw CDP is unavailable while Browser Use is resolving a paused
+   document response` and `evaluate` sees a stub window (`window.addEventListener is not a function`).
 3. `submit` the exact `trigger_url` (snippet `agent_submit.js` or mailbox command). Success returns
    `{ jobIds: [...] }`. An error is a setup error — show its text to the user as-is. If the transport is unavailable,
-   navigate to `trigger_url` in the same tab as a fallback.
+   navigate to `trigger_url` in the same tab as a fallback. You already have the parent `jobId` from
+   `browser_job.job_ids` — if `submit` seems to fail on a transport hiccup (not a setup error), the job may already be
+   accepted: check `progress`/`list` on that `jobId` before re-submitting. Do NOT create a new `browser_job` to recover
+   from a transport error (that wastes time and produces a wrong jobId).
 4. Poll `progress` (snippet `agent_poll.js`) every 2-3 seconds until `progress.status === "done"`. Large jobs run in
    throttled waves and can take tens of minutes; read completed units as they appear. If `setupError` appears, stop
    and show `setupError.message` as-is.

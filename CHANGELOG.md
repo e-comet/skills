@@ -1,5 +1,11 @@
 # Changelog
 
+## [2026.7.5] - 2026-07-12
+
+### Changed
+- Browser jobs now wait for a ready Wildberries tab before RPC, retry postMessage after transient navigation errors,
+  and recover an already-accepted job by its existing ID instead of creating a duplicate job.
+
 ## [2026.7.4] - 2026-07-11
 
 ### Changed
