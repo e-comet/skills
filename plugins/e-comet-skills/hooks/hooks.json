@@ -1,0 +1,31 @@
+{
+  "description": "Preserve signed e-Comet browser-job authorizations between remote and local MCP calls.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^mcp__.+__browser_job$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/browser-job-handoff.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Securing e-Comet browser authorization"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^mcp__(?:plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:wb_product_card|wb_search_by_query|wb_recommendations_by_product)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/browser-job-handoff.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Restoring e-Comet browser authorization"
+          }
+        ]
+      }
+    ]
+  }
+}

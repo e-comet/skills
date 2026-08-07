@@ -1,0 +1,18 @@
+{
+  "name": "e-comet-skills",
+  "displayName": "e-Comet MCP Tools",
+  "description": "MCP tools for e-Comet seller analytics and live Wildberries data.",
+  "repository": "https://github.com/e-comet/skills",
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "e-comet": {
+      "type": "http",
+      "url": "https://mcp.e-comet.io/mcp"
+    },
+    "e-comet-local": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/src/server.mjs"]
+    }
+  }
+}

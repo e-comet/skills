@@ -1,0 +1,42 @@
+{
+  "name": "e-comet-skills",
+  "version": "2026.8.2",
+  "description": "MCP tools for e-Comet seller analytics and live Wildberries data.",
+  "author": {
+    "name": "e-Comet",
+    "url": "https://e-comet.io/"
+  },
+  "homepage": "https://github.com/e-comet/skills",
+  "repository": "https://github.com/e-comet/skills",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "wildberries", "wb", "e-comet"],
+  "mcpServers": {
+    "e-comet": {
+      "type": "http",
+      "url": "https://mcp.e-comet.io/mcp"
+    },
+    "e-comet-local": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["mcp/src/server.mjs"],
+      "cwd": "."
+    }
+  },
+  "interface": {
+    "displayName": "e-Comet MCP Tools",
+    "shortDescription": "Seller analytics and live Wildberries data",
+    "longDescription": "Analyze e-Comet account data and get current Wildberries data through the user's browser.",
+    "developerName": "e-Comet",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive"],
+    "websiteURL": "https://e-comet.io/",
+    "defaultPrompt": [
+      "Find WB image URLs for product IDs",
+      "Show WB stock by warehouse for an article",
+      "Find my WB article position in search"
+    ],
+    "brandColor": "#0F766E",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/logo.png"
+  }
+}
