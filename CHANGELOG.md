@@ -1,5 +1,9 @@
 # Changelog
 
+## [2026.8.5] - 2026-08-09
+
+Corrected spelling, punctuation and typography in the README.
+
 ## [2026.8.4] - 2026-08-09
 
 Reorganised the README: installation is split into a browser-only basic path and a full desktop path, with separate
