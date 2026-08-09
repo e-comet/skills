@@ -1,6 +1,6 @@
 const SAFE_CODE = /^[A-Z][A-Z0-9_]{2,63}$/;
 const MAX_SAFE_MESSAGE_LENGTH = 500;
-const SAFE_STAGES = new Set(['arguments', 'handoff', 'extension', 'authorization', 'execution', 'storage', 'images', 'local']);
+const SAFE_STAGES = new Set(['arguments', 'handoff', 'extension', 'authorization', 'execution', 'storage', 'images', 'seller', 'local']);
 
 export class ToolExecutionError extends Error {
     constructor(code, message, stage, retryable = false, options = {}) {

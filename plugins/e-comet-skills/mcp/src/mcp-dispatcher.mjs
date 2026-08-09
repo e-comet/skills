@@ -9,8 +9,9 @@ import {
     MAX_IMAGE_BASKET,
     SUPPORTED_MCP_PROTOCOL_VERSIONS,
 } from './config.mjs';
-import { executeAuthorizedBrowserJob, extractBrowserJobToken, validateAuthorizedJobLimits } from './browser-job.mjs';
-import { mcpError, mcpResult, textResult } from './mcp-protocol.mjs';
+import { createArtifactWriter, releaseArtifactJob } from './artifact-store.mjs';
+import { executeAuthorizedBrowserJob, executeSellerReviewsJob, extractBrowserJobToken, validateAuthorizedJobLimits } from './browser-job.mjs';
+import { mcpError, mcpResult, resourceLinkResult, textResult } from './mcp-protocol.mjs';
 import { createJobWriter } from './result-store.mjs';
 import { serverInstructions, tools, validateToolArguments } from './tool-catalog.mjs';
 import { ToolExecutionError, toolFailure } from './tool-errors.mjs';
@@ -19,7 +20,15 @@ import { createConcurrencyLimiter, discoverImageBasket, imageExists, normalizeSt
 export const createMcpMessageHandler = ({
     getBridgeStatus,
     waitForExtensionReady,
+    // Non-blocking nudge that pulls the next bridge reconnect attempt forward. Applied once at the tools/call
+    // dispatch point to every tool declaring `needsBridge`, rather than from inside individual handlers: the
+    // wake-up inside waitForExtensionReady is reachable only by a fully-formed signed call, so the calls a
+    // degraded agent actually makes first — the status read and the discovery call without a triggerUrl —
+    // would otherwise each have to remember to nudge.
+    ensureBridgeConnected = () => undefined,
     requestBrowserJobAuthorization,
+    createSellerArtifactWriter = createArtifactWriter,
+    releaseSellerArtifactJob = releaseArtifactJob,
     sendError = mcpError,
     sendResult = mcpResult,
     createJobWriter: createWriter = createJobWriter,
@@ -71,11 +80,22 @@ export const createMcpMessageHandler = ({
         }
         let writer;
         let authorizationLease;
-        const releaseAuthorization = () => {
+        // The scope is dropped the moment this runs and the release outcome cannot change the result, so the
+        // round trip must not sit between a finished job and the response it already earned. `release()` is
+        // invoked directly rather than from a `.then()` callback: everything that revokes the scope — the
+        // broker map entry, its expiry timer, its pending operations — runs before that call's first await,
+        // so deferring it by a microtask would leave the scope usable while the result is being emitted.
+        const releaseAuthorization = (context) => {
             if (!authorizationLease) return;
             const currentLease = authorizationLease;
             authorizationLease = undefined;
-            currentLease.release();
+            const reportFailure = (releaseError) =>
+                console.error(`[McpDispatcher] Failed to release browser-job authorization ${context}:`, releaseError.message);
+            try {
+                void Promise.resolve(currentLease.release()).catch(reportFailure);
+            } catch (releaseError) {
+                reportFailure(releaseError);
+            }
         };
         try {
             if (!(await waitForExtensionReady())) {
@@ -133,7 +153,7 @@ export const createMcpMessageHandler = ({
                 productLimitPerScope,
                 productNmIds,
             });
-            releaseAuthorization();
+            releaseAuthorization('after job completion');
             const writeErrors = await writer.close();
             sendResult(
                 id,
@@ -147,7 +167,7 @@ export const createMcpMessageHandler = ({
                 )
             );
         } catch (error) {
-            releaseAuthorization();
+            releaseAuthorization('after job failure');
             let partialResult = {};
             if (writer) {
                 const writeErrors = await writer.close().catch(() => []);
@@ -288,15 +308,161 @@ export const createMcpMessageHandler = ({
         }
     };
 
+    const handleSellerReviewsExport = async (id, args = {}) => {
+        const toolName = 'wb_seller_reviews';
+        if (!validateToolArguments(toolName, args)) {
+            sendResult(
+                id,
+                textResult(
+                    toolFailure(new ToolExecutionError('INVALID_TOOL_ARGUMENTS', `Invalid ${toolName} arguments.`, 'arguments', false)),
+                    true
+                )
+            );
+            return;
+        }
+        const triggerUrl = args.triggerUrl;
+        if (typeof triggerUrl !== 'string' || !triggerUrl) {
+            sendResult(
+                id,
+                textResult(
+                    toolFailure(
+                        new ToolExecutionError(
+                            'BROWSER_JOB_HANDOFF_REQUIRED',
+                            'Browser authorization handoff is required.',
+                            'handoff',
+                            true
+                        )
+                    ),
+                    true
+                )
+            );
+            return;
+        }
+        let authorizationLease;
+        let terminalResult;
+        let sellerResult;
+        let sellerArtifacts = [];
+        const artifactJobId = randomUUID();
+        try {
+            if (!(await waitForExtensionReady())) {
+                throw new ToolExecutionError(
+                    'EXTENSION_DISCONNECTED',
+                    'Open an authenticated Wildberries tab, then retry the e-Comet request.',
+                    'extension',
+                    true
+                );
+            }
+            authorizationLease = await requestBrowserJobAuthorization(extractBrowserJobToken(triggerUrl));
+            const authorization = authorizationLease?.authorization;
+            if (
+                !authorization ||
+                typeof authorization.authorizationId !== 'string' ||
+                authorization.jobType !== 'seller_reviews' ||
+                !authorization.job ||
+                typeof authorizationLease.requestSellerOperation !== 'function' ||
+                typeof authorizationLease.release !== 'function'
+            ) {
+                if (authorization?.jobType && authorization.jobType !== 'seller_reviews') {
+                    throw new ToolExecutionError(
+                        'BROWSER_JOB_TYPE_MISMATCH',
+                        `Signed ${authorization.jobType} job cannot be executed as ${toolName}.`,
+                        'authorization',
+                        false
+                    );
+                }
+                throw new Error('Extension returned an invalid seller browser job authorization lease');
+            }
+            sellerResult = await executeSellerReviewsJob({
+                authorization,
+                requestSellerOperation: authorizationLease.requestSellerOperation,
+                createArtifactWriter: createSellerArtifactWriter,
+                artifactJobId,
+            });
+            sellerArtifacts = sellerResult.exports.flatMap((item) =>
+                item.status === 'complete' && 'artifact' in item ? [item.artifact] : []
+            );
+            const summary = `Seller review export ${sellerResult.status}: ${sellerArtifacts.length} of ${sellerResult.exports.length} XLSX artifact(s) available.`;
+            terminalResult = resourceLinkResult(sellerResult, summary, sellerArtifacts, !sellerResult.ok);
+        } catch (error) {
+            terminalResult = textResult(
+                toolFailure(error, {
+                    code: 'SELLER_REVIEWS_EXPORT_FAILED',
+                    message: 'The authorized seller review export could not be completed.',
+                    stage: 'execution',
+                    retryable: false,
+                }),
+                true
+            );
+        }
+        try {
+            await authorizationLease?.release?.();
+        } catch (error) {
+            const failure = toolFailure(
+                new ToolExecutionError(
+                    'SELLER_AUTHORIZATION_RELEASE_FAILED',
+                    'The seller organization could not be restored safely after the export.',
+                    'extension',
+                    false,
+                    { cause: error }
+                )
+            );
+            // A restore failure must not erase the per-export report: the workbooks exist and only the
+            // export list says which filters each one covers. Carry the failure alongside that report.
+            if (sellerResult) {
+                terminalResult = resourceLinkResult(
+                    { ...sellerResult, ok: false, releaseError: failure },
+                    `Seller review export ${sellerResult.status}: ${sellerArtifacts.length} of ${sellerResult.exports.length} XLSX artifact(s) available, but seller cabinet restoration failed.`,
+                    sellerArtifacts,
+                    true
+                );
+            } else {
+                terminalResult = textResult(failure, true);
+            }
+        }
+        try {
+            sendResult(id, terminalResult);
+        } finally {
+            try {
+                await releaseSellerArtifactJob(artifactJobId);
+            } catch (error) {
+                log('failed to release seller artifact pins after terminal response:', error?.message);
+            }
+        }
+    };
+
+    // `needsBridge` declares which tools depend on the bridge, so the wake-up is applied once at the dispatch
+    // point below instead of being remembered inside each handler. A tool added without the flag simply never
+    // nudges; a tool added with it cannot forget to. `wb_product_images` is the deliberate false: it is a
+    // public image-CDN lookup, and nudging for it would stamp the wake-up cooldown against a bridge it never
+    // uses. The status read carries the flag because that is what an agent reaches for when the bridge is
+    // degraded — the snapshot still describes the state as it was, and the nudge affects what happens next,
+    // so the diagnostic path can repair the bridge it describes.
     const toolHandlers = new Map([
-        ['local_bridge_status', async (id) => sendResult(id, textResult({ ok: true, ...getBridgeStatus() }))],
-        ['wb_product_card', (id, args) => handleBrowserJob(id, 'wb_product_card', 'product_card', args)],
-        ['wb_search_by_query', (id, args) => handleBrowserJob(id, 'wb_search_by_query', 'search_by_query', args)],
+        [
+            'local_bridge_status',
+            { needsBridge: true, run: async (id) => sendResult(id, textResult({ ok: true, ...getBridgeStatus() })) },
+        ],
+        [
+            'wb_product_card',
+            { needsBridge: true, run: (id, args) => handleBrowserJob(id, 'wb_product_card', 'product_card', args) },
+        ],
+        [
+            'wb_search_by_query',
+            { needsBridge: true, run: (id, args) => handleBrowserJob(id, 'wb_search_by_query', 'search_by_query', args) },
+        ],
+        [
+            'wb_check_by_query',
+            { needsBridge: true, run: (id, args) => handleBrowserJob(id, 'wb_check_by_query', 'check_by_query', args) },
+        ],
         [
             'wb_recommendations_by_product',
-            (id, args) => handleBrowserJob(id, 'wb_recommendations_by_product', 'recommendations_by_product', args),
+            {
+                needsBridge: true,
+                run: (id, args) => handleBrowserJob(id, 'wb_recommendations_by_product', 'recommendations_by_product', args),
+            },
         ],
-        ['wb_product_images', (id, args) => handleProductImages(id, args)],
+        ['wb_seller_reviews', { needsBridge: true, run: (id, args) => handleSellerReviewsExport(id, args) }],
+        ['wb_product_images', { needsBridge: false, run: (id, args) => handleProductImages(id, args) }],
     ]);
 
     return async (message) => {
@@ -332,11 +498,15 @@ export const createMcpMessageHandler = ({
             return;
         }
 
-        const handler = toolHandlers.get(params?.name);
-        if (!handler) {
+        const tool = toolHandlers.get(params?.name);
+        if (!tool) {
             sendError(id, -32602, `Unknown tool: ${params?.name}`);
             return;
         }
-        await handler(id, params?.arguments ?? {});
+        // Before the handler runs, so a degraded agent's very first call starts the reconnect rather than
+        // waiting out the retry interval — including the signed-call forms that return early, before they ever
+        // reach waitForExtensionReady.
+        if (tool.needsBridge) ensureBridgeConnected();
+        await tool.run(id, params?.arguments ?? {});
     };
 };

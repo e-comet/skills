@@ -8,10 +8,15 @@ export const MESSAGE_TYPES = Object.freeze({
     hello: 'hello',
     wbFetch: 'wb_fetch',
     browserJobAuthorize: 'browser_job_authorize',
+    browserJobAuthorizationRelease: 'browser_job_authorization_release',
     // расширение -> local MCP
     helloAck: 'hello_ack',
     wbFetchResult: 'wb_fetch_result',
+    wbFetchStreamStart: 'wb_fetch_stream_start',
+    wbFetchStreamChunk: 'wb_fetch_stream_chunk',
+    wbFetchStreamEnd: 'wb_fetch_stream_end',
     browserJobAuthorizeResult: 'browser_job_authorize_result',
+    browserJobAuthorizationReleaseResult: 'browser_job_authorization_release_result',
     error: 'error',
     // в обе стороны (heartbeat)
     ping: 'ping',
@@ -41,6 +46,7 @@ export const peerStatusMessage = ({
 
 export const CLIENT_TO_EXTENSION_MESSAGE_TYPES = Object.freeze([
     MESSAGE_TYPES.browserJobAuthorize,
+    MESSAGE_TYPES.browserJobAuthorizationRelease,
     MESSAGE_TYPES.hello,
     MESSAGE_TYPES.ping,
     // Ответ на heartbeat расширения. Отсутствие pong в этом списке означало, что
@@ -51,12 +57,29 @@ export const CLIENT_TO_EXTENSION_MESSAGE_TYPES = Object.freeze([
 
 export const EXTENSION_TO_CLIENT_MESSAGE_TYPES = Object.freeze([
     MESSAGE_TYPES.browserJobAuthorizeResult,
+    MESSAGE_TYPES.browserJobAuthorizationReleaseResult,
     MESSAGE_TYPES.error,
     MESSAGE_TYPES.helloAck,
     MESSAGE_TYPES.ping,
     MESSAGE_TYPES.pong,
     MESSAGE_TYPES.wbFetchResult,
+    MESSAGE_TYPES.wbFetchStreamStart,
+    MESSAGE_TYPES.wbFetchStreamChunk,
+    MESSAGE_TYPES.wbFetchStreamEnd,
 ]);
+
+export const EXTENSION_CAPABILITIES = Object.freeze(['wb_fetch', 'browser_job', 'seller_reviews']);
+
+// Стадия операции продавца внутри payload'а `wb_fetch`. Расширение решает по ней,
+// какой admission применить, поэтому набор объявлен enum'ом SellerOperationStage в
+// src/local-agent-protocol.ts и закреплён в контракте наравне с именами сообщений.
+export const SELLER_OPERATION_STAGES = Object.freeze({
+    create: 'create',
+    poll: 'poll',
+    download: 'download',
+});
+
+export const isSellerOperationStage = (value) => Object.values(SELLER_OPERATION_STAGES).includes(value);
 
 // Коды внутри `wb_fetch_result.response.code`.
 export const FETCH_ERROR_CODES = Object.freeze({
@@ -78,11 +101,14 @@ export const AUTHORIZATION_FETCH_ERROR_CODES = Object.freeze([
     FETCH_ERROR_CODES.browserJobUrlNotAllowed,
 ]);
 
-// Из них повторить задание с новой авторизацией имеет смысл только для этих двух:
-// исчерпанный URL-бюджет новой попыткой не лечится.
+// Коды, при которых повтор имеет смысл. Из авторизационных это только два: исчерпанный URL-бюджет
+// новой попыткой не лечится. Рейт-лимит кабинета сюда же, хотя авторизации не касается: это ровно то
+// состояние, которое лечится ожиданием, и пакет он останавливает, а не запрещает повторить позже.
+// Флаг ниоткуда не запускает автоповтор — он сообщает вызывающему, стоит ли пробовать снова.
 export const RETRYABLE_FETCH_ERROR_CODES = Object.freeze([
     FETCH_ERROR_CODES.browserJobNotAuthorized,
     FETCH_ERROR_CODES.browserJobExpired,
+    'SELLER_CABINET_RATE_LIMITED',
 ]);
 
 export const UNCLASSIFIED_FETCH_ERROR_CODE = 'WB_FETCH_FAILED';

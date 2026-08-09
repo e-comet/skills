@@ -1,6 +1,24 @@
+// Peer failures are reported to the agent, so the vocabulary is a closed set owned by this process. A reason
+// string received from the other side of the socket is never surfaced: anything listening on loopback could
+// otherwise write arbitrary text into a tool result and from there into the model's context.
+/**
+ * The whole vocabulary, so a caller cannot be narrowed to whichever code happens to be a default.
+ * @typedef {'authentication_failed' | 'protocol_mismatch' | 'handshake_required' | 'connection_failed' | 'listen_failed'} PeerRejectionCode
+ */
+export const PEER_REJECTION_CODES = Object.freeze({
+    authenticationFailed: 'authentication_failed',
+    protocolMismatch: 'protocol_mismatch',
+    handshakeRequired: 'handshake_required',
+    connectionFailed: 'connection_failed',
+    // This process could not bind the listener at all — no peer was ever contacted. Reporting it through
+    // `connection_failed` would send the reader to investigate a primary that was never reached.
+    listenFailed: 'listen_failed',
+});
+
 export class ConnectionState {
     #extensionReadyWaiters = new Set();
     #closed = false;
+    #now;
 
     extensionSocket = null;
     extensionReady = false;
@@ -10,8 +28,24 @@ export class ConnectionState {
     peerExtensionReady = false;
     peerExtensionBrowserJobReady = false;
     peerReconnectTimer = null;
-    peerReconnectAttempts = 0;
-    peerRejectionReason = null;
+    peerReconnectBackoffStep = 0;
+    // Classification of the attempt currently in flight. Cleared when an attempt ends, so a socket that closes
+    // after a protocol-level rejection cannot overwrite the more specific code with a generic one.
+    peerAttemptRejectionCode = null;
+    // Last classified failure of the current uninterrupted streak, and when that streak began.
+    peerRejectionCode = null;
+    peerFailureSinceMs = null;
+    peerNextRetryAtMs = null;
+
+    constructor({ now = Date.now } = {}) {
+        this.#now = now;
+    }
+
+    // The one clock for everything that ends up compared or reported together. The bridge runtime reads it
+    // through here rather than taking its own injection, so `since` and `retryAt` cannot come from two epochs.
+    now() {
+        return this.#now();
+    }
 
     get effectiveExtensionReady() {
         return this.extensionReady || (this.peerReady && this.peerExtensionReady);
@@ -38,7 +72,12 @@ export class ConnectionState {
         return true;
     }
 
-    updatePeerStatus({ extensionConnected, browserJobSupported }) {
+    // Returns null for a frame from a socket that is no longer the peer socket. The old client socket's
+    // message listener is never detached, so frames queued before its close completes still arrive; without
+    // the identity check (which `disconnectPeer` already has) a late frame would republish readiness for a
+    // socket that no longer exists and silently cancel a retry that was just armed.
+    updatePeerStatus({ extensionConnected, browserJobSupported }, socket) {
+        if (socket !== undefined && socket !== this.peerSocket) return null;
         const wasReady = this.peerReady;
         this.resetPeerReconnect();
         this.peerReady = true;
@@ -92,19 +131,66 @@ export class ConnectionState {
         this.resetPeerReconnect();
     }
 
-    recordPeerRejection(reason) {
-        this.peerRejectionReason = reason || 'unknown reason';
+    clearPeerAttemptVerdict() {
+        this.peerAttemptRejectionCode = null;
     }
 
-    nextPeerReconnectDelay({ baseMs, maxMs, maxAttempts }) {
-        if (this.peerReconnectAttempts >= maxAttempts) return null;
-        const delay = Math.min(maxMs, baseMs * 2 ** this.peerReconnectAttempts);
-        this.peerReconnectAttempts += 1;
-        return delay;
+    // A protocol-level verdict: always authoritative for the attempt in flight.
+    recordPeerRejection(code) {
+        const rejectionCode = Object.values(PEER_REJECTION_CODES).includes(code) ? code : PEER_REJECTION_CODES.connectionFailed;
+        this.peerAttemptRejectionCode = rejectionCode;
+        this.peerRejectionCode = rejectionCode;
+        this.peerFailureSinceMs ??= this.#now();
+    }
+
+    // A socket that closed without telling us why. Never downgrades a verdict already reached for this attempt.
+    classifyPeerCloseFailure() {
+        if (this.peerAttemptRejectionCode !== null) return;
+        this.recordPeerRejection(PEER_REJECTION_CODES.connectionFailed);
+    }
+
+    // Saturation is a property of the delay, not of an attempt count: once the curve reaches its ceiling the
+    // secondary is degraded and stays there, retrying at that cadence until it reconnects or becomes primary.
+    nextPeerReconnectDelay({ baseMs, maxMs }) {
+        const delayMs = Math.min(maxMs, baseMs * 2 ** this.peerReconnectBackoffStep);
+        const saturated = delayMs >= maxMs;
+        if (!saturated) this.peerReconnectBackoffStep += 1;
+        return { delayMs, saturated };
+    }
+
+    // Takes an absolute time rather than a delay: the runtime that schedules the timer owns the clock this is
+    // later compared against, so the value must not be stamped from a second, independently injectable one.
+    notePeerRetryScheduled(retryAtMs) {
+        this.peerNextRetryAtMs = retryAtMs;
+    }
+
+    clearPeerRetrySchedule() {
+        clearTimeout(this.peerReconnectTimer);
+        this.peerReconnectTimer = null;
+        this.peerNextRetryAtMs = null;
+    }
+
+    // Absent while the bridge is healthy: a null-filled object in every status would be noise in the agent's context.
+    peerRejectionStatus() {
+        if (this.peerRejectionCode === null || this.peerFailureSinceMs === null) return undefined;
+        // This feeds the one tool an operator uses to diagnose a wedged bridge, so it must report the failure
+        // rather than become one: a millisecond value outside the Date range would make toISOString() throw
+        // on every status call. Such a timestamp is omitted, never thrown on.
+        const isoTime = (ms) => (Number.isFinite(ms) && Math.abs(ms) <= 8.64e15 ? new Date(ms).toISOString() : undefined);
+        const since = isoTime(this.peerFailureSinceMs);
+        const retryAt = this.peerNextRetryAtMs === null ? undefined : isoTime(this.peerNextRetryAtMs);
+        return {
+            code: this.peerRejectionCode,
+            ...(since === undefined ? {} : { since }),
+            ...(retryAt === undefined ? {} : { retryAt }),
+        };
     }
 
     resetPeerReconnect() {
-        this.peerReconnectAttempts = 0;
-        this.peerRejectionReason = null;
+        this.clearPeerRetrySchedule();
+        this.peerReconnectBackoffStep = 0;
+        this.peerAttemptRejectionCode = null;
+        this.peerRejectionCode = null;
+        this.peerFailureSinceMs = null;
     }
 }

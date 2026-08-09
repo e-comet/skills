@@ -1,13 +1,19 @@
+import { HANDOFF_RECONNECT_GRACE_MAX_MS } from './config.mjs';
+
 export class HandoffState {
     target = null;
     transitioning = false;
     takeoverGranted = false;
     listenerYieldUntil = 0;
 
-    constructor({ generation, instanceId, reconnectGraceMs, now = Date.now }) {
+    // The ceiling is the shared constant, not a multiple of the default grace: deriving it meant that changing
+    // `HANDOFF_RECONNECT_GRACE_MS` would silently move the clamp every caller that omits the parameter — all of
+    // the tests — exercises, away from the one production passes.
+    constructor({ generation, instanceId, reconnectGraceMs, reconnectGraceMaxMs = HANDOFF_RECONNECT_GRACE_MAX_MS, now = Date.now }) {
         this.generation = generation;
         this.instanceId = instanceId;
         this.reconnectGraceMs = reconnectGraceMs;
+        this.reconnectGraceMaxMs = reconnectGraceMaxMs;
         this.now = now;
     }
 
@@ -36,8 +42,12 @@ export class HandoffState {
         return true;
     }
 
-    markRoutable(routable) {
-        if (routable) this.transitioning = false;
+    // `transitioning` describes the bridge topology alone: whether the primary/secondary arrangement is still
+    // settling. It deliberately says nothing about extension readiness, which callers report separately as
+    // `extensionConnected`. Conflating the two used to leave the flag stuck on whenever a peer reconnected to a
+    // primary that had no extension attached.
+    markTopologySettled() {
+        this.transitioning = false;
     }
 
     markDisconnected() {
@@ -47,7 +57,11 @@ export class HandoffState {
     observeHandoff({ targetInstanceId, reconnectGraceMs }) {
         this.transitioning = true;
         if (targetInstanceId !== this.instanceId) {
-            this.deferListener(Number(reconnectGraceMs) || this.reconnectGraceMs);
+            // The grace arrives over the socket, so it is clamped: an unbounded value would park this
+            // listener (and the tool wake-up guarded by it) arbitrarily far into the future, and an Infinity
+            // smuggled through JSON parsing would turn the reconnect delay into a spin loop.
+            const grace = Number(reconnectGraceMs);
+            this.deferListener(grace > 0 && grace <= this.reconnectGraceMaxMs ? grace : this.reconnectGraceMs);
         }
     }
 
@@ -81,5 +95,7 @@ export class HandoffState {
         this.takeoverGranted = false;
         this.listenerYieldUntil = 0;
         this.target = null;
+        // Owning the listener is a settled topology, so stop reporting a transition even if no extension ever attaches.
+        this.transitioning = false;
     }
 }

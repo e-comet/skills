@@ -2,7 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { chmod, link, mkdir, open, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { LOCAL_STATE_DIR } from './config.mjs';
+import { PEER_TOKEN_DIR } from './config.mjs';
 
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const TOKEN_FILE = '.peer-token';
@@ -58,7 +58,7 @@ export const createPeerAuthProof = (peerToken, role, transcript) =>
         .digest('base64url');
 
 export const loadOrCreatePeerToken = async ({
-    directory = LOCAL_STATE_DIR,
+    directory = PEER_TOKEN_DIR,
     invalidTokenRepairLimit = 2,
     fileSystem: fileSystemOverrides = {},
     waitForContention = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),

@@ -19,9 +19,11 @@ export const serverInstructions =
     'Для живых данных Wildberries сначала выберите локальный типизированный инструмент по намерению пользователя: ' +
     'остаток, остатки, сток, наличие, склады, размеры, цена, описание, характеристики или карточка товара — wb_product_card; ' +
     'поиск, поисковая выдача, позиция, место или топ товаров по запросу — wb_search_by_query; ' +
+    'проверка, находится ли конкретный артикул в поиске по одной или нескольким фразам — wb_check_by_query; ' +
     'рекомендации, похожие товары или рекомендательная полка — wb_recommendations_by_product; ' +
+    'скачать или экспортировать отчёт по отзывам продавца — wb_seller_reviews; ' +
     'фото, фотографии, картинки, изображения или галерея — wb_product_images. ' +
-    'Не начинайте с browser_job. После выбора одной из первых трёх локальных tools следуйте её описанию: ' +
+    'Не начинайте с browser_job. После выбора подписанного локального инструмента следуйте его описанию: ' +
     'browser_job используется только следующим шагом для получения подписанной авторизации выбранного задания.';
 
 export const tools = [
@@ -59,11 +61,31 @@ export const tools = [
             'Authorize with job {type:"search_by_query",queries:[{query:string,pages:integer},...]}; use at most 50 pages for each query and 1000 pages total. Start with 1 page for a top list or 2-3 pages when depth is unspecified. ' +
             'For a targeted rank check, put phrases in remote job.queries and target article IDs in local productNmIds. For a top N list, use productLimitPerQuery:N. ' +
             'Read queries[].pages[].products. Use globalPosition only when globalPositionsComplete is true; position is page-local. promoted is always boolean: promoted:true means реклама (paid placement), promoted:false means органика. ' +
-            'If a target is absent, claim only that it was not found within the requested pages/positions, never that it is absent from all WB search results. Group multiple phrases separately and disclose failed pages. ' +
+            'One product occupies exactly one position per phrase in a snapshot: WB does not also list it organically when it is already rendered as реклама. ' +
+            'If a product appears as promoted:true, its organic position for that phrase is not observed at all in this snapshot — not "not found", but fundamentally not visible. ' +
+            'Do not infer presence or absence of organic ranking from promoted:true, and never claim the product is "absent from organics" / «нет в органике». ' +
+            'Correct wording: "position N, рекламная; organic position for this phrase cannot be determined from this snapshot". ' +
+            'To observe the organic position, take a snapshot when реклама for that phrase is not running. ' +
+            'If a target is absent, claim only that it was not found within the requested pages/positions, never that it is absent from all WB search results or from organics. Group multiple phrases separately and disclose failed pages. ' +
             'Results are a current WB-session snapshot. ' +
             resultPathGuidance,
         inputSchema: toolInputSchemas.wb_search_by_query,
         outputSchema: toolOutputSchemas.wb_search_by_query,
+        annotations: liveToolAnnotations,
+    },
+    {
+        name: 'wb_check_by_query',
+        description:
+            'Check whether one Wildberries article appears in search results for 1-100 phrases. Use for Russian requests about проверка артикула в выдаче, находится ли артикул по фразе, индексируется ли товар, or по каким запросам виден товар. ' +
+            authorizationWorkflow +
+            'Authorize with job {type:"check_by_query",product_id:integer,queries:[string,...]}; send one positive product ID and 1-100 unique non-empty phrases. Page depth is fixed by the service; do not supply it. ' +
+            'Read queries[] separately. For found:true, report only that the product was found for the phrase. For found:false, report only that the product was not found for the phrase. ' +
+            'Do not mention pagesChecked, completionReason, page limits, or brand-filtered depth unless the user explicitly asks for diagnostics. Never present pagesChecked as a page, position, rank, or search depth in ordinary unfiltered search. ' +
+            'request_failed and card_failed mean the check was incomplete; report that the check was incomplete rather than reporting the product as not found. ' +
+            'Do not claim that the product is absent from all Wildberries search results. Results are a current WB-session snapshot. ' +
+            resultPathGuidance,
+        inputSchema: toolInputSchemas.wb_check_by_query,
+        outputSchema: toolOutputSchemas.wb_check_by_query,
         annotations: liveToolAnnotations,
     },
     {
@@ -79,6 +101,21 @@ export const tools = [
             resultPathGuidance,
         inputSchema: toolInputSchemas.wb_recommendations_by_product,
         outputSchema: toolOutputSchemas.wb_recommendations_by_product,
+        annotations: liveToolAnnotations,
+    },
+    {
+        name: 'wb_seller_reviews',
+        description:
+            'Export original Wildberries seller-review XLSX reports for the signed seller_reviews browser_job. ' +
+            authorizationWorkflow +
+            'Authorize one mixed request with job {type:"seller_reviews",exports:[{product_id?:integer,dateFrom?:"YYYY-MM-DD",dateTo?:"YYYY-MM-DD",isAnswered?:boolean,ratings?:[1|2|3|4|5,...],content?:"media"},...],org?:{id:string}|{name:string}}. ' +
+            'Put every requested product, period, answer state, rating filter, and media filter into that single exports array. Omit product_id to export all products in the selected organization. Omitted ratings mean all ratings; content:"media" selects reviews with photo or video, while omitted content means any content. Omitted dates mean all time; otherwise provide both inclusive dates. Omitted isAnswered produces separate answered and unanswered workbooks. ' +
+            'Omit org to use the organization active in the seller portal. Include exactly one signed org id or exact name only when the user explicitly selects another organization. ' +
+            'Use at most 50 logical exports and 100 physical reports after expanding all. Each XLSX is limited to 100 MiB, the job to 500 MiB, and artifacts are retained for 24 hours. The shared artifact store is limited to 512 MiB and 1000 files; oldest completed artifacts are evicted first. ' +
+            'Return every successful resource link (resource_link) and explicitly summarize complete, failed, and skipped exports when status is partial. Do not infer product ownership from an empty workbook. ' +
+            'Returns compact metadata and private local resource links only; XLSX bytes never enter the tool result or model context, and base64 is never returned. Do not read or summarize workbook contents unless the user separately asks.',
+        inputSchema: toolInputSchemas.wb_seller_reviews,
+        outputSchema: toolOutputSchemas.wb_seller_reviews,
         annotations: liveToolAnnotations,
     },
     {

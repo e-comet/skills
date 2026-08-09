@@ -1,5 +1,23 @@
 # Changelog
 
+## [2026.8.3] - 2026-08-08
+
+### Added
+- Added `wb_check_by_query` for checking whether one Wildberries product appears in search results for each requested
+  query.
+- Added `wb_seller_reviews` for mixed, entity-bound Wildberries seller-review exports with per-report partial results
+  and private local XLSX resource links.
+- Added bounded artifact streaming and storage with 100 MiB per-file, 500 MiB per-job, and 24-hour retention limits.
+
+### Changed
+- Extended the trusted one-use browser authorization handoff to the seller-review export tool while keeping the plugin
+  MCP-only.
+
+### Fixed
+- The local bridge now resolves its peer token from a location that per-application storage cannot redirect, so two
+  desktop agents pair with each other instead of each running without the extension. Reconnection no longer gives up,
+  and `local_bridge_status` reports why a peer cannot be reached.
+
 ## [2026.8.2] - 2026-08-07
 
 Initial public release of the e-Comet skill pack.

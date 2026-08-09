@@ -29,7 +29,8 @@ import { createPeerProtocol } from './peer-protocol.mjs';
 import { RequestBroker } from './request-broker.mjs';
 import { attachStdioTransport } from './stdio-transport.mjs';
 import { ToolExecutionError } from './tool-errors.mjs';
-import { sendWs } from './websocket.mjs';
+import { connectWebSocket } from './websocket-client.mjs';
+import { sendWs, WS_OPEN } from './websocket.mjs';
 
 const nodeMajor = Number.parseInt(process.versions.node.split('.')[0], 10);
 if (!Number.isInteger(nodeMajor) || nodeMajor < 22) {
@@ -58,6 +59,10 @@ const handoff = new HandoffState({
     generation: BRIDGE_GENERATION,
     instanceId,
     reconnectGraceMs: HANDOFF_RECONNECT_GRACE_MS,
+    // One clock for both halves of the wake-up guard: `ensureBridgeConnected` weighs this state's listener
+    // yield against the retry time the connection state stamped, so the two must not be able to read
+    // different epochs.
+    now: () => connections.now(),
 });
 
 const requestBroker = new RequestBroker({
@@ -71,7 +76,7 @@ const requestBroker = new RequestBroker({
     routeWbFetch: ({ requestId, url, timeout, authorizationId, authorizationScopeId }) => {
         if (connections.extensionReady) {
             sendWs(connections.extensionSocket, localMessage(requestId, MESSAGE_TYPES.wbFetch, { url, timeout, authorizationId }));
-        } else if (connections.peerReady && connections.peerSocket?.readyState === WebSocket.OPEN) {
+        } else if (connections.peerReady && connections.peerSocket?.readyState === WS_OPEN) {
             connections.peerSocket.send(
                 JSON.stringify({
                     type: 'peer_wb_fetch',
@@ -93,6 +98,34 @@ const requestBroker = new RequestBroker({
             );
         }
     },
+    routeSellerOperation: ({ requestId, sellerOperation, timeout, authorizationId, authorizationScopeId }) => {
+        if (connections.extensionReady) {
+            sendWs(
+                connections.extensionSocket,
+                localMessage(requestId, MESSAGE_TYPES.wbFetch, { authorizationId, sellerOperation, timeout })
+            );
+            return;
+        }
+        if (connections.peerReady && connections.peerSocket?.readyState === WS_OPEN) {
+            connections.peerSocket.send(
+                JSON.stringify({
+                    type: 'peer_seller_operation',
+                    requestId,
+                    authorizationScopeId,
+                    authorizationId,
+                    sellerOperation,
+                    timeout,
+                })
+            );
+            return;
+        }
+        throw new ToolExecutionError(
+            'EXTENSION_DISCONNECTED',
+            'The e-Comet Chrome extension is not connected. Open an authenticated Wildberries tab and retry.',
+            'extension',
+            true
+        );
+    },
     routeAuthorization: ({ requestId, token }) => {
         if (connections.extensionReady && !connections.extensionBrowserJobReady) {
             throw new ToolExecutionError(
@@ -107,6 +140,21 @@ const requestBroker = new RequestBroker({
             sendWs(extensionSocket, localMessage(requestId, MESSAGE_TYPES.browserJobAuthorize, { token }));
             return {
                 isActive: () => connections.extensionReady && connections.extensionSocket === extensionSocket,
+                release: (authorizationId) =>
+                    requestBroker.requestAuthorizationRelease(authorizationId, ({ requestId: releaseRequestId }) => {
+                        if (!connections.extensionReady || connections.extensionSocket !== extensionSocket) {
+                            throw new ToolExecutionError(
+                                'EXTENSION_DISCONNECTED',
+                                'The e-Comet Chrome extension disconnected before releasing browser-job authorization.',
+                                'extension',
+                                true
+                            );
+                        }
+                        sendWs(
+                            extensionSocket,
+                            localMessage(releaseRequestId, MESSAGE_TYPES.browserJobAuthorizationRelease, { authorizationId })
+                        );
+                    }),
             };
         }
         if (connections.peerReady && !connections.peerExtensionBrowserJobReady) {
@@ -117,25 +165,30 @@ const requestBroker = new RequestBroker({
                 false
             );
         }
-        if (connections.peerExtensionBrowserJobReady && connections.peerSocket?.readyState === WebSocket.OPEN) {
+        if (connections.peerExtensionBrowserJobReady && connections.peerSocket?.readyState === WS_OPEN) {
             const peerSocket = connections.peerSocket;
             peerSocket.send(JSON.stringify({ type: 'peer_browser_job_authorize', requestId, token }));
             return {
                 isActive: () =>
-                    connections.peerReady && connections.peerSocket === peerSocket && peerSocket.readyState === WebSocket.OPEN,
-                release: () => {
-                    if (peerSocket.readyState !== WebSocket.OPEN) return;
-                    try {
+                    connections.peerReady && connections.peerSocket === peerSocket && peerSocket.readyState === WS_OPEN,
+                release: (authorizationId) =>
+                    requestBroker.requestAuthorizationRelease(authorizationId, ({ requestId: releaseRequestId }) => {
+                        if (peerSocket.readyState !== WS_OPEN) {
+                            throw new ToolExecutionError(
+                                'EXTENSION_DISCONNECTED',
+                                'The primary local bridge disconnected before releasing browser-job authorization.',
+                                'extension',
+                                true
+                            );
+                        }
                         peerSocket.send(
                             JSON.stringify({
                                 type: 'peer_browser_job_authorization_release',
+                                requestId: releaseRequestId,
                                 authorizationScopeId: requestId,
                             })
                         );
-                    } catch (error) {
-                        log('failed to release peer browser-job authorization:', error.message);
-                    }
-                },
+                    }),
             };
         }
         throw new ToolExecutionError(
@@ -173,7 +226,9 @@ runtime = createBridgeRuntime({
     extensionPath: EXTENSION_PATH,
     peerPath: PEER_PATH,
     createHttpServer: createServer,
-    createWebSocket: (url) => new WebSocket(url),
+    // Deliberately not the platform WebSocket: the peer client must be able to destroy a transport whose
+    // remote never completes the closing handshake, which the WHATWG socket cannot do (see websocket-client.mjs).
+    createWebSocket: (url) => connectWebSocket(url),
     extensionProtocol,
     peerProtocol,
     handoff,
@@ -195,6 +250,11 @@ const handleMcpMessage = createMcpMessageHandler({
         resultDirectory: RESULT_DIR,
     }),
     waitForExtensionReady: () => connections.waitForExtensionReady(EXTENSION_READINESS_WAIT_MS),
+    // A degraded secondary retries slowly in the background; an actual request is the signal to try again now.
+    // The dispatcher owns every wake-up, applying it at its tools/call dispatch point to whichever tools
+    // declare a bridge dependency, so routing one through waitForExtensionReady as well would only nudge twice
+    // for the same call and split the wiring across two modules.
+    ensureBridgeConnected: () => runtime.ensureBridgeConnected(),
     requestBrowserJobAuthorization,
     shutdownSignal: shutdownController.signal,
     log,
@@ -208,6 +268,14 @@ const shutdown = () => {
     shutdownController.abort();
     detachStdio();
     runtime.close();
+    // Last resort, not the normal path. The wedged-CLOSING peer socket this once existed for is now bounded by
+    // the owned transport, which destroys its handle after WS_CLIENT_CLOSE_GRACE_MS, and the broker's own
+    // timers are unref'd, so a healthy shutdown drains and exits without ever reaching this. It stays for an
+    // unknown straggler only: process.exit() abandons whatever is still buffered, including a result file
+    // mid-write, so the grace has to comfortably outlast every bounded wait above. Unref'd, so it never
+    // delays a clean exit.
+    const exitTimer = setTimeout(() => process.exit(process.exitCode ?? 0), 5000);
+    exitTimer.unref?.();
 };
 detachStdio = attachStdioTransport({ handleMessage: handleMcpMessage, sendError: mcpError, onClose: shutdown });
 runtime.start();

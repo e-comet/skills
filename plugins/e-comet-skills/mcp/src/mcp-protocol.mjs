@@ -11,3 +11,18 @@ export const textResult = (value, isError = false) => ({
     structuredContent: value,
     isError,
 });
+
+export const resourceLinkResult = (value, summary, artifacts, isError = false) => ({
+    content: [
+        { type: 'text', text: summary },
+        ...artifacts.map((artifact) => ({
+            type: 'resource_link',
+            uri: artifact.uri,
+            name: artifact.name,
+            mimeType: artifact.mimeType,
+            size: artifact.size,
+        })),
+    ],
+    structuredContent: value,
+    isError,
+});
