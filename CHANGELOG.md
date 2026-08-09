@@ -1,5 +1,10 @@
 # Changelog
 
+## [2026.8.4] - 2026-08-09
+
+Reorganised the README: installation is split into a browser-only basic path and a full desktop path, with separate
+setup steps for Claude and ChatGPT, and the tool list marks whether each tool reads Wildberries or the seller portal.
+
 ## [2026.8.3] - 2026-08-08
 
 ### Added
