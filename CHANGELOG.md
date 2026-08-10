@@ -1,40 +1,32 @@
 # Changelog
 
-## [2026.8.5] - 2026-08-09
-
-Corrected spelling, punctuation and typography in the README.
-
-## [2026.8.4] - 2026-08-09
-
-Reorganised the README: installation is split into a browser-only basic path and a full desktop path, with separate
-setup steps for Claude and ChatGPT, and the tool list marks whether each tool reads Wildberries or the seller portal.
-
 ## [2026.8.3] - 2026-08-08
 
-### Added
-- Added `wb_check_by_query` for checking whether one Wildberries product appears in search results for each requested
-  query.
-- Added `wb_seller_reviews` for mixed, entity-bound Wildberries seller-review exports with per-report partial results
-  and private local XLSX resource links.
-- Added bounded artifact streaming and storage with 100 MiB per-file, 500 MiB per-job, and 24-hour retention limits.
+### Добавлено
+- `wb_check_by_query` — проверка того, находится ли товар в поисковой выдаче Wildberries по каждой из указанных фраз.
+- `wb_seller_reviews` — выгрузка отзывов селлера в XLSX по нескольким наборам фильтров сразу, с частичным результатом
+  по каждому отчёту и ссылками на локальные файлы.
+- Потоковая загрузка и локальное хранение файлов с ограничениями: 100 МиБ на файл, 500 МиБ на задание и 24 часа
+  хранения.
 
-### Changed
-- Extended the trusted one-use browser authorization handoff to the seller-review export tool while keeping the plugin
-  MCP-only.
+### Изменено
+- Разовая передача браузерной авторизации распространена на выгрузку отзывов; плагин по-прежнему состоит только из
+  MCP-инструментов.
 
-### Fixed
-- The local bridge now resolves its peer token from a location that per-application storage cannot redirect, so two
-  desktop agents pair with each other instead of each running without the extension. Reconnection no longer gives up,
-  and `local_bridge_status` reports why a peer cannot be reached.
+### Исправлено
+- Локальный мост читает общий токен из места, которое не подменяется пер-приложенческим хранилищем: два десктопных
+  агента теперь связываются друг с другом, а не работают каждый без расширения. Переподключение больше не прекращается,
+  а `local_bridge_status` сообщает, почему второй агент недоступен.
 
 ## [2026.8.2] - 2026-08-07
 
-Initial public release of the e-Comet skill pack.
+Первый публичный выпуск набора инструментов e-Comet.
 
-### Added
-- Marketplace plugin for Claude Cowork and Codex Desktop that installs the remote e-Comet MCP for seller analytics
-  together with a bundled local MCP for live Wildberries data.
-- Typed local tools for Wildberries product cards, search results, recommendation shelves, and product images,
-  executed through the user's e-Comet browser extension.
-- Authorization handoff that keeps the signed browser-job token out of the model's context.
-- Full Wildberries responses stay on the user's computer; tool results carry compact summaries and local result paths.
+### Добавлено
+- Marketplace-плагин для Claude Cowork и Codex Desktop: подключает удалённый MCP e-Comet для аналитики кабинета и
+  встроенный локальный MCP для живых данных Wildberries.
+- Типизированные локальные инструменты для карточек товаров, поисковой выдачи, рекомендательных полок и фото —
+  выполняются через браузерное расширение e-Comet.
+- Передача авторизации, при которой подписанный токен не попадает в контекст модели.
+- Полные ответы Wildberries остаются на компьютере пользователя; в результат инструмента попадают компактная сводка и
+  путь к локальному файлу.
