@@ -3,7 +3,7 @@
 // otherwise write arbitrary text into a tool result and from there into the model's context.
 /**
  * The whole vocabulary, so a caller cannot be narrowed to whichever code happens to be a default.
- * @typedef {'authentication_failed' | 'protocol_mismatch' | 'handshake_required' | 'connection_failed' | 'listen_failed'} PeerRejectionCode
+ * @typedef {'authentication_failed' | 'protocol_mismatch' | 'handshake_required' | 'connection_failed' | 'listen_failed' | 'token_permission_denied' | 'token_unavailable'} PeerRejectionCode
  */
 export const PEER_REJECTION_CODES = Object.freeze({
     authenticationFailed: 'authentication_failed',
@@ -13,6 +13,8 @@ export const PEER_REJECTION_CODES = Object.freeze({
     // This process could not bind the listener at all — no peer was ever contacted. Reporting it through
     // `connection_failed` would send the reader to investigate a primary that was never reached.
     listenFailed: 'listen_failed',
+    tokenPermissionDenied: 'token_permission_denied',
+    tokenUnavailable: 'token_unavailable',
 });
 
 export class ConnectionState {
@@ -27,6 +29,11 @@ export class ConnectionState {
     peerReady = false;
     peerExtensionReady = false;
     peerExtensionBrowserJobReady = false;
+    peerBrowserContext = { state: 'unknown' };
+    peerExtensionLastConnectedAtMs = null;
+    peerExtensionLastDisconnectedAtMs = null;
+    peerExtensionVersion = undefined;
+    authenticatedPrimaryMetadata = undefined;
     peerReconnectTimer = null;
     peerReconnectBackoffStep = 0;
     // Classification of the attempt currently in flight. Cleared when an attempt ends, so a socket that closes
@@ -36,6 +43,10 @@ export class ConnectionState {
     peerRejectionCode = null;
     peerFailureSinceMs = null;
     peerNextRetryAtMs = null;
+    extensionLastConnectedAtMs = null;
+    extensionLastDisconnectedAtMs = null;
+    extensionVersion = undefined;
+    browserContext = { state: 'unknown' };
 
     constructor({ now = Date.now } = {}) {
         this.#now = now;
@@ -55,11 +66,31 @@ export class ConnectionState {
         return this.extensionBrowserJobReady || (this.peerReady && this.peerExtensionBrowserJobReady);
     }
 
-    connectExtension(socket, browserJobSupported) {
+    get effectiveBrowserContext() {
+        return this.extensionReady ? this.browserContext : this.peerReady ? this.peerBrowserContext : { state: 'unknown' };
+    }
+
+    get effectiveExtensionLastConnectedAtMs() {
+        return this.extensionReady ? this.extensionLastConnectedAtMs : this.peerReady ? this.peerExtensionLastConnectedAtMs : this.extensionLastConnectedAtMs;
+    }
+
+    get effectiveExtensionLastDisconnectedAtMs() {
+        return this.extensionReady ? this.extensionLastDisconnectedAtMs : this.peerReady ? this.peerExtensionLastDisconnectedAtMs : this.extensionLastDisconnectedAtMs;
+    }
+
+    get effectiveExtensionVersion() {
+        return this.extensionReady ? this.extensionVersion : this.peerReady ? this.peerExtensionVersion : this.extensionVersion;
+    }
+
+    connectExtension(socket, options) {
+        const browserJobSupported = typeof options === 'boolean' ? options : options.browserJobSupported;
         const previousSocket = this.extensionSocket;
+        if (previousSocket !== socket) this.browserContext = { state: 'unknown' };
         this.extensionSocket = socket;
         this.extensionReady = true;
         this.extensionBrowserJobReady = browserJobSupported;
+        this.extensionVersion = typeof options === 'object' ? options.version : undefined;
+        this.extensionLastConnectedAtMs = this.#now();
         this.#resolveExtensionReadyWaiters();
         return previousSocket && previousSocket !== socket ? previousSocket : null;
     }
@@ -69,6 +100,16 @@ export class ConnectionState {
         this.extensionSocket = null;
         this.extensionReady = false;
         this.extensionBrowserJobReady = false;
+        this.extensionLastDisconnectedAtMs = this.#now();
+        this.browserContext = { state: 'unknown' };
+        return true;
+    }
+
+    updateBrowserContext(socket, context) {
+        if (socket !== this.extensionSocket) return false;
+        const previous = this.browserContext;
+        if (previous.state === 'known' && previous.wbTabConnected === context.wbTabConnected && previous.sellerTabConnected === context.sellerTabConnected) return false;
+        this.browserContext = { state: 'known', ...context, changedAt: new Date(this.#now()).toISOString() };
         return true;
     }
 
@@ -76,13 +117,24 @@ export class ConnectionState {
     // message listener is never detached, so frames queued before its close completes still arrive; without
     // the identity check (which `disconnectPeer` already has) a late frame would republish readiness for a
     // socket that no longer exists and silently cancel a retry that was just armed.
-    updatePeerStatus({ extensionConnected, browserJobSupported }, socket) {
+    updatePeerStatus(message, socket, authenticatedPrimary = {}) {
         if (socket !== undefined && socket !== this.peerSocket) return null;
+        const { extensionConnected, browserJobSupported } = message;
         const wasReady = this.peerReady;
         this.resetPeerReconnect();
         this.peerReady = true;
         this.peerExtensionReady = extensionConnected === true;
         this.peerExtensionBrowserJobReady = browserJobSupported === true;
+        this.peerBrowserContext = message.browserContext?.state === 'known' ? { ...message.browserContext } : { state: 'unknown' };
+        this.peerExtensionLastConnectedAtMs = Number.isFinite(message.extensionLastConnectedAtMs) ? message.extensionLastConnectedAtMs : null;
+        this.peerExtensionLastDisconnectedAtMs = Number.isFinite(message.extensionLastDisconnectedAtMs) ? message.extensionLastDisconnectedAtMs : null;
+        this.peerExtensionVersion = typeof message.extensionVersion === 'string' ? message.extensionVersion : undefined;
+        this.authenticatedPrimaryMetadata = {
+            ...(typeof authenticatedPrimary.authenticatedPrimaryBridgeVersion === 'string'
+                ? { bridgeVersion: authenticatedPrimary.authenticatedPrimaryBridgeVersion }
+                : {}),
+            browserContextPropagationSupported: authenticatedPrimary.browserContextPropagationSupported === true,
+        };
         this.#resolveExtensionReadyWaiters();
         return wasReady;
     }
@@ -119,6 +171,8 @@ export class ConnectionState {
         this.peerReady = false;
         this.peerExtensionReady = false;
         this.peerExtensionBrowserJobReady = false;
+        this.peerBrowserContext = { state: 'unknown' };
+        this.authenticatedPrimaryMetadata = undefined;
         return true;
     }
 
@@ -128,6 +182,8 @@ export class ConnectionState {
         this.peerReady = false;
         this.peerExtensionReady = false;
         this.peerExtensionBrowserJobReady = false;
+        this.peerBrowserContext = { state: 'unknown' };
+        this.authenticatedPrimaryMetadata = undefined;
         this.resetPeerReconnect();
     }
 

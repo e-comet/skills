@@ -25,6 +25,8 @@ export const MESSAGE_TYPES = Object.freeze({
 
 export const localMessage = (id, type, payload) => ({ id, type, payload });
 
+export const PEER_CAPABILITIES = Object.freeze({ browserContextPropagation: 'browser_context_propagation' });
+
 export const peerStatusMessage = ({
     connections,
     handoff,
@@ -42,6 +44,11 @@ export const peerStatusMessage = ({
     bridgeGeneration,
     bridgeVersion,
     instanceId: handoff.instanceId,
+    capabilities: [PEER_CAPABILITIES.browserContextPropagation],
+    browserContext: connections.browserContext,
+    ...(connections.extensionLastConnectedAtMs === null ? {} : { extensionLastConnectedAtMs: connections.extensionLastConnectedAtMs }),
+    ...(connections.extensionLastDisconnectedAtMs === null ? {} : { extensionLastDisconnectedAtMs: connections.extensionLastDisconnectedAtMs }),
+    ...(connections.extensionVersion === undefined ? {} : { extensionVersion: connections.extensionVersion }),
 });
 
 export const CLIENT_TO_EXTENSION_MESSAGE_TYPES = Object.freeze([

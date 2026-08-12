@@ -14,17 +14,22 @@ import {
     HANDOFF_RECONNECT_GRACE_MS,
     HOST,
     PEER_PATH,
+    PEER_TOKEN_CREATE_TIMEOUT_MS,
+    PEER_TOKEN_DIR,
+    PEER_TOKEN_READ_TIMEOUT_MS,
     PORT,
     RESULT_DIR,
     SESSION_NONCE,
 } from './config.mjs';
 import { ConnectionState } from './connection-state.mjs';
+import { deriveBridgeDiagnostics } from './bridge-diagnostics.mjs';
 import { createExtensionProtocol } from './extension-protocol.mjs';
 import { localMessage, MESSAGE_TYPES } from './extension-vocabulary.mjs';
 import { HandoffState } from './handoff-state.mjs';
 import { createMcpMessageHandler } from './mcp-dispatcher.mjs';
 import { mcpError } from './mcp-protocol.mjs';
-import { loadOrCreatePeerToken } from './peer-auth.mjs';
+import { loadOrCreatePeerToken, loadPeerToken } from './peer-auth.mjs';
+import { createPeerTokenSource } from './peer-token-source.mjs';
 import { createPeerProtocol } from './peer-protocol.mjs';
 import { RequestBroker } from './request-broker.mjs';
 import { attachStdioTransport } from './stdio-transport.mjs';
@@ -43,17 +48,23 @@ if (!Number.isInteger(BRIDGE_GENERATION) || BRIDGE_GENERATION < 1) {
 }
 
 const log = (...args) => console.error('[e-comet-local-bridge]', ...args);
-const loadPeerTokenOrExit = async () => {
-    try {
-        return await loadOrCreatePeerToken();
-    } catch (error) {
-        log('failed to initialize local peer authentication:', error.message);
-        process.exit(1);
-    }
-};
-
 const instanceId = randomUUID();
-const peerToken = await loadPeerTokenOrExit();
+const injectedPeerTokenFailure =
+    process.env.NODE_ENV === 'test' ? process.env.ECOMET_LOCAL_TEST_PEER_TOKEN_FAILURE : undefined;
+const peerTokenSource = createPeerTokenSource({
+    load: () =>
+        injectedPeerTokenFailure
+            ? Promise.resolve({ ok: false, reason: injectedPeerTokenFailure })
+            : loadPeerToken({ directory: PEER_TOKEN_DIR }),
+    loadOrCreate: () => {
+        if (injectedPeerTokenFailure) {
+            return Promise.reject(Object.assign(new Error('Injected peer-token failure'), { code: 'EACCES' }));
+        }
+        return loadOrCreatePeerToken({ directory: PEER_TOKEN_DIR });
+    },
+    readDeadlineMs: PEER_TOKEN_READ_TIMEOUT_MS,
+    createDeadlineMs: PEER_TOKEN_CREATE_TIMEOUT_MS,
+});
 const connections = new ConnectionState();
 const handoff = new HandoffState({
     generation: BRIDGE_GENERATION,
@@ -215,7 +226,6 @@ const peerProtocol = createPeerProtocol({
     connections,
     requestBroker,
     handoff,
-    peerToken,
     send: sendWs,
     log,
     broadcastStatus,
@@ -233,14 +243,18 @@ runtime = createBridgeRuntime({
     peerProtocol,
     handoff,
     connections,
+    peerTokenSource,
     log,
 });
 
 const requestBrowserJobAuthorization = (...args) => requestBroker.requestAuthorization(...args);
 const shutdownController = new AbortController();
 const handleMcpMessage = createMcpMessageHandler({
-    getBridgeStatus: () => ({
-        ...runtime.status(),
+    getBridgeStatus: () => {
+        const rawStatus = runtime.status();
+        return ({
+        ...rawStatus,
+        ...deriveBridgeDiagnostics(rawStatus, connections.now()),
         bridgeVersion: BRIDGE_VERSION,
         bridgeGeneration: BRIDGE_GENERATION,
         controlProtocolVersion: CONTROL_PROTOCOL_VERSION,
@@ -248,7 +262,7 @@ const handleMcpMessage = createMcpMessageHandler({
         instanceId,
         websocket: `ws://${HOST}:${PORT}${EXTENSION_PATH}`,
         resultDirectory: RESULT_DIR,
-    }),
+    });},
     waitForExtensionReady: () => connections.waitForExtensionReady(EXTENSION_READINESS_WAIT_MS),
     // A degraded secondary retries slowly in the background; an actual request is the signal to try again now.
     // The dispatcher owns every wake-up, applying it at its tools/call dispatch point to whichever tools

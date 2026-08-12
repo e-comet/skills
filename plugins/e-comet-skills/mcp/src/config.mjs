@@ -69,6 +69,9 @@ export const PEER_WAKE_COOLDOWN_MS = 2000;
 // A peer that has neither connected nor completed a handshake by now is wedged, not slow. Without this the
 // socket would sit open and silent, emitting no close and so scheduling no further attempt.
 export const PEER_HANDSHAKE_TIMEOUT_MS = 5000;
+export const PEER_TOKEN_READ_TIMEOUT_MS = 1000;
+export const PEER_TOKEN_CREATE_TIMEOUT_MS = 5000;
+export const PEER_PENDING_UPGRADE_LIMIT = 16;
 // close() only starts the closing handshake; a peer that never answers the Close frame would otherwise hold
 // the TCP handle in CLOSING until the process exits — one leaked handle per retry against a silent listener.
 // After this grace the client transport destroys its socket outright.

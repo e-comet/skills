@@ -146,7 +146,10 @@ export const createExtensionProtocol = ({
             }
             const previousSocket = connections.connectExtension(
                 socket,
-                Array.isArray(payload.capabilities) && payload.capabilities.includes('browser_job')
+                {
+                    browserJobSupported: Array.isArray(payload.capabilities) && payload.capabilities.includes('browser_job'),
+                    version: payload.extensionVersion,
+                }
             );
             previousSocket?.end(encodeFrame('', 0x8));
             handoff.markTopologySettled();
@@ -162,6 +165,16 @@ export const createExtensionProtocol = ({
         }
 
         if (type === MESSAGE_TYPES.ping) {
+            const context = payload.browserContext;
+            if (
+                context &&
+                Object.keys(context).length === 2 &&
+                typeof context.wbTabConnected === 'boolean' &&
+                typeof context.sellerTabConnected === 'boolean' &&
+                connections.updateBrowserContext(socket, context)
+            ) {
+                broadcastStatus();
+            }
             send(socket, localMessage(message.id, MESSAGE_TYPES.pong, { at: Date.now() }));
             return;
         }

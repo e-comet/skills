@@ -3,6 +3,12 @@
 Codex and Claude launch `src/server.mjs` directly over STDIO with the `node` command. The server has no npm runtime
 dependencies; all required source modules are included in this directory. Node.js 22+ is required.
 
+`local_bridge_status` distinguishes bridge startup, extension waiting, Wildberries-tab readiness,
+update needs, and pairing failures, and returns a recommended next action. Peer-token storage affects
+pairing only; if a second agent reports `peer_unavailable`, continue in the agent that owns the bridge.
+Browser jobs may still return `LOCAL_STORAGE_FAILED` when result or artifact directories are
+unwritable; storage classification, fallback, and retry work is deferred.
+
 The canonical source and tests live under `e-comet-local-mcp/` in the private skills repository. This plugin contains a
 release snapshot of its `src/` directory.
 

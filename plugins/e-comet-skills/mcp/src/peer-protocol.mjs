@@ -16,7 +16,7 @@ import {
     isValidSellerStreamStart,
 } from './extension-protocol.mjs';
 import { createPeerAuthNonce, createPeerAuthProof, isValidPeerAuthNonce, peerTokensEqual } from './peer-auth.mjs';
-import { peerStatusMessage, SELLER_OPERATION_STAGES } from './extension-vocabulary.mjs';
+import { PEER_CAPABILITIES, peerStatusMessage, SELLER_OPERATION_STAGES } from './extension-vocabulary.mjs';
 import { safeExternalToolError, ToolExecutionError, toolFailure } from './tool-errors.mjs';
 import { encodeFrame } from './websocket.mjs';
 import { validTimeout } from './wb-domain.mjs';
@@ -71,7 +71,6 @@ export const createPeerProtocol = ({
     connections,
     requestBroker,
     handoff,
-    peerToken,
     send,
     log,
     broadcastStatus,
@@ -116,8 +115,12 @@ export const createPeerProtocol = ({
         }
     };
 
-    const createState = (socket, { role = 'server' } = {}) => ({
+    /** @param {unknown} socket @param {{role?: string, peerToken?: string}} [options] */
+    const createState = (socket, { role = 'server', peerToken } = {}) => {
+        if (typeof peerToken !== 'string' || peerToken.length === 0) throw new Error('Resolved peer token is required');
+        return ({
         socket,
+        peerToken,
         role,
         peerHandshakeComplete: false,
         mutualPeerAuthentication: false,
@@ -141,7 +144,8 @@ export const createPeerProtocol = ({
                       clientNonce: createPeerAuthNonce(),
                   }
                 : undefined,
-    });
+        });
+    };
 
     const rejectUnauthenticated = (state, reason) => {
         send(state.socket, {
@@ -187,6 +191,11 @@ export const createPeerProtocol = ({
             bridgeVersion: BRIDGE_VERSION,
             instanceId: handoff.instanceId,
             handoffSupported: true,
+            capabilities: [PEER_CAPABILITIES.browserContextPropagation],
+            browserContext: connections.browserContext,
+            ...(connections.extensionLastConnectedAtMs === null ? {} : { extensionLastConnectedAtMs: connections.extensionLastConnectedAtMs }),
+            ...(connections.extensionLastDisconnectedAtMs === null ? {} : { extensionLastDisconnectedAtMs: connections.extensionLastDisconnectedAtMs }),
+            ...(connections.extensionVersion === undefined ? {} : { extensionVersion: connections.extensionVersion }),
         });
         return state.peerGeneration > handoff.generation
             ? {
@@ -240,7 +249,7 @@ export const createPeerProtocol = ({
                 serverNonce: message.serverNonce,
             };
             const transcript = peerAuthTranscript(client, primary);
-            const expectedProof = createPeerAuthProof(peerToken, 'primary', transcript);
+            const expectedProof = createPeerAuthProof(state.peerToken, 'primary', transcript);
             if (!peerTokensEqual(message.serverProof, expectedProof)) {
                 rejectUntrustedPrimary(state);
                 return;
@@ -251,7 +260,7 @@ export const createPeerProtocol = ({
                 JSON.stringify({
                     type: 'peer_auth_response',
                     controlProtocolVersion: CONTROL_PROTOCOL_VERSION,
-                    clientProof: createPeerAuthProof(peerToken, 'client', transcript),
+                    clientProof: createPeerAuthProof(state.peerToken, 'client', transcript),
                 })
             );
             return;
@@ -271,7 +280,11 @@ export const createPeerProtocol = ({
             }
             state.peerHandshakeComplete = true;
             state.mutualPeerAuthentication = true;
-            const wasReady = connections.updatePeerStatus(message, state.socket);
+            const wasReady = connections.updatePeerStatus(message, state.socket, {
+                authenticatedPrimaryBridgeVersion: authenticatedPrimary.bridgeVersion,
+                browserContextPropagationSupported:
+                    Array.isArray(message.capabilities) && message.capabilities.includes(PEER_CAPABILITIES.browserContextPropagation),
+            });
             // A welcome on a superseded socket publishes nothing: the readiness it would set could never be
             // cleared, because disconnectPeer only acts for the current socket.
             if (wasReady === null) return;
@@ -306,7 +319,11 @@ export const createPeerProtocol = ({
             return;
         }
         if (message?.type === 'peer_status') {
-            const wasReady = connections.updatePeerStatus(message, state.socket);
+            const wasReady = connections.updatePeerStatus(message, state.socket, {
+                authenticatedPrimaryBridgeVersion: state.authenticatedPrimary?.bridgeVersion,
+                browserContextPropagationSupported:
+                    connections.authenticatedPrimaryMetadata?.browserContextPropagationSupported === true,
+            });
             if (wasReady === null) return;
             // Only a connection *becoming* ready settles the topology here. A routine broadcast on an
             // already-established socket is not a topology event: mid-handoff the draining primary keeps
@@ -448,7 +465,7 @@ export const createPeerProtocol = ({
                 instanceId: primary.instanceId,
                 clientNonce: client.clientNonce,
                 serverNonce: primary.serverNonce,
-                serverProof: createPeerAuthProof(peerToken, 'primary', transcript),
+                serverProof: createPeerAuthProof(state.peerToken, 'primary', transcript),
             });
             return;
         }
@@ -459,7 +476,7 @@ export const createPeerProtocol = ({
                 !pending ||
                 message.controlProtocolVersion !== CONTROL_PROTOCOL_VERSION ||
                 typeof message.clientProof !== 'string' ||
-                !peerTokensEqual(message.clientProof, createPeerAuthProof(peerToken, 'client', pending.transcript))
+                !peerTokensEqual(message.clientProof, createPeerAuthProof(state.peerToken, 'client', pending.transcript))
             ) {
                 rejectUnauthenticated(state, 'Peer authentication failed');
                 return;

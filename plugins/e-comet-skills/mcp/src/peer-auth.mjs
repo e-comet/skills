@@ -1,5 +1,6 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { chmod, link, mkdir, open, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { chmod, link, lstat, mkdir, open, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { PEER_TOKEN_DIR } from './config.mjs';
@@ -10,7 +11,7 @@ const PEER_AUTH_CONTEXT = 'e-comet-local-peer-auth-v1';
 const TEMPORARY_TOKEN_STALE_MS = 24 * 60 * 60 * 1_000;
 const TEMPORARY_TOKEN_PATTERN = /^\.peer-token\.\d+\.[a-f0-9]{16}\.tmp$/;
 const ATOMIC_LINK_UNSUPPORTED_CODES = new Set(['EACCES', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP', 'EPERM', 'EXDEV']);
-const DEFAULT_FILE_SYSTEM = { chmod, link, mkdir, open, readFile, readdir, rm, stat };
+const DEFAULT_FILE_SYSTEM = { chmod, link, lstat, mkdir, open, readFile, readdir, rm, stat };
 
 const normalizeToken = (value) => value.trim();
 const restrictExistingTokenPermissions = async (tokenPath, fileSystem) => {
@@ -83,7 +84,7 @@ export const loadOrCreatePeerToken = async ({
             const existing = normalizeToken(await fileSystem.readFile(tokenPath, 'utf8'));
             if (!TOKEN_PATTERN.test(existing)) {
                 if (repairAttempts >= repairLimit) {
-                    throw new Error('Corrupt local peer token could not be repaired');
+                    throw Object.assign(new Error('Corrupt local peer token could not be repaired'), { code: 'PEER_TOKEN_CORRUPT' });
                 }
                 repairAttempts += 1;
                 await fileSystem.rm(tokenPath, { force: true });
@@ -131,12 +132,62 @@ export const loadOrCreatePeerToken = async ({
                 }
             }
             if (repairAttempts >= repairLimit) {
-                throw new Error('Corrupt local peer token could not be repaired');
+                throw Object.assign(new Error('Corrupt local peer token could not be repaired'), { code: 'PEER_TOKEN_CORRUPT' });
             }
             repairAttempts += 1;
             continue;
         } finally {
             await fileSystem.rm(temporaryTokenPath, { force: true }).catch(() => undefined);
         }
+    }
+};
+
+const peerTokenFailure = (reason) => ({ ok: false, reason });
+const mapReadFailure = (error) => {
+    if (error?.code === 'ENOENT') return 'missing';
+    if (error?.code === 'EPERM' || error?.code === 'EACCES') return 'permission_denied';
+    if (error?.code === 'ELOOP') return 'insecure_permissions';
+    if (error?.code === 'PEER_TOKEN_ATOMIC_PUBLISH_UNSUPPORTED') return 'unsupported';
+    if (error?.code === 'PEER_TOKEN_CORRUPT') return 'corrupt';
+    return 'io_error';
+};
+
+export const loadPeerToken = async ({
+    directory = PEER_TOKEN_DIR,
+    fileSystem: fileSystemOverrides = {},
+    platform = process.platform,
+    uid = process.getuid?.(),
+} = {}) => {
+    const fileSystem = { ...DEFAULT_FILE_SYSTEM, ...fileSystemOverrides };
+    const tokenPath = join(directory, TOKEN_FILE);
+    try {
+        let contents;
+        if (platform === 'win32') {
+            contents = await fileSystem.readFile(tokenPath, 'utf8');
+        } else {
+            const before = await fileSystem.lstat(directory);
+            if (!before.isDirectory() || before.isSymbolicLink() || before.uid !== uid || (before.mode & 0o077) !== 0) {
+                return peerTokenFailure('insecure_permissions');
+            }
+            let handle;
+            try {
+                handle = await fileSystem.open(tokenPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+                const metadata = await handle.stat();
+                if (!metadata.isFile() || metadata.isSymbolicLink?.() || metadata.uid !== uid || (metadata.mode & 0o077) !== 0) {
+                    return peerTokenFailure('insecure_permissions');
+                }
+                const after = await fileSystem.lstat(directory);
+                if (!after.isDirectory() || after.isSymbolicLink() || after.dev !== before.dev || after.ino !== before.ino) {
+                    return peerTokenFailure('insecure_permissions');
+                }
+                contents = await handle.readFile('utf8');
+            } finally {
+                await handle?.close();
+            }
+        }
+        const token = normalizeToken(contents);
+        return TOKEN_PATTERN.test(token) ? { ok: true, token } : peerTokenFailure('corrupt');
+    } catch (error) {
+        return peerTokenFailure(mapReadFailure(error));
     }
 };

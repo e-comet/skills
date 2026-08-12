@@ -29,7 +29,17 @@ export const serverInstructions =
 export const tools = [
     {
         name: 'local_bridge_status',
-        description: 'Check whether the local e-Comet Chrome extension is connected to this MCP server.',
+        description:
+            'Reports extensionConnected, the stable state code, and actionable recommendedAction. Translate the stable state into a short user-facing explanation; keep structured protocol codes in English. ' +
+            'ready means only that the local bridge, extension protocol, and an observed WB or seller browser context are available; each typed tool still decides its own live WB or seller prerequisites. ' +
+            'Use these Russian examples when speaking to a Russian-language user: ' +
+            'waiting_for_extension: «Локальный bridge запущен и ждёт подключения расширения.» ' +
+            'extension_connected_no_wb_tab: «Расширение подключено; откройте авторизованную вкладку Wildberries.» ' +
+            'extension_context_unknown: «Расширение подключено, но эта версия не сообщает контекст вкладок; обновите расширение. Конкретный инструмент всё ещё проверит свои условия сам.» ' +
+            'peer_context_unknown: «Расширение доступно через другой локальный процесс, но он не передаёт контекст вкладок; перезапустите или обновите desktop hosts. Не делайте вывод, что устарело само расширение.» ' +
+            'ready: «Локальный bridge и расширение подключены; найдена вкладка Wildberries. Готовность конкретного задания проверит выбранный инструмент.» ' +
+            'peer_unavailable + FIX_PEER_TOKEN_PERMISSIONS: «Другой локальный процесс уже владеет bridge, но этот агент не может подключиться из-за ограничений доступа к данным сопряжения в профиле пользователя. Разрешите desktop host доступ к профилю пользователя и повторите запрос.» Use this explanation only for the explicit FIX_PEER_TOKEN_PERMISSIONS action; do not expose raw filesystem paths or errors. ' +
+            'peer_unavailable: «Мостом уже владеет другой агент, и связаться с ним не удалось — работайте в нём.»',
         inputSchema: toolInputSchemas.local_bridge_status,
         outputSchema: toolOutputSchemas.local_bridge_status,
         annotations: {

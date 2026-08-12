@@ -11,6 +11,7 @@ import {
     HANDOFF_MAX_DRAIN_MS,
     HANDOFF_RECONNECT_GRACE_MS,
     PEER_HANDSHAKE_TIMEOUT_MS,
+    PEER_RECONNECT_BASE_MS,
     PEER_RECONNECT_MAX_MS,
     PEER_WAKE_COOLDOWN_MS,
     SESSION_NONCE,
@@ -38,9 +39,12 @@ export const createBridgeRuntime = ({
     peerProtocol,
     handoff,
     connections,
+    peerTokenSource,
     log,
     // Only a test seam: a suite cannot wait out the production deadline to prove a silent peer is abandoned.
     peerHandshakeTimeoutMs = PEER_HANDSHAKE_TIMEOUT_MS,
+    inboundPeerResolutionTimeoutMs = 1000,
+    inboundPeerHandshakeTimeoutMs = 5000,
 }) => {
     const acceptedPeerStates = new Set();
     const connectionStates = new Set();
@@ -50,10 +54,13 @@ export const createBridgeRuntime = ({
     // connectionStates yet still blocks server.close() — and closeIdleConnections()/closeAllConnections() do
     // not touch upgraded sockets, which the HTTP server no longer tracks.
     const upgradedSockets = new Set();
+    const inboundPeerAdmissions = new Map();
     let closed = false;
     // Guards a listener attempt between `listen()` and its callback or 'error' event, where `server.listening`
     // is still false. Without it two nearly simultaneous wake-ups both reach `listen()`.
     let bridgeStartPending = false;
+    let peerConnectPending = false;
+    let listenerState = 'pending';
     let lastBridgeStartAttemptAtMs = null;
     // Which classifications the current degraded episode has already announced. A retry is never logged on its
     // own — a process that lives for days would write a line every 30 seconds — and a code that alternates
@@ -201,13 +208,63 @@ export const createBridgeRuntime = ({
         if (destroySocket) state.socket.destroy();
     };
 
-    server.on('upgrade', (request, socket) => {
+    const releaseInboundPeerAdmission = (socket) => {
+        const admission = inboundPeerAdmissions.get(socket);
+        if (!admission || admission.released) return false;
+        admission.released = true;
+        clearTimeout(admission.resolutionTimer);
+        clearTimeout(admission.handshakeTimer);
+        inboundPeerAdmissions.delete(socket);
+        return true;
+    };
+
+    const acquireInboundPeerAdmission = (socket) => {
+        if (inboundPeerAdmissions.size >= 16) return null;
+        const admission = { released: false, resolutionTimer: null, handshakeTimer: null };
+        inboundPeerAdmissions.set(socket, admission);
+        const cleanup = () => releaseInboundPeerAdmission(socket);
+        socket.once('close', cleanup);
+        socket.once('error', cleanup);
+        return admission;
+    };
+
+    server.on('upgrade', async (request, socket) => {
         if (
             (request.url !== extensionPath && request.url !== peerPath) ||
             request.headers.upgrade?.toLowerCase() !== 'websocket' ||
             !request.headers['sec-websocket-key']
         ) {
             socket.destroy();
+            return;
+        }
+
+        const inboundAdmission = request.url === peerPath ? acquireInboundPeerAdmission(socket) : null;
+        if (request.url === peerPath && !inboundAdmission) {
+            socket.destroy();
+            return;
+        }
+
+        let resolvedPeerToken;
+        if (request.url === peerPath && peerTokenSource) {
+            inboundAdmission.resolutionTimer = setTimeout(() => {
+                socket.destroy();
+                releaseInboundPeerAdmission(socket);
+            }, inboundPeerResolutionTimeoutMs);
+            inboundAdmission.resolutionTimer.unref?.();
+            const tokenResult = await peerTokenSource.resolve({ allowCreate: false });
+            clearTimeout(inboundAdmission.resolutionTimer);
+            inboundAdmission.resolutionTimer = null;
+            if (closed || socket.destroyed || inboundAdmission.released || !tokenResult.ok) {
+                socket.destroy();
+                releaseInboundPeerAdmission(socket);
+                return;
+            }
+            resolvedPeerToken = tokenResult.token;
+        }
+
+        if (closed || socket.destroyed || (inboundAdmission && inboundAdmission.released)) {
+            socket.destroy();
+            releaseInboundPeerAdmission(socket);
             return;
         }
 
@@ -219,6 +276,7 @@ export const createBridgeRuntime = ({
         ) {
             log('rejected WebSocket origin');
             socket.destroy();
+            releaseInboundPeerAdmission(socket);
             return;
         }
 
@@ -236,7 +294,7 @@ export const createBridgeRuntime = ({
 
         const protocolState =
             request.url === peerPath
-                ? peerProtocol.createState(socket)
+                ? peerProtocol.createState(socket, { peerToken: resolvedPeerToken })
                 : {
                       socket,
                       extensionHandshakeComplete: false,
@@ -261,6 +319,14 @@ export const createBridgeRuntime = ({
         socket.on('close', () => upgradedSockets.delete(socket));
         connectionStates.add(state);
         if (request.url === peerPath) acceptedPeerStates.add(state);
+        if (inboundAdmission) {
+            inboundAdmission.handshakeTimer = setTimeout(() => {
+                if (state.peerHandshakeComplete) return;
+                closeConnectionState(state);
+                releaseInboundPeerAdmission(socket);
+            }, inboundPeerHandshakeTimeoutMs);
+            inboundAdmission.handshakeTimer.unref?.();
+        }
 
         if (request.url === extensionPath) {
             state.helloId = randomUUID();
@@ -302,6 +368,7 @@ export const createBridgeRuntime = ({
                         (message) => {
                             void Promise.resolve(peerProtocol.handleMessage(state, message))
                                 .then((effect) => {
+                                    if (state.peerHandshakeComplete) releaseInboundPeerAdmission(socket);
                                     if (effect?.type === 'handoff_requested') return beginHandoff(effect);
                                 })
                                 .catch((error) => log('WebSocket message handling failed:', error.message));
@@ -388,6 +455,7 @@ export const createBridgeRuntime = ({
     // retry, contradicting the invariant that reconnection never gives up — while the log line and the status
     // code follow the degraded-episode rules: announced once per episode, never once per retry.
     const onListenFailure = (error) => {
+        listenerState = 'failed';
         process.exitCode = 1;
         connections.recordPeerRejection(PEER_REJECTION_CODES.listenFailed);
         if (!announcedDegradedCodes.has(PEER_REJECTION_CODES.listenFailed)) {
@@ -404,6 +472,7 @@ export const createBridgeRuntime = ({
     // and a failed bind never removes it, so re-passing it on every retry of a now-endless schedule would
     // accumulate one callback per attempt and fire them all together when the port finally frees.
     server.on('listening', () => {
+        listenerState = 'listening';
         bridgeStartPending = false;
         clearStaleExitVerdict();
         noteDegradedEpisodeEnded('primary');
@@ -466,12 +535,35 @@ export const createBridgeRuntime = ({
         scheduleBridgeStart(0);
     };
 
-    connectToPrimaryBridge = () => {
+    connectToPrimaryBridge = async () => {
         if (closed) return;
         if (peerSocketLive()) return;
+        if (peerConnectPending) return;
+        peerConnectPending = true;
+        let resolvedPeerToken;
+        if (peerTokenSource) {
+            const tokenResult = await peerTokenSource.resolve({ allowCreate: true });
+            if (closed) {
+                peerConnectPending = false;
+                return;
+            }
+            if (!tokenResult.ok) {
+                peerConnectPending = false;
+                const rejectionCode =
+                    ['permission_denied', 'insecure_permissions'].includes(tokenResult.reason)
+                        ? PEER_REJECTION_CODES.tokenPermissionDenied
+                        : PEER_REJECTION_CODES.tokenUnavailable;
+                connections.recordPeerRejection(rejectionCode);
+                const retry = connections.nextPeerReconnectDelay({ baseMs: PEER_RECONNECT_BASE_MS, maxMs: PEER_RECONNECT_MAX_MS });
+                scheduleBridgeStart(retry.delayMs, connectToPrimaryBridge);
+                return;
+            }
+            resolvedPeerToken = tokenResult.token;
+        }
 
         const socket = createWebSocket(`ws://${host}:${port}${peerPath}`);
-        const state = peerProtocol.createState(socket, { role: 'client' });
+        const state = peerProtocol.createState(socket, { role: 'client', peerToken: resolvedPeerToken });
+        peerConnectPending = false;
         connections.clearPeerAttemptVerdict();
         connections.peerSocket = socket;
         // A peer that never answers leaves this socket silent forever: no 'close' fires, so nothing schedules the
@@ -552,6 +644,7 @@ export const createBridgeRuntime = ({
         // would make every later ensureBridgeConnected() a silent no-op.
         bridgeStartPending = false;
         if (error.code === 'EADDRINUSE') {
+            listenerState = 'address_in_use';
             if (connections.peerReconnectBackoffStep === 0) {
                 log(`local bridge already exists at ${host}:${port}; using it as the primary instance`);
             }
@@ -572,6 +665,10 @@ export const createBridgeRuntime = ({
         connections.peerSocket?.close();
         for (const state of [...connectionStates]) {
             closeConnectionState(state);
+        }
+        for (const [socket] of [...inboundPeerAdmissions]) {
+            socket.destroy();
+            releaseInboundPeerAdmission(socket);
         }
         // Sockets that already left connectionStates without being destroyed (the echoed-close-frame path)
         // would otherwise keep the process alive after shutdown.
@@ -595,6 +692,14 @@ export const createBridgeRuntime = ({
             browserJobSupported: connections.effectiveBrowserJobReady,
             bridgeRole: server.listening ? 'primary' : connections.peerReady ? 'secondary' : 'disconnected',
             bridgeTransitioning: handoff.transitioning,
+            listenerState,
+            browserContext: connections.effectiveBrowserContext,
+            extensionLastConnectedAtMs: connections.effectiveExtensionLastConnectedAtMs,
+            extensionLastDisconnectedAtMs: connections.effectiveExtensionLastDisconnectedAtMs,
+            extensionVersion: connections.effectiveExtensionVersion,
+            ...(connections.peerReady && connections.authenticatedPrimaryMetadata
+                ? { peer: connections.authenticatedPrimaryMetadata }
+                : {}),
             ...(peerRejection === undefined ? {} : { peerRejection }),
         };
     };

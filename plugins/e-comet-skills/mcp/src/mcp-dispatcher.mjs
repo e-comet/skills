@@ -430,17 +430,15 @@ export const createMcpMessageHandler = ({
         }
     };
 
-    // `needsBridge` declares which tools depend on the bridge, so the wake-up is applied once at the dispatch
-    // point below instead of being remembered inside each handler. A tool added without the flag simply never
-    // nudges; a tool added with it cannot forget to. `wb_product_images` is the deliberate false: it is a
-    // public image-CDN lookup, and nudging for it would stamp the wake-up cooldown against a bridge it never
-    // uses. The status read carries the flag because that is what an agent reaches for when the bridge is
-    // degraded — the snapshot still describes the state as it was, and the nudge affects what happens next,
-    // so the diagnostic path can repair the bridge it describes.
+    // `needsBridge` declares which operational tools depend on the bridge, so the wake-up is applied once at
+    // the dispatch point below instead of being remembered inside each handler. A tool added without the flag
+    // never nudges; a tool added with it cannot forget to. `local_bridge_status` is deliberately false because
+    // its read-only contract forbids a diagnostic call from pulling forward peer-token creation.
+    // `wb_product_images` is also false: it is a public image-CDN lookup that never uses the bridge.
     const toolHandlers = new Map([
         [
             'local_bridge_status',
-            { needsBridge: true, run: async (id) => sendResult(id, textResult({ ok: true, ...getBridgeStatus() })) },
+            { needsBridge: false, run: async (id) => sendResult(id, textResult({ ok: true, ...getBridgeStatus() })) },
         ],
         [
             'wb_product_card',
