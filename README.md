@@ -49,10 +49,29 @@
 
 #### ChatGPT Desktop (Codex)
 
-1. Откройте `Settings` → `Configuration` и включите `Allow network access`.
+1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Configuration` и включите `Allow network access`.
 2. Откройте `Plugins`, нажмите `+` → `Add marketplace`. Укажите `https://github.com/e-comet/skills` в поле `Source` и нажмите `Add marketplace`.
 3. Там же, в `Plugins`, в разделе `Personal` нажмите `e-Comet MCP Tools` и в разделе `Hooks` выберите `Trust all`.
 4. Убедитесь, что оба MCP-сервера, `E-comet` и `E-comet-local`, готовы к работе (справа ⚙️), иначе нажмите `Install` / `Connect` и введите почту.
+
+## Обновление
+
+### Базовая установка
+
+Ручные обновления не требуются, так как обновляется только удаленный MCP-сервер.
+
+### Полная установка
+
+Рекомендуем регулярно обновлять установку для добавления нового функционала и улучшения стабильности текущего. Список последних изменений доступен в [CHANGELOG](CHANGELOG.md).
+
+#### Claude Desktop (Cowork)
+
+1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Plugins` → `Browse` → `Personal` → `...` у `skills` → `Check for updates`.
+2. Снова зайдите в `Settings` → `Plugins` → `e-Comet MCP Tools` → `Update`. Если `Update` неактивна и `Last updated` совпадает с последней датой в [CHANGELOG](CHANGELOG.md) - значит у вас уже установлена последняя версия.
+
+#### ChatGPT Desktop (Codex)
+
+1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Plugins` → `Мarketplace` → `Мarketplace` → `e-Comet MCP Tools` → `Upgrade`.
 
 ## Начало работы
 
