@@ -71,7 +71,7 @@
 
 #### ChatGPT Desktop (Codex)
 
-1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Plugins` → `Мarketplace` → `Мarketplace` → `e-Comet MCP Tools` → `Upgrade`.
+1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Plugins` → `Мarketplace` → `e-Comet MCP Tools` → `Upgrade`.
 
 ## Начало работы
 
