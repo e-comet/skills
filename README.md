@@ -1,4 +1,4 @@
-# e-Comet Skills
+# <img src="plugins/e-comet-skills/assets/logo.png" alt="" width="45" height="45" align="absmiddle"> e-Comet Skills
 
 Инструменты e-Comet помогают селлерам работать с Wildberries: анализировать данные кабинета по API и через ЛК ВБ, а также получать актуальные данные напрямую с Wildberries.
 
@@ -29,7 +29,7 @@
 ### Полная
 
 > [!IMPORTANT]
-> Необходим установленный ИИ-агент (Claude или ChatGPT) в виде десктопного приложения с платной подпиской.
+> Необходим ИИ-агент с поддержкой плагинов: Claude Desktop (Cowork), Claude Code, ChatGPT Desktop (Codex) или Codex CLI с платной подпиской.
 
 #### Браузер и расширение
 
@@ -47,6 +47,13 @@
 4. Нажмите `+` на карточке `e-Comet MCP Tools`. В окне-подтверждении нажмите `Continue`.
 5. Нажмите на ⚙️ на карточке `e-Comet MCP Tools`. В разделе `Connectors` у `e-comet` нажмите `Install`. Нажмите `Add`. Нажмите `Connect` и введите почту.
 
+#### Claude Code
+
+```bash
+claude plugin marketplace add https://github.com/e-comet/skills
+claude plugin install e-comet-skills@e-comet-skills
+```
+
 #### ChatGPT Desktop (Codex)
 
 1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Configuration` и включите `Allow network access`.
@@ -54,24 +61,12 @@
 3. Там же, в `Plugins`, в разделе `Personal` нажмите `e-Comet MCP Tools` и в разделе `Hooks` выберите `Trust all`.
 4. Убедитесь, что оба MCP-сервера, `E-comet` и `E-comet-local`, готовы к работе (справа ⚙️), иначе нажмите `Install` / `Connect` и введите почту.
 
-## Обновление
+#### Codex CLI
 
-### Базовая установка
-
-Ручные обновления не требуются, так как обновляется только удаленный MCP-сервер.
-
-### Полная установка
-
-Рекомендуем регулярно обновлять установку для добавления нового функционала и улучшения стабильности текущего. Список последних изменений доступен в [CHANGELOG](CHANGELOG.md).
-
-#### Claude Desktop (Cowork)
-
-1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Plugins` → `Browse` → `Personal` → `...` у `skills` → `Check for updates`.
-2. Снова зайдите в `Settings` → `Plugins` → `e-Comet MCP Tools` → `Update`. Если `Update` неактивна и `Last updated` совпадает с последней датой в [CHANGELOG](CHANGELOG.md) - значит у вас уже установлена последняя версия.
-
-#### ChatGPT Desktop (Codex)
-
-1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Plugins` → `Мarketplace` → `e-Comet MCP Tools` → `Upgrade`.
+```bash
+codex plugin marketplace add https://github.com/e-comet/skills
+codex plugin add e-comet-skills@e-comet-skills
+```
 
 ## Начало работы
 
@@ -121,33 +116,62 @@
 
 </details>
 
+<a id="plugin-update"></a>
+
+## Обновление
+
+### Базовая установка
+
+Ручные обновления не требуются, так как обновляется только удаленный MCP-сервер.
+
+### Полная установка
+
+Рекомендуем регулярно обновлять установку для добавления нового функционала и улучшения стабильности текущего. При использовании функций полной установки агент сообщит, если доступно обновление. Список последних изменений доступен в [CHANGELOG](CHANGELOG.md).
+
+<a id="update-cowork"></a>
+
+#### Claude Desktop (Cowork)
+
+1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Plugins` → `Browse` → `Personal` → `...` у `e-comet-skills` → `Check for updates`.
+2. Снова зайдите в `Settings` → `Plugins` → `e-Comet MCP Tools` → `Update`. Если `Update` неактивна и `Last updated` совпадает с последней датой в [CHANGELOG](CHANGELOG.md) — значит у вас уже установлена последняя версия.
+
+<a id="update-claude-code"></a>
+
+#### Claude Code
+
+```bash
+claude plugin marketplace update e-comet-skills
+claude plugin update e-comet-skills@e-comet-skills
+```
+
+Выполните `/reload-plugins` или перезапустите Claude Code, затем начните новую задачу.
+
+<a id="update-codex"></a>
+
+#### ChatGPT Desktop (Codex)
+
+1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Plugins` → `Marketplace` → `e-Comet MCP Tools` → `Upgrade`.
+
+<a id="update-codex-cli"></a>
+
+#### Codex CLI
+
+```bash
+codex plugin marketplace upgrade e-comet-skills
+codex plugin add e-comet-skills@e-comet-skills
+```
+
+После обновления начните новую задачу.
+
 ## FAQ
 
 ### Зачем нужно расширение?
 
 Для надёжного выполнения запросов к Wildberries через браузер. Без расширения Wildberries может блокировать запросы или возвращать неполную информацию.
 
-### Работает ли это в Claude Code / Codex CLI?
+## Устранение неполадок
 
-Да. В обоих клиентах достаточно добавить marketplace и установить плагин.
-
-Claude Code:
-
-```bash
-claude plugin marketplace add https://github.com/e-comet/skills
-claude plugin install e-comet-skills@e-comet-skills
-```
-
-Codex CLI:
-
-```bash
-codex plugin marketplace add https://github.com/e-comet/skills
-codex plugin add e-comet-skills@e-comet-skills
-```
-
-## Если живые данные Wildberries не загружаются
-
-Проверьте, что:
+Если живые данные Wildberries не загружаются, проверьте, что:
 
 - Chrome запущен
 - расширение e-Comet установлено и активировано

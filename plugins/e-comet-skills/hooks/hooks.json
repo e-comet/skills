@@ -25,6 +25,17 @@
             "statusMessage": "Restoring e-Comet browser authorization"
           }
         ]
+      },
+      {
+        "matcher": "^mcp__(?:plugin_e-comet-skills_)?e[-_]comet[-_]local__.*$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/check-update.mjs\"",
+            "timeout": 4,
+            "statusMessage": "Checking e-Comet MCP Tools plugin version"
+          }
+        ]
       }
     ]
   }
