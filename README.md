@@ -13,18 +13,24 @@
 > [!IMPORTANT]
 > Если вы хотите Полную установку, то шаги, описанные в Базовой, делать не нужно.
 
-#### Claude
+<details>
+<summary>Claude</summary>
 
 1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Connectors` → `Add` → `Add custom connector`.
 2. `Name`: e-Comet, `Remote MCP server URL`: https://mcp.e-comet.io/mcp → `Add`.
 3. У коннектора `e-comet` нажмите `Connect` и введите почту.
 
-#### ChatGPT
+</details>
+
+<details>
+<summary>ChatGPT</summary>
 
 1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Security and login` → `Developer mode` → Включить.
 2. На панели слева `Plugins` → `+`.
 3. `Name`: e-Comet, `Connection`: https://mcp.e-comet.io/mcp, `Authentication`: OAuth, `I understand and want to continue`: Чек → `Create`.
 4. В окне `Add e-Comet to ChatGPT` нажмите `Sign in with e-Comet` и введите почту.
+
+</details>
 
 ### Полная
 
@@ -39,7 +45,8 @@
 3. Активируйте расширение API-ключом из [аккаунта e-Comet](https://app.e-comet.io/account).
 4. Войдите в свой аккаунт на [wildberries.ru](https://www.wildberries.ru/lk).
 
-#### Claude Desktop (Cowork)
+<details>
+<summary>Claude Desktop (Cowork)</summary>
 
 1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Capabilities`, включите `Allow network egress` и выберите `All domains` в `Domain allowlist`.
 2. Оставаясь в окне настроек, откройте слева `Plugins` → `Add` → `Add marketplace` → `Add from repository`.
@@ -47,26 +54,37 @@
 4. Нажмите `+` на карточке `e-Comet MCP Tools`. В окне-подтверждении нажмите `Continue`.
 5. Нажмите на ⚙️ на карточке `e-Comet MCP Tools`. В разделе `Connectors` у `e-comet` нажмите `Install`. Нажмите `Add`. Нажмите `Connect` и введите почту.
 
-#### Claude Code
+</details>
+
+<details>
+<summary>Claude Code</summary>
 
 ```bash
 claude plugin marketplace add https://github.com/e-comet/skills
 claude plugin install e-comet-skills@e-comet-skills
 ```
 
-#### ChatGPT Desktop (Codex)
+</details>
+
+<details>
+<summary>ChatGPT Desktop (Codex)</summary>
 
 1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Configuration` и включите `Allow network access`.
 2. Откройте `Plugins`, нажмите `+` → `Add marketplace`. Укажите `https://github.com/e-comet/skills` в поле `Source` и нажмите `Add marketplace`.
 3. Там же, в `Plugins`, в разделе `Personal` нажмите `e-Comet MCP Tools` и в разделе `Hooks` выберите `Trust all`.
 4. Убедитесь, что оба MCP-сервера, `E-comet` и `E-comet-local`, готовы к работе (справа ⚙️), иначе нажмите `Install` / `Connect` и введите почту.
 
-#### Codex CLI
+</details>
+
+<details>
+<summary>Codex CLI</summary>
 
 ```bash
 codex plugin marketplace add https://github.com/e-comet/skills
 codex plugin add e-comet-skills@e-comet-skills
 ```
+
+</details>
 
 ## Начало работы
 
@@ -130,14 +148,18 @@ codex plugin add e-comet-skills@e-comet-skills
 
 <a id="update-cowork"></a>
 
-#### Claude Desktop (Cowork)
+<details>
+<summary>Claude Desktop (Cowork)</summary>
 
 1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Plugins` → `Browse` → `Personal` → `...` у `e-comet-skills` → `Check for updates`.
 2. Снова зайдите в `Settings` → `Plugins` → `e-Comet MCP Tools` → `Update`. Если `Update` неактивна и `Last updated` совпадает с последней датой в [CHANGELOG](CHANGELOG.md) — значит у вас уже установлена последняя версия.
 
+</details>
+
 <a id="update-claude-code"></a>
 
-#### Claude Code
+<details>
+<summary>Claude Code</summary>
 
 ```bash
 claude plugin marketplace update e-comet-skills
@@ -146,15 +168,21 @@ claude plugin update e-comet-skills@e-comet-skills
 
 Выполните `/reload-plugins` или перезапустите Claude Code, затем начните новую задачу.
 
+</details>
+
 <a id="update-codex"></a>
 
-#### ChatGPT Desktop (Codex)
+<details>
+<summary>ChatGPT Desktop (Codex)</summary>
 
 1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Plugins` → `Marketplace` → `e-Comet MCP Tools` → `Upgrade`.
 
+</details>
+
 <a id="update-codex-cli"></a>
 
-#### Codex CLI
+<details>
+<summary>Codex CLI</summary>
 
 ```bash
 codex plugin marketplace upgrade e-comet-skills
@@ -162,6 +190,8 @@ codex plugin add e-comet-skills@e-comet-skills
 ```
 
 После обновления начните новую задачу.
+
+</details>
 
 ## FAQ
 
