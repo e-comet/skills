@@ -696,6 +696,7 @@ export const createBridgeRuntime = ({
             browserContext: connections.effectiveBrowserContext,
             extensionLastConnectedAtMs: connections.effectiveExtensionLastConnectedAtMs,
             extensionLastDisconnectedAtMs: connections.effectiveExtensionLastDisconnectedAtMs,
+            extensionTakeovers: connections.effectiveExtensionTakeovers,
             extensionVersion: connections.effectiveExtensionVersion,
             ...(connections.peerReady && connections.authenticatedPrimaryMetadata
                 ? { peer: connections.authenticatedPrimaryMetadata }

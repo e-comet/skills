@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const CALVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\+codex\.[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
-const LOCAL_TOOL_PATTERN = /^mcp__(?:plugin_e-comet-skills_)?e[-_]comet[-_]local__.*$/;
+const LOCAL_TOOL_PATTERN = /^mcp__.*e[-_]comet[-_]local__.*$/;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 const MAX_SESSION_BYTES = 1024;
 const MAX_STDIN_BYTES = 1024 * 1024;

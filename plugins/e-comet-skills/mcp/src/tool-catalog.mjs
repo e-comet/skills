@@ -35,6 +35,8 @@ export const tools = [
             'Use these Russian examples when speaking to a Russian-language user: ' +
             'waiting_for_extension: «Локальный bridge запущен и ждёт подключения расширения.» ' +
             'extension_connected_no_wb_tab: «Расширение подключено; откройте авторизованную вкладку Wildberries.» ' +
+            'extension_contended + CLOSE_DUPLICATE_EXTENSIONS: «Похоже, расширение e-Comet работает в нескольких экземплярах — возможно, в разных профилях браузера, — и они отбирают соединение друг у друга. Оставьте включённым только тот профиль, где открыта авторизованная вкладка Wildberries.» ' +
+            'Do not assert the number of profiles or which one is at fault: the bridge observes repeated socket takeovers, not the browser layout. extensionTakeovers.count is a count within a recent window, and saturated true means it is a lower bound. Do not tell the user to open a WB tab for this state — a takeover clears the tab context, so the tab is usually already open. ' +
             'extension_context_unknown: «Расширение подключено, но эта версия не сообщает контекст вкладок; обновите расширение. Конкретный инструмент всё ещё проверит свои условия сам.» ' +
             'peer_context_unknown: «Расширение доступно через другой локальный процесс, но он не передаёт контекст вкладок; перезапустите или обновите desktop hosts. Не делайте вывод, что устарело само расширение.» ' +
             'ready: «Локальный bridge и расширение подключены; найдена вкладка Wildberries. Готовность конкретного задания проверит выбранный инструмент.» ' +

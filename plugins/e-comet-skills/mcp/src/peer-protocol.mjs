@@ -195,6 +195,9 @@ export const createPeerProtocol = ({
             browserContext: connections.browserContext,
             ...(connections.extensionLastConnectedAtMs === null ? {} : { extensionLastConnectedAtMs: connections.extensionLastConnectedAtMs }),
             ...(connections.extensionLastDisconnectedAtMs === null ? {} : { extensionLastDisconnectedAtMs: connections.extensionLastDisconnectedAtMs }),
+            // Тот же набор, что и в `peer_status`: иначе пир до первого пуша считает,
+            // что перехватов не было, и первые секунды после подключения диагностирует мимо.
+            extensionTakeoverAtMs: connections.extensionTakeoverAtMs,
             ...(connections.extensionVersion === undefined ? {} : { extensionVersion: connections.extensionVersion }),
         });
         return state.peerGeneration > handoff.generation

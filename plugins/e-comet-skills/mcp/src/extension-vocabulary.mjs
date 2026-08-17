@@ -48,6 +48,11 @@ export const peerStatusMessage = ({
     browserContext: connections.browserContext,
     ...(connections.extensionLastConnectedAtMs === null ? {} : { extensionLastConnectedAtMs: connections.extensionLastConnectedAtMs }),
     ...(connections.extensionLastDisconnectedAtMs === null ? {} : { extensionLastDisconnectedAtMs: connections.extensionLastDisconnectedAtMs }),
+    // Вторичный процесс сам расширение не видит, поэтому без этого поля конкуренция
+    // диагностируется только на первичном — а агент чаще как раз secondary. Передаются
+    // метки, а не сводка: получатель считает скользящее окно сам, иначе снимок замер бы у
+    // него навсегда — новые `peer_status` при неизменившемся статусе не рассылаются.
+    extensionTakeoverAtMs: connections.extensionTakeoverAtMs,
     ...(connections.extensionVersion === undefined ? {} : { extensionVersion: connections.extensionVersion }),
 });
 

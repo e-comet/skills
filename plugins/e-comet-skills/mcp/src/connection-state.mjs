@@ -17,10 +17,42 @@ export const PEER_REJECTION_CODES = Object.freeze({
     tokenUnavailable: 'token_unavailable',
 });
 
+// Окно, за которое считаются перехваты сокета расширением. Живой замер конкуренции двух
+// профилей давал перехват примерно раз в секунду, поэтому настоящая конкуренция набирает
+// порог за секунды, а одиночный повторный connect в окно не собирается.
+export const EXTENSION_TAKEOVER_WINDOW_MS = 30_000;
+// Кольцо ограничено, чтобы память не росла на затяжном пинг-понге. При заполнении `count`
+// становится нижней оценкой, и это помечается флагом `saturated`.
+export const EXTENSION_TAKEOVER_MAX_ENTRIES = 20;
+
+// По проводу идут сами метки, а не готовая сводка. Сводка — снимок на момент отправки:
+// вторичный процесс не получает новых `peer_status`, пока статус не меняется (неизменившийся
+// heartbeat рассылки не вызывает), поэтому у него окно никогда бы не истекло и
+// `extension_contended` держался бы бессрочно. С метками обе стороны считают окно сами, и
+// отдельные события выпадают из него постепенно, а не разом.
+const normalizeTakeoverTimestamps = (value) => {
+    if (!Array.isArray(value)) return null;
+    if (!value.every((atMs) => Number.isFinite(atMs))) return null;
+    return value.slice(-EXTENSION_TAKEOVER_MAX_ENTRIES);
+};
+
+const summarizeTakeovers = (takeoverAtMs, nowMs) => {
+    const cutoffMs = nowMs - EXTENSION_TAKEOVER_WINDOW_MS;
+    const recentCount = takeoverAtMs.reduce((count, atMs) => (atMs >= cutoffMs ? count + 1 : count), 0);
+    return {
+        count: recentCount,
+        lastAtMs: takeoverAtMs.at(-1) ?? null,
+        // Кольцо заполнено, значит внутри окна могли быть и более ранние перехваты:
+        // `count` тогда — нижняя оценка, а не точное число.
+        saturated: recentCount >= EXTENSION_TAKEOVER_MAX_ENTRIES,
+    };
+};
+
 export class ConnectionState {
     #extensionReadyWaiters = new Set();
     #closed = false;
     #now;
+    #extensionTakeoverAtMs = [];
 
     extensionSocket = null;
     extensionReady = false;
@@ -32,6 +64,7 @@ export class ConnectionState {
     peerBrowserContext = { state: 'unknown' };
     peerExtensionLastConnectedAtMs = null;
     peerExtensionLastDisconnectedAtMs = null;
+    peerExtensionTakeoverAtMs = null;
     peerExtensionVersion = undefined;
     authenticatedPrimaryMetadata = undefined;
     peerReconnectTimer = null;
@@ -82,10 +115,45 @@ export class ConnectionState {
         return this.extensionReady ? this.extensionVersion : this.peerReady ? this.peerExtensionVersion : this.extensionVersion;
     }
 
+    // Сколько раз за окно у расширения отбирали сокет. Считается только вытеснение живого
+    // чужого сокета: штатное переподключение одного расширения сюда не попадает, потому что
+    // после его close `extensionSocket` уже null.
+    get extensionTakeovers() {
+        return summarizeTakeovers(this.#extensionTakeoverAtMs, this.#now());
+    }
+
+    // Метки для передачи пиру: он считает окно сам, поэтому получает события, а не вывод.
+    get extensionTakeoverAtMs() {
+        return [...this.#extensionTakeoverAtMs];
+    }
+
+    // Окно пересчитывается на каждом чтении и для своих меток, и для полученных от пира:
+    // вторичный процесс обязан видеть, как конкуренция затухает, даже если новых
+    // `peer_status` больше не приходило.
+    get effectiveExtensionTakeovers() {
+        if (this.extensionReady) return this.extensionTakeovers;
+        return this.peerReady && this.peerExtensionTakeoverAtMs
+            ? summarizeTakeovers(this.peerExtensionTakeoverAtMs, this.#now())
+            : this.extensionTakeovers;
+    }
+
     connectExtension(socket, options) {
         const browserJobSupported = typeof options === 'boolean' ? options : options.browserJobSupported;
         const previousSocket = this.extensionSocket;
+        const evicted = Boolean(previousSocket) && previousSocket !== socket;
         if (previousSocket !== socket) this.browserContext = { state: 'unknown' };
+        // Вытеснение — единственный путь, на котором прежнее соединение заканчивается без
+        // собственного close: `disconnectExtension` для вытесненного сокета вернёт false,
+        // потому что текущим уже числится новый. Без записи здесь время разрыва не
+        // появлялось никогда — ровно в том сценарии, ради диагностики которого оно нужно
+        // (два экземпляра расширения, отбирающие сокет друг у друга).
+        if (evicted) {
+            this.extensionLastDisconnectedAtMs = this.#now();
+            this.#extensionTakeoverAtMs.push(this.#now());
+            if (this.#extensionTakeoverAtMs.length > EXTENSION_TAKEOVER_MAX_ENTRIES) {
+                this.#extensionTakeoverAtMs.splice(0, this.#extensionTakeoverAtMs.length - EXTENSION_TAKEOVER_MAX_ENTRIES);
+            }
+        }
         this.extensionSocket = socket;
         this.extensionReady = true;
         this.extensionBrowserJobReady = browserJobSupported;
@@ -128,6 +196,9 @@ export class ConnectionState {
         this.peerBrowserContext = message.browserContext?.state === 'known' ? { ...message.browserContext } : { state: 'unknown' };
         this.peerExtensionLastConnectedAtMs = Number.isFinite(message.extensionLastConnectedAtMs) ? message.extensionLastConnectedAtMs : null;
         this.peerExtensionLastDisconnectedAtMs = Number.isFinite(message.extensionLastDisconnectedAtMs) ? message.extensionLastDisconnectedAtMs : null;
+        // Приходит по loopback от соседнего процесса, поэтому форма проверяется целиком:
+        // в статус агента попадает только то, что мы сами умеем объяснить.
+        this.peerExtensionTakeoverAtMs = normalizeTakeoverTimestamps(message.extensionTakeoverAtMs);
         this.peerExtensionVersion = typeof message.extensionVersion === 'string' ? message.extensionVersion : undefined;
         this.authenticatedPrimaryMetadata = {
             ...(typeof authenticatedPrimary.authenticatedPrimaryBridgeVersion === 'string'
