@@ -27,7 +27,7 @@
         ]
       },
       {
-        "matcher": "^mcp__.*e[-_]comet[-_]local__.*$",
+        "matcher": "^mcp__(?:(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet(?:[-_]local)?__.+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}__(?:info|describe_metrics|list_entities|query_metrics|query_forecast|browser_job))$",
         "hooks": [
           {
             "type": "command",

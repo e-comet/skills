@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 
 import { createHash, randomBytes } from 'node:crypto';
+import { realpathSync, statSync } from 'node:fs';
 import { mkdir, open, readFile, readdir, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const CALVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\+codex\.[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
-const LOCAL_TOOL_PATTERN = /^mcp__.*e[-_]comet[-_]local__.*$/;
+const ECOMET_TOOL_PATTERN = /^mcp__(?:(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet(?:[-_]local)?__.+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}__(?:info|describe_metrics|list_entities|query_metrics|query_forecast|browser_job))$/;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 const MAX_SESSION_BYTES = 1024;
 const MAX_STDIN_BYTES = 1024 * 1024;
@@ -20,17 +21,31 @@ export const LOCK_RELEASE_RETRY_LIMIT = 20;
 export const LOCK_RELEASE_RETRY_MS = 5;
 const TRANSIENT_FILESYSTEM_ERRORS = new Set(['EACCES', 'EBUSY', 'EPERM']);
 const UPDATE_URL = 'https://github.com/e-comet/skills#plugin-update';
+export const CHANGELOG_URL = 'https://github.com/e-comet/skills/blob/main/CHANGELOG.md';
+// Claude Code caps hook output at 10,000 characters; Codex caps a model-visible hook message at
+// roughly 2,500 tokens, which for Cyrillic is pessimistically ~3,750 characters. This budget sits
+// under the tighter ceiling with margin and still holds far more than the changelog written to date.
+export const CHANGELOG_CONTEXT_BUDGET = 3000;
+const MAX_CHANGELOG_BYTES = 64 * 1024;
+const MAX_RELEASES = 200;
+const MAX_ADDED_ENTRIES = 20;
+const MAX_ADDED_ENTRY_BYTES = 2048;
+const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/e-comet/skills/main/plugins/e-comet-skills/.codex-plugin/plugin.json';
 const CACHE_NAME = 'plugin-update-latest-v1.json';
 const GLOBAL_LOCK_NAME = 'plugin-update-latest-v1.lock';
 const SESSION_DIRECTORY = 'plugin-update-sessions-v1';
+const CHANGELOG_STATE_NAME = 'changelog-state-v1.json';
+const CHANGELOG_LOCK_NAME = 'changelog-state-v1.lock';
 
 export const REMOTE_INTERVAL_MS = 86_400_000;
 export const MAX_FUTURE_SKEW_MS = 300_000;
 export const FETCH_TIMEOUT_MS = 2_500;
+export const MAX_CALVER_BYTES = 256;
 
 export const normalizeCalVer = (value) => {
     if (typeof value !== 'string') return null;
+    if (Buffer.byteLength(value, 'utf8') > MAX_CALVER_BYTES) return null;
     const match = CALVER_PATTERN.exec(value);
     if (match === null) return null;
     const components = match.slice(1, 4).map(Number);
@@ -48,12 +63,126 @@ export const compareCalVer = (left, right) => {
     return 0;
 };
 
+const normalizeAdded = (value) => {
+    if (!Array.isArray(value) || value.length === 0 || value.length > MAX_ADDED_ENTRIES) return null;
+    for (const entry of value) {
+        if (typeof entry !== 'string' || entry.trim().length === 0) return null;
+        if (Buffer.byteLength(entry, 'utf8') > MAX_ADDED_ENTRY_BYTES) return null;
+        if (CONTROL_CHARACTERS.test(entry)) return null;
+    }
+    return [...value];
+};
+
+export const normalizeChangelogFeed = (value, installedVersion) => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+    if (Object.keys(value).sort().join('\0') !== ['releases', 'schemaVersion', 'version'].join('\0')) return null;
+    if (value.schemaVersion !== 1) return null;
+    if (normalizeCalVer(value.version) === null || normalizeCalVer(installedVersion) === null) return null;
+    // The top-level version identifies the exact build whose local changelog this is. Numeric CalVer
+    // comparison deliberately ignores +codex metadata for release ranges, but build identity must not.
+    if (value.version !== installedVersion) return null;
+    if (!Array.isArray(value.releases) || value.releases.length > MAX_RELEASES) return null;
+    const releases = [];
+    let previous = null;
+    for (const release of value.releases) {
+        if (release === null || typeof release !== 'object' || Array.isArray(release)) return null;
+        if (Object.keys(release).sort().join('\0') !== ['added', 'version'].join('\0')) return null;
+        if (normalizeCalVer(release.version) === null) return null;
+        if (compareCalVer(release.version, value.version) === 1) return null;
+        // Strictly descending: selection walks this list newest first and stops when the budget is hit.
+        if (previous !== null && compareCalVer(previous, release.version) !== 1) return null;
+        const added = normalizeAdded(release.added);
+        if (added === null) return null;
+        releases.push({ version: release.version, added });
+        previous = release.version;
+    }
+    return { version: value.version, releases };
+};
+
+export const normalizeHandledState = (value) => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+    if (Object.keys(value).sort().join('\0') !== ['lastHandledVersion', 'schemaVersion'].join('\0')) return null;
+    if (value.schemaVersion !== 1) return null;
+    return normalizeCalVer(value.lastHandledVersion) === null ? null : value.lastHandledVersion;
+};
+
+export const selectChangelogEntries = ({ feed, handledVersion, installedVersion, budget = CHANGELOG_CONTEXT_BUDGET }) => {
+    const inRange = feed.releases.filter(
+        (release) =>
+            compareCalVer(release.version, handledVersion) === 1 && compareCalVer(release.version, installedVersion) !== 1,
+    );
+    if (inRange.length === 0) return null;
+    const totalEntries = inRange.reduce((sum, release) => sum + release.added.length, 0);
+    let added = [];
+    let taken = 0;
+    let prefix = [];
+    for (let index = 0; index < inRange.length; index += 1) {
+        // Whole releases only: a user never sees half of a version.
+        prefix = [...prefix, ...inRange[index].added];
+        const rendered = buildChangelogContext(
+            installedVersion,
+            prefix,
+            totalEntries - prefix.length,
+            inRange.length - (index + 1),
+        );
+        // The omission sentence shrinks and eventually disappears, so later cumulative prefixes can
+        // fit even when an earlier rendering did not. Retain the deepest whole-release prefix that fits.
+        if (rendered.length <= budget) {
+            added = prefix;
+            taken = index + 1;
+        }
+    }
+    return { added, omittedEntries: totalEntries - added.length, omittedReleases: inRange.length - taken };
+};
+
+export const decideChangelogNotice = ({ installedVersion, handledVersion, selection }) => {
+    if (handledVersion === null) return { emit: false, store: installedVersion };
+    const order = compareCalVer(handledVersion, installedVersion);
+    if (order === null) return { emit: false, store: installedVersion };
+    // A stored version at or above the installed one is never lowered: a rollback would otherwise
+    // re-announce the version the user has already seen every time the plugin moves forward again.
+    if (order >= 0) return { emit: false, store: null };
+    return { emit: selection !== null, store: installedVersion };
+};
+
+// The hosts render the notice as Markdown, so the block is dictated verbatim rather than described:
+// a heading line, a bulleted list and a trailing rule that separates the notice from the answer the
+// user actually asked for. Describing it left the model free to flatten everything into paragraphs.
+const ONE_SHOT_FINAL_INSTRUCTION =
+    'Эта одноразовая инструкция относится только к ближайшему итоговому ответу текущего хода. Не выводи уведомление в размышлениях, commentary или промежуточных сообщениях. Покажи уведомление ровно один раз в самом начале ближайшего итогового ответа, даже если в текущем ходе было несколько вызовов инструментов. После отправки этого итогового ответа считай инструкцию исполненной и не повторяй уведомление в последующих ответах.';
+const CHANGELOG_INSTRUCTION =
+    `${ONE_SHOT_FINAL_INSTRUCTION} Выведи блок ниже дословно вместе со строкой «---», затем дай основной результат. Не упоминай hook или служебный контекст.`;
+
+const buildChangelogBlock = (version, body) =>
+    `${CHANGELOG_INSTRUCTION}
+
+**Установлено обновление плагина e-Comet MCP Tools версии ${version}**
+
+${body}
+
+[Все изменения](${CHANGELOG_URL})
+
+---`;
+
+export const buildChangelogContext = (version, added, omittedEntries, omittedReleases) => {
+    const tail = omittedEntries > 0
+        ? `
+
+За рамками списка: изменений — ${omittedEntries}; предыдущих версий — ${omittedReleases}.`
+        : '';
+    return buildChangelogBlock(version, `Добавлено:
+${added.map((entry) => `- ${entry}`).join('\n')}${tail}`);
+};
+
+export const buildChangelogDigestContext = (version) =>
+    buildChangelogBlock(version, 'Накопившихся изменений слишком много для короткого перечисления.');
+
 export const validateEvent = (value) => {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
     const { hook_event_name: hookEventName, session_id: sessionId, tool_name: toolName } = value;
     if (hookEventName !== 'PreToolUse') return null;
     if (typeof sessionId !== 'string' || sessionId.length === 0 || Buffer.byteLength(sessionId, 'utf8') > MAX_SESSION_BYTES) return null;
-    if (typeof toolName !== 'string' || !LOCAL_TOOL_PATTERN.test(toolName)) return null;
+    if (typeof toolName !== 'string' || !ECOMET_TOOL_PATTERN.test(toolName)) return null;
     return { sessionId, toolName };
 };
 
@@ -80,8 +209,8 @@ export const resolvePluginPaths = (env) => {
 
 const requireDirectory = (path) => {
     // Keep the exported resolver synchronous for command-hook callers.
-    const result = process.getBuiltinModule('node:fs').realpathSync(path);
-    return process.getBuiltinModule('node:fs').statSync(result).isDirectory() ? result : null;
+    const result = realpathSync(path);
+    return statSync(result).isDirectory() ? result : null;
 };
 
 const readBoundedFile = async (path, maximumBytes) => {
@@ -110,10 +239,86 @@ export const readInstalledVersion = async (pluginRoot) => {
     }
 };
 
+export const readHandledState = async (stateDir, readStateFile = readBoundedFile) => {
+    try {
+        const raw = await readStateFile(join(stateDir, CHANGELOG_STATE_NAME), MAX_MANIFEST_BYTES);
+        if (raw === null) return { status: 'invalid' };
+        let value;
+        try {
+            value = JSON.parse(raw);
+        } catch {
+            return { status: 'invalid' };
+        }
+        const version = normalizeHandledState(value);
+        return version === null ? { status: 'invalid' } : { status: 'valid', version };
+    } catch (error) {
+        return { status: error?.code === 'ENOENT' ? 'missing' : 'error' };
+    }
+};
+
+export const readChangelogFeed = async (pluginRoot, installedVersion) => {
+    try {
+        const raw = await readBoundedFile(join(pluginRoot, 'changelog.json'), MAX_CHANGELOG_BYTES);
+        return raw === null ? null : normalizeChangelogFeed(JSON.parse(raw), installedVersion);
+    } catch {
+        return null;
+    }
+};
+
+const selectFor = async (pluginRoot, handledVersion, installedVersion, readFeed) => {
+    const feed = await readFeed(pluginRoot, installedVersion);
+    return feed === null ? null : selectChangelogEntries({ feed, handledVersion, installedVersion });
+};
+
+export const resolveChangelogNotice = async ({
+    acquireStateLock = acquireLock,
+    pluginRoot,
+    readFeed = readChangelogFeed,
+    stateDir,
+    lockOperations = {},
+    readState = readHandledState,
+    writeState = writeAtomicJson,
+}) => {
+    try {
+        if (typeof stateDir !== 'string' || stateDir.length === 0) return null;
+        const installedVersion = await readInstalledVersion(pluginRoot);
+        if (installedVersion === null) return null;
+        await mkdir(stateDir, { recursive: true, mode: 0o700 });
+        // Unlocked pre-read: the steady state is "already handled", and it must cost two reads and no lock.
+        const initialState = await readState(stateDir);
+        if (initialState.status === 'error') return null;
+        // Covers both already-handled directions, not just equality: after a rollback the older plugin root
+        // can only ever decide to do nothing, and must not take the lock to learn that.
+        const initialOrder = initialState.status === 'valid' ? compareCalVer(initialState.version, installedVersion) : null;
+        if (initialOrder !== null && initialOrder >= 0) return null;
+
+        const release = await acquireStateLock(join(stateDir, CHANGELOG_LOCK_NAME), Date.now(), lockOperations);
+        if (release === null) return null;
+        try {
+            const lockedState = await readState(stateDir);
+            if (lockedState.status === 'error') return null;
+            const handledVersion = lockedState.status === 'valid' ? lockedState.version : null;
+            const selection = compareCalVer(handledVersion, installedVersion) === -1
+                ? await selectFor(pluginRoot, handledVersion, installedVersion, readFeed)
+                : null;
+            const { emit, store } = decideChangelogNotice({ installedVersion, handledVersion, selection });
+            if (store !== null) {
+                // Persist before emitting: a lost notification is preferred over a repeated one.
+                await writeState(join(stateDir, CHANGELOG_STATE_NAME), { schemaVersion: 1, lastHandledVersion: store });
+            }
+            return emit ? { version: installedVersion, ...selection } : null;
+        } finally {
+            await release().catch(() => {});
+        }
+    } catch {
+        return null;
+    }
+};
+
 export const sessionKey = (sessionId) => createHash('sha256').update(sessionId, 'utf8').digest('hex');
 
 export const buildAdditionalContext = (installedVersion, latestVersion) =>
-    `В начале ближайшего сообщения перед основным результатом одной короткой строкой сообщи пользователю: «Доступно обновление плагина e-Comet MCP Tools: установлена версия ${installedVersion}, доступна версия ${latestVersion}. [Как обновить](${UPDATE_URL})». Не упоминай hook или служебный контекст.`;
+    `${ONE_SHOT_FINAL_INSTRUCTION} Выведи уведомление одной строкой: «Доступно обновление плагина e-Comet MCP Tools: установлена версия ${installedVersion}, доступна версия ${latestVersion}. [Как обновить](${UPDATE_URL})». Затем выведи строку «---» и основной результат. Не упоминай hook или служебный контекст.`;
 
 const isValidTimestamp = (value, nowMs) =>
     value === null || (Number.isSafeInteger(value) && value >= 0 && value <= nowMs + MAX_FUTURE_SKEW_MS);
@@ -438,19 +643,29 @@ export const checkUpdateForSession = async ({ pluginRoot, dataRoot, event, fetch
     }
 };
 
+const emit = (additionalContext) =>
+    `${JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext } })}\n`;
+
 export const runHook = async ({ input, env, fetchImpl, nowMs = Date.now() }) => {
     try {
         const event = validateEvent(input);
         const paths = resolvePluginPaths(env);
-        if (event === null || paths === null || typeof fetchImpl !== 'function' || !Number.isSafeInteger(nowMs)) return '';
+        if (event === null || paths === null || !Number.isSafeInteger(nowMs)) return '';
+
+        // Path B runs on every matching call: an update can land while a session stays open, and the
+        // once-per-version guarantee comes from the stored version rather than the session marker.
+        const notice = await resolveChangelogNotice({ pluginRoot: paths.pluginRoot, stateDir: paths.dataRoot });
+        if (notice !== null) {
+            // Nothing fit the budget: name the version and let the link carry the rest.
+            return emit(notice.added.length === 0
+                ? buildChangelogDigestContext(notice.version)
+                : buildChangelogContext(notice.version, notice.added, notice.omittedEntries, notice.omittedReleases));
+        }
+
+        if (typeof fetchImpl !== 'function') return '';
         const update = await checkUpdateForSession({ ...paths, event, fetchImpl, nowMs });
         if (update === null) return '';
-        return `${JSON.stringify({
-            hookSpecificOutput: {
-                hookEventName: 'PreToolUse',
-                additionalContext: buildAdditionalContext(update.installedVersion, update.latestVersion),
-            },
-        })}\n`;
+        return emit(buildAdditionalContext(update.installedVersion, update.latestVersion));
     } catch {
         return '';
     }
@@ -471,11 +686,31 @@ const readStdin = async () => {
 export const main = async () => {
     try {
         const input = await readStdin();
-        const output = await runHook({ input, env: process.env, fetchImpl: globalThis.fetch, nowMs: Date.now() });
+        const output = await runHook({
+            input,
+            env: process.env,
+            fetchImpl: globalThis.fetch,
+            nowMs: Date.now(),
+        });
         if (output !== '') process.stdout.write(output);
     } catch {
         // Command hooks must always fail open without polluting the agent response or diagnostics.
     }
 };
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();
+// Node resolves module specifiers through symlinks, so `import.meta.url` is already canonical while
+// argv[1] keeps whatever path the host invoked. On macOS the temporary directory alone differs
+// (/var vs /private/var), and a symlinked plugin root would otherwise leave the hook silently inert.
+const isEntryPoint = (invokedPath) => {
+    if (typeof invokedPath !== 'string' || invokedPath.length === 0) return false;
+    const modulePath = fileURLToPath(import.meta.url);
+    const invoked = resolve(invokedPath);
+    if (invoked === modulePath) return true;
+    try {
+        return realpathSync(invoked) === modulePath;
+    } catch {
+        return false;
+    }
+};
+
+if (isEntryPoint(process.argv[1])) await main();

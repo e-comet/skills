@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { posix, win32 } from 'node:path';
+import { resolveLocalStateDir, resolvePeerTokenDir } from './state-paths.mjs';
 
 const readBuildVersion = () => {
     for (const metadataUrl of [new URL('../package.json', import.meta.url), new URL('../../.codex-plugin/plugin.json', import.meta.url)]) {
@@ -179,26 +179,7 @@ export const IMAGE_BASKET_BOUNDS = [
     4349, 4565, 4877, 5189, 5501, 5813, 6125, 6437, 6749, 7061, 7373, 7685, 7997, 8309, 8741, 9173, 9605, 10373, 11141, 11909, 12677, 13445,
     14213,
 ];
-export const resolveLocalStateDir = ({ platform = process.platform, env = process.env, home = homedir() } = {}) => {
-    if (platform === 'win32') {
-        return win32.join(env.LOCALAPPDATA || win32.join(home, 'AppData', 'Local'), 'e-comet', 'local-agent');
-    }
-    if (platform === 'darwin') {
-        return posix.join(home, 'Library', 'Application Support', 'e-comet', 'local-agent');
-    }
-    return posix.join(env.XDG_DATA_HOME || posix.join(home, '.local', 'share'), 'e-comet', 'local-agent');
-};
-
-// The peer token is the shared secret both local agents authenticate with, so it must live outside every
-// per-application sandbox. On Windows an MSIX-packaged host redirects writes under %LOCALAPPDATA% into its own
-// package container, which silently gives each agent a private token and makes the peer handshake fail forever.
-// The user profile root is not redirected. Other platforms have no such redirection, so the token stays with the
-// rest of the local state there. Deliberately not env-configurable: pointing a shared secret at an
-// attacker-chosen directory is a footgun, and tests inject `directory` directly.
-export const resolvePeerTokenDir = ({ platform = process.platform, env = process.env, home = homedir() } = {}) => {
-    if (platform === 'win32') return win32.join(home, '.e-comet', 'local-agent');
-    return resolveLocalStateDir({ platform, env, home });
-};
+export { resolveLocalStateDir, resolvePeerTokenDir };
 
 // Result-directory relocation is intentionally user-configurable in production; quota and retention overrides above are not.
 export const resolveResultDir = (options = {}) =>
