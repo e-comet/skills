@@ -41,10 +41,9 @@ export const CONTROL_PROTOCOL_VERSION = 1;
 export const EXTENSION_PROTOCOL_VERSION = 4;
 export const SUPPORTED_MCP_PROTOCOL_VERSIONS = ['2025-06-18'];
 export const LATEST_MCP_PROTOCOL_VERSION = SUPPORTED_MCP_PROTOCOL_VERSIONS[0];
-// 3: the release that moved the peer token and made reconnection endless must replace an already-running
-// primary wherever a mixed pair can still complete the handshake (macOS and Linux, where the token file did
-// not move), so the fixed behaviour owns the listener instead of idling behind the old build.
-const DEFAULT_BRIDGE_GENERATION = 3;
+// 4: a build that can proxy Ozon promotion reports must replace an already-running generation-3 primary;
+// otherwise the capable secondary remains behind a primary that cannot advertise or route the Ozon operation.
+const DEFAULT_BRIDGE_GENERATION = 4;
 export const resolveBridgeGeneration = ({ env = process.env } = {}) => {
     const mode = env.NODE_ENV;
     if (mode !== 'test' && mode !== 'development') return DEFAULT_BRIDGE_GENERATION;

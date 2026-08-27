@@ -32,6 +32,7 @@ import { loadOrCreatePeerToken, loadPeerToken } from './peer-auth.mjs';
 import { createPeerTokenSource } from './peer-token-source.mjs';
 import { createPeerProtocol } from './peer-protocol.mjs';
 import { RequestBroker } from './request-broker.mjs';
+import { createOzonPromotionRoute } from './server-routing.mjs';
 import { attachStdioTransport } from './stdio-transport.mjs';
 import { ToolExecutionError } from './tool-errors.mjs';
 import { connectWebSocket } from './websocket-client.mjs';
@@ -137,6 +138,7 @@ const requestBroker = new RequestBroker({
             true
         );
     },
+    routeOzonPromotionReport: createOzonPromotionRoute({ connections }),
     routeAuthorization: ({ requestId, token }) => {
         if (connections.extensionReady && !connections.extensionBrowserJobReady) {
             throw new ToolExecutionError(

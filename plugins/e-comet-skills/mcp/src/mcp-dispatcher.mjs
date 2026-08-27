@@ -13,8 +13,10 @@ import { createArtifactWriter, releaseArtifactJob } from './artifact-store.mjs';
 import { executeAuthorizedBrowserJob, executeSellerReviewsJob, extractBrowserJobToken, validateAuthorizedJobLimits } from './browser-job.mjs';
 import { mcpError, mcpResult, resourceLinkResult, textResult } from './mcp-protocol.mjs';
 import { createJobWriter } from './result-store.mjs';
+import { executeOzonPromotionJob, getOzonPromotionArtifactResource } from './ozon-promotion-job.mjs';
+import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
 import { serverInstructions, tools, validateToolArguments } from './tool-catalog.mjs';
-import { ToolExecutionError, toolFailure } from './tool-errors.mjs';
+import { safeOzonPromotionToolError, ToolExecutionError, toolFailure } from './tool-errors.mjs';
 import { createConcurrencyLimiter, discoverImageBasket, imageExists, normalizeStatus, runWithConcurrency } from './wb-domain.mjs';
 
 export const createMcpMessageHandler = ({
@@ -29,13 +31,37 @@ export const createMcpMessageHandler = ({
     requestBrowserJobAuthorization,
     createSellerArtifactWriter = createArtifactWriter,
     releaseSellerArtifactJob = releaseArtifactJob,
+    createOzonArtifactWriter = createArtifactWriter,
+    releaseOzonArtifactJob = releaseArtifactJob,
+    renderOzonResult = resourceLinkResult,
     sendError = mcpError,
     sendResult = mcpResult,
     createJobWriter: createWriter = createJobWriter,
     probeImageExists = imageExists,
     shutdownSignal,
     log = (..._args) => undefined,
+    now = Date.now,
 }) => {
+    // Scope revocation occurs before the release route's acknowledgement can suspend, so callers can safely
+    // deliver a terminal result without letting a peer/extension round trip delay it.
+    const releaseAuthorizationInBackground = (lease, context) => {
+        if (!lease) return;
+        const reportFailure = (releaseError) => {
+            let message;
+            try {
+                message = typeof releaseError?.message === 'string' ? releaseError.message : String(releaseError);
+            } catch {
+                message = 'unknown release failure';
+            }
+            console.error(`[McpDispatcher] Failed to release browser-job authorization ${context}:`, message);
+        };
+        try {
+            void Promise.resolve(lease.release()).catch(reportFailure);
+        } catch (releaseError) {
+            reportFailure(releaseError);
+        }
+    };
+
     const handleBrowserJob = async (id, toolName, expectedJobType, args = {}) => {
         const triggerUrl = args.triggerUrl;
         let productLimitPerScope = DEFAULT_RETURNED_PRODUCTS;
@@ -80,22 +106,11 @@ export const createMcpMessageHandler = ({
         }
         let writer;
         let authorizationLease;
-        // The scope is dropped the moment this runs and the release outcome cannot change the result, so the
-        // round trip must not sit between a finished job and the response it already earned. `release()` is
-        // invoked directly rather than from a `.then()` callback: everything that revokes the scope — the
-        // broker map entry, its expiry timer, its pending operations — runs before that call's first await,
-        // so deferring it by a microtask would leave the scope usable while the result is being emitted.
         const releaseAuthorization = (context) => {
             if (!authorizationLease) return;
             const currentLease = authorizationLease;
             authorizationLease = undefined;
-            const reportFailure = (releaseError) =>
-                console.error(`[McpDispatcher] Failed to release browser-job authorization ${context}:`, releaseError.message);
-            try {
-                void Promise.resolve(currentLease.release()).catch(reportFailure);
-            } catch (releaseError) {
-                reportFailure(releaseError);
-            }
+            releaseAuthorizationInBackground(currentLease, context);
         };
         try {
             if (!(await waitForExtensionReady())) {
@@ -430,6 +445,107 @@ export const createMcpMessageHandler = ({
         }
     };
 
+    const handleOzonPromotionReport = async (id, args = {}) => {
+        const toolName = 'ozon_seller_promotion_report';
+        const dateFrom = args?.dateFrom;
+        const dateTo = args?.dateTo;
+        const artifactJobId = randomUUID();
+        let authorizationLease;
+        let terminalResult;
+        let periodValidated = false;
+        const failureResult = (error) => {
+            let normalized;
+            try {
+                if (error instanceof ToolExecutionError) normalized = safeOzonPromotionToolError(error);
+            } catch {
+                normalized = undefined;
+            }
+            const safeError = normalized
+                ? { code: normalized.code, message: normalized.message, stage: normalized.stage, retryable: false }
+                : { code: 'ARTIFACT_REJECTED', message: 'The Ozon promotion report could not be completed safely.', stage: 'artifact', retryable: false };
+            return {
+                ok: false,
+                status: 'failed',
+                jobType: 'ozon_seller_promotion_report',
+                ...(periodValidated ? { dateFrom, dateTo } : {}),
+                error: safeError,
+            };
+        };
+        try {
+            if (!validateToolArguments(toolName, args)) {
+                throw new ToolExecutionError('PREFLIGHT_FAILED', 'The Ozon promotion period is invalid.', 'preflight', false);
+            }
+            try {
+                parseOzonPromotionPeriod(dateFrom, dateTo);
+            } catch (error) {
+                throw new ToolExecutionError('PREFLIGHT_FAILED', 'The Ozon promotion period is invalid.', 'preflight', false, {
+                    cause: error,
+                });
+            }
+            periodValidated = true;
+            if (typeof args.triggerUrl !== 'string' || !args.triggerUrl) {
+                throw new ToolExecutionError(
+                    'OZON_AUTHORIZATION_REJECTED',
+                    'The trusted browser-job hook did not provide Ozon authorization.',
+                    'authorization',
+                    false
+                );
+            }
+            try {
+                authorizationLease = await requestBrowserJobAuthorization(extractBrowserJobToken(args.triggerUrl));
+            } catch (error) {
+                throw new ToolExecutionError(
+                    'OZON_AUTHORIZATION_REJECTED',
+                    'The Ozon promotion report authorization was rejected.',
+                    'authorization',
+                    false,
+                    { cause: error }
+                );
+            }
+            if (
+                !authorizationLease ||
+                typeof authorizationLease.requestOzonPromotionReport !== 'function' ||
+                typeof authorizationLease.release !== 'function'
+            ) {
+                throw new ToolExecutionError(
+                    'OZON_AUTHORIZATION_REJECTED',
+                    'The extension returned an invalid Ozon promotion authorization.',
+                    'authorization',
+                    false
+                );
+            }
+            const result = await executeOzonPromotionJob({
+                authorization: authorizationLease.authorization,
+                dateFrom,
+                dateTo,
+                requestOzonPromotionReport: authorizationLease.requestOzonPromotionReport,
+                createArtifactWriter: createOzonArtifactWriter,
+                artifactJobId,
+                now,
+            });
+            terminalResult = renderOzonResult(
+                result,
+                `Ozon Seller promotion report complete: one XLSX workbook for ${dateFrom} through ${dateTo}.`,
+                [getOzonPromotionArtifactResource(result)]
+            );
+        } catch (error) {
+            terminalResult = textResult(failureResult(error), true);
+        } finally {
+            const currentLease = authorizationLease;
+            authorizationLease = undefined;
+            releaseAuthorizationInBackground(currentLease, 'after Ozon promotion report completion');
+        }
+        try {
+            sendResult(id, terminalResult);
+        } finally {
+            try {
+                await releaseOzonArtifactJob(artifactJobId, { deferWhileActive: true });
+            } catch (error) {
+                log('failed to release Ozon promotion artifact pins after terminal response:', error?.message);
+            }
+        }
+    };
+
     // `needsBridge` declares which operational tools depend on the bridge, so the wake-up is applied once at
     // the dispatch point below instead of being remembered inside each handler. A tool added without the flag
     // never nudges; a tool added with it cannot forget to. `local_bridge_status` is deliberately false because
@@ -460,6 +576,7 @@ export const createMcpMessageHandler = ({
             },
         ],
         ['wb_seller_reviews', { needsBridge: true, run: (id, args) => handleSellerReviewsExport(id, args) }],
+        ['ozon_seller_promotion_report', { needsBridge: true, run: (id, args) => handleOzonPromotionReport(id, args) }],
         ['wb_product_images', { needsBridge: false, run: (id, args) => handleProductImages(id, args) }],
     ]);
 

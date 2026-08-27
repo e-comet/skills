@@ -5,11 +5,14 @@ import {
     isSellerOperationStage,
     localMessage,
     MESSAGE_TYPES,
+    OZON_PROMOTION_CAPABILITY,
+    OZON_PROMOTION_SERVER_MESSAGE_TYPES,
     RETRYABLE_FETCH_ERROR_CODES,
     SELLER_OPERATION_STAGES,
     UNCLASSIFIED_FETCH_ERROR_CODE,
 } from './extension-vocabulary.mjs';
-import { ToolExecutionError, safeExternalToolError } from './tool-errors.mjs';
+import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
+import { ToolExecutionError, safeExternalToolError, safeOzonPromotionToolError } from './tool-errors.mjs';
 import { encodeFrame } from './websocket.mjs';
 
 const MAX_ID_LENGTH = 128;
@@ -18,10 +21,12 @@ const MAX_BASE64_STREAM_CHUNK_LENGTH = 4 * Math.ceil(MAX_STREAM_CHUNK_BYTES / 3)
 const XLSX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const MAX_SAFE_MESSAGE_LENGTH = 500;
 
 const isRecord = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 const isNonNegativeSafeInteger = (value) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const hasOnlyKeys = (value, keys) => Object.keys(value).every((key) => keys.includes(key));
+const isBoundedString = (value, maxLength) => typeof value === 'string' && value.length > 0 && value.length <= maxLength;
 const isValidBase64Chunk = (value) => {
     if (
         typeof value !== 'string' ||
@@ -61,6 +66,66 @@ export const isValidSellerStreamEnd = (value) =>
     isNonNegativeSafeInteger(value.size) &&
     typeof value.sha256 === 'string' &&
     SHA256_PATTERN.test(value.sha256);
+export const isValidOzonPromotionOperation = (value) => {
+    if (
+        !isRecord(value) ||
+        !hasOnlyKeys(value, ['dateFrom', 'dateTo', 'deadlineAt']) ||
+        !Number.isSafeInteger(value.deadlineAt) ||
+        value.deadlineAt <= 0
+    ) {
+        return false;
+    }
+    try {
+        parseOzonPromotionPeriod(value.dateFrom, value.dateTo);
+        return true;
+    } catch {
+        return false;
+    }
+};
+const isValidOzonStreamStart = (value) =>
+    isRecord(value) &&
+    hasOnlyKeys(value, ['frameId', 'name', 'mimeType', 'declaredSize']) &&
+    isBoundedString(value.frameId, MAX_ID_LENGTH) &&
+    isBoundedString(value.name, MAX_BROWSER_JOB_TEXT_LENGTH) &&
+    value.mimeType === XLSX_MIME_TYPE &&
+    (value.declaredSize === undefined ||
+        (isNonNegativeSafeInteger(value.declaredSize) && value.declaredSize <= ARTIFACT_MAX_FILE_BYTES));
+const isValidOzonStreamChunk = (value) =>
+    isRecord(value) &&
+    hasOnlyKeys(value, ['frameId', 'index', 'data']) &&
+    isBoundedString(value.frameId, MAX_ID_LENGTH) &&
+    isNonNegativeSafeInteger(value.index) &&
+    isValidBase64Chunk(value.data);
+const isValidOzonStreamEnd = (value) =>
+    isRecord(value) &&
+    hasOnlyKeys(value, ['frameId', 'size', 'sha256']) &&
+    isBoundedString(value.frameId, MAX_ID_LENGTH) &&
+    isNonNegativeSafeInteger(value.size) &&
+    value.size <= ARTIFACT_MAX_FILE_BYTES &&
+    typeof value.sha256 === 'string' &&
+    SHA256_PATTERN.test(value.sha256);
+const isValidOzonResult = (value) => {
+    if (!isRecord(value) || !hasOnlyKeys(value, ['ok', 'error'])) return false;
+    if (value.ok === true) return Object.keys(value).length === 1;
+    if (value.ok !== false || !isRecord(value.error) || Object.keys(value).length !== 2) return false;
+    const error = value.error;
+    if (
+        !hasOnlyKeys(error, ['code', 'stage', 'retryable', 'message', 'dateFrom', 'dateTo']) ||
+        typeof error.message !== 'string' ||
+        error.message.length === 0 ||
+        error.message.length > MAX_SAFE_MESSAGE_LENGTH
+    ) {
+        return false;
+    }
+    try {
+        safeOzonPromotionToolError(error);
+        if ((error.dateFrom === undefined) !== (error.dateTo === undefined)) return false;
+        if (error.dateFrom !== undefined) parseOzonPromotionPeriod(error.dateFrom, error.dateTo);
+        return true;
+    } catch {
+        return false;
+    }
+};
 export const parseExtensionServerMessage = (value) => {
     if (
         !isRecord(value) ||
@@ -68,7 +133,7 @@ export const parseExtensionServerMessage = (value) => {
         value.id.length === 0 ||
         value.id.length > MAX_ID_LENGTH ||
         typeof value.type !== 'string' ||
-        !EXTENSION_TO_CLIENT_MESSAGE_TYPES.includes(value.type) ||
+        (!EXTENSION_TO_CLIENT_MESSAGE_TYPES.includes(value.type) && !OZON_PROMOTION_SERVER_MESSAGE_TYPES.includes(value.type)) ||
         !isRecord(value.payload)
     ) {
         return { ok: false };
@@ -96,6 +161,10 @@ export const parseExtensionServerMessage = (value) => {
             typeof payload.error.message === 'string';
         if (!validSuccess && !validError) return { ok: false };
     }
+    if (type === MESSAGE_TYPES.ozonPromotionStreamStart && !isValidOzonStreamStart(payload)) return { ok: false };
+    if (type === MESSAGE_TYPES.ozonPromotionStreamChunk && !isValidOzonStreamChunk(payload)) return { ok: false };
+    if (type === MESSAGE_TYPES.ozonPromotionStreamEnd && !isValidOzonStreamEnd(payload)) return { ok: false };
+    if (type === MESSAGE_TYPES.ozonPromotionResult && !isValidOzonResult(payload)) return { ok: false };
 
     return { ok: true, message: value };
 };
@@ -148,6 +217,8 @@ export const createExtensionProtocol = ({
                 socket,
                 {
                     browserJobSupported: Array.isArray(payload.capabilities) && payload.capabilities.includes('browser_job'),
+                    ozonSellerPromotionReportSupported:
+                        Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_PROMOTION_CAPABILITY),
                     version: payload.extensionVersion,
                 }
             );
@@ -199,6 +270,8 @@ export const createExtensionProtocol = ({
                 ? requestBroker.rejectAuthorization(message.id, rejection)
                 : requestBroker.hasPendingAuthorizationRelease(message.id)
                   ? requestBroker.rejectAuthorizationRelease(message.id, rejection)
+                  : requestBroker.hasPendingOzonPromotionOperation(message.id)
+                    ? requestBroker.rejectOzonPromotionReport(message.id, rejection)
                   : requestBroker.hasPendingSellerOperation(message.id)
                     ? requestBroker.rejectSellerOperation(message.id, rejection)
                     : requestBroker.rejectFetch(message.id, rejection);
@@ -242,6 +315,33 @@ export const createExtensionProtocol = ({
 
         if (type === MESSAGE_TYPES.wbFetchStreamEnd) {
             await requestBroker.endSellerStream(message.id, payload);
+            return;
+        }
+
+        if (type === MESSAGE_TYPES.ozonPromotionStreamStart) {
+            if (await requestBroker.startOzonPromotionStream(message.id, payload)) {
+                send(socket, localMessage(message.id, MESSAGE_TYPES.ozonPromotionStreamAck, { frameId: payload.frameId }));
+            }
+            return;
+        }
+
+        if (type === MESSAGE_TYPES.ozonPromotionStreamChunk) {
+            if (await requestBroker.appendOzonPromotionStreamChunk(message.id, payload)) {
+                send(socket, localMessage(message.id, MESSAGE_TYPES.ozonPromotionStreamAck, { frameId: payload.frameId }));
+            }
+            return;
+        }
+
+        if (type === MESSAGE_TYPES.ozonPromotionStreamEnd) {
+            if (await requestBroker.endOzonPromotionStream(message.id, payload)) {
+                send(socket, localMessage(message.id, MESSAGE_TYPES.ozonPromotionStreamAck, { frameId: payload.frameId }));
+            }
+            return;
+        }
+
+        if (type === MESSAGE_TYPES.ozonPromotionResult) {
+            if (payload.ok) requestBroker.resolveOzonPromotionReport(message.id, payload);
+            else requestBroker.rejectOzonPromotionReport(message.id, safeOzonPromotionToolError(payload.error));
             return;
         }
 

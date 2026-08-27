@@ -10,15 +10,32 @@ import {
     REQUEST_TIMEOUT_MS,
     SELLER_AUTHORIZATION_SCOPE_MAX_MS,
 } from './config.mjs';
-import { isValidSellerOperation } from './extension-protocol.mjs';
+import { isValidOzonPromotionOperation, isValidSellerOperation } from './extension-protocol.mjs';
 import { SELLER_OPERATION_STAGES } from './extension-vocabulary.mjs';
-import { ToolExecutionError } from './tool-errors.mjs';
+import { OZON_PROMOTION_TERMINAL_CODE_STAGES, ToolExecutionError } from './tool-errors.mjs';
 import { isAllowedWbUrl, validTimeout } from './wb-domain.mjs';
+
+export const OZON_PROMOTION_OPERATION_MAX_MS = 8 * 60 * 1000;
+const OZON_PROMOTION_OPERATION_MIN_MS = 1000;
+const isValidOzonPromotionTimeout = (value) =>
+    Number.isSafeInteger(value) && value >= OZON_PROMOTION_OPERATION_MIN_MS && value <= OZON_PROMOTION_OPERATION_MAX_MS;
+const ozonPromotionError = (code, message) => {
+    const stage = OZON_PROMOTION_TERMINAL_CODE_STAGES[code];
+    if (stage === undefined) throw new TypeError(`Unknown Ozon promotion terminal code: ${code}`);
+    return new ToolExecutionError(code, message, stage, false);
+};
+const normalizeOzonPromotionError = (error, fallbackCode, fallbackMessage) =>
+    error instanceof ToolExecutionError &&
+    OZON_PROMOTION_TERMINAL_CODE_STAGES[error.code] === error.stage &&
+    error.retryable === false
+        ? error
+        : ozonPromotionError(fallbackCode, fallbackMessage);
 
 export class RequestBroker {
     constructor({
         routeWbFetch,
         routeSellerOperation,
+        routeOzonPromotionReport = undefined,
         routeAuthorization,
         createRequestId = randomUUID,
         defaultTimeout = REQUEST_TIMEOUT_MS,
@@ -35,6 +52,7 @@ export class RequestBroker {
     }) {
         this.routeWbFetch = routeWbFetch;
         this.routeSellerOperation = routeSellerOperation;
+        this.routeOzonPromotionReport = routeOzonPromotionReport;
         this.routeAuthorization = routeAuthorization;
         this.createRequestId = createRequestId;
         this.defaultTimeout = defaultTimeout;
@@ -51,6 +69,8 @@ export class RequestBroker {
     pendingAuthorizations = new Map();
     pendingAuthorizationReleases = new Map();
     pendingSellerOperations = new Map();
+    pendingOzonPromotionOperations = new Map();
+    ozonPromotionReservation = null;
     activeAuthorizationScopes = new Map();
     inFlightFetches = new Map();
 
@@ -60,6 +80,7 @@ export class RequestBroker {
             this.pendingAuthorizations.size +
             this.pendingAuthorizationReleases.size +
             this.pendingSellerOperations.size +
+            (this.ozonPromotionReservation === null ? 0 : 1) +
             this.activeAuthorizationScopes.size
         );
     }
@@ -76,10 +97,15 @@ export class RequestBroker {
         return this.pendingSellerOperations.has(requestId);
     }
 
+    hasPendingOzonPromotionOperation(requestId) {
+        return this.pendingOzonPromotionOperations.has(requestId);
+    }
+
     rejectPendingRequests(message) {
         this.#rejectAll(this.pendingRequests, message);
         this.#rejectAll(this.pendingAuthorizationReleases, message);
         this.#rejectAllSellerOperations(message);
+        this.#rejectAllOzonPromotionOperations(message);
     }
 
     rejectPendingAuthorizations(message) {
@@ -94,6 +120,7 @@ export class RequestBroker {
         this.#rejectAll(this.pendingRequests, error);
         this.#rejectAll(this.pendingAuthorizationReleases, error);
         this.#rejectAllSellerOperations(error);
+        this.#rejectAllOzonPromotionOperations(error);
         this.#rejectAll(this.pendingAuthorizations, error);
         for (const requestId of this.activeAuthorizationScopes.keys()) {
             this.#releaseAuthorizationScopeInBackground(requestId, false);
@@ -133,6 +160,81 @@ export class RequestBroker {
         if (!pending) return this.#reportUnsettled('seller-error', requestId, error?.code);
         this.#cancelSellerOperation(requestId, pending, error);
         return true;
+    }
+
+    resolveOzonPromotionReport(requestId, result) {
+        const pending = this.pendingOzonPromotionOperations.get(requestId);
+        if (!pending) return this.#reportUnsettled('ozon-result', requestId);
+        if (pending.state !== 'awaiting-result') {
+            this.#cancelOzonPromotionOperation(
+                requestId,
+                pending,
+                ozonPromotionError(
+                    'ARTIFACT_REJECTED',
+                    'The Ozon promotion result arrived before the artifact stream ended.',
+                )
+            );
+            return false;
+        }
+        return this.#settleOzonPromotionOperation(requestId, pending, (value) => pending.resolve(value), result);
+    }
+
+    rejectOzonPromotionReport(requestId, error) {
+        const pending = this.pendingOzonPromotionOperations.get(requestId);
+        if (!pending) return this.#reportUnsettled('ozon-error', requestId, error?.code);
+        this.#cancelOzonPromotionOperation(
+            requestId,
+            pending,
+            normalizeOzonPromotionError(
+                error,
+                'OZON_AUTHORIZATION_REJECTED',
+                'The extension rejected the Ozon promotion operation.'
+            )
+        );
+        return true;
+    }
+
+    async startOzonPromotionStream(requestId, metadata) {
+        const pending = this.pendingOzonPromotionOperations.get(requestId);
+        if (!pending) return this.#reportUnsettled('ozon-stream-start', requestId);
+        if (pending.state !== 'awaiting-stream') return this.#rejectInvalidOzonStream(requestId, pending);
+        const { frameId: _frameId, ...handlerMetadata } = metadata;
+        pending.state = 'streaming';
+        pending.declaredStreamBytes = metadata.declaredSize ?? null;
+        pending.maxStreamBytes = metadata.declaredSize ?? ARTIFACT_MAX_FILE_BYTES;
+        return this.#enqueueOzonHandler(requestId, pending, pending.streamHandlers.onStart, [handlerMetadata]);
+    }
+
+    async appendOzonPromotionStreamChunk(requestId, chunk) {
+        const pending = this.pendingOzonPromotionOperations.get(requestId);
+        if (!pending) return this.#reportUnsettled('ozon-stream-chunk', requestId, chunk?.index);
+        if (pending.state !== 'streaming' || chunk.index !== pending.nextChunkIndex) {
+            return this.#rejectInvalidOzonStream(requestId, pending);
+        }
+        const decodedBytes = Buffer.byteLength(chunk.data, 'base64');
+        if (pending.receivedStreamBytes + decodedBytes > pending.maxStreamBytes) {
+            return this.#rejectInvalidOzonStream(requestId, pending);
+        }
+        pending.nextChunkIndex += 1;
+        pending.receivedStreamBytes += decodedBytes;
+        return this.#enqueueOzonHandler(requestId, pending, pending.streamHandlers.onChunk, [chunk.index, chunk.data]);
+    }
+
+    async endOzonPromotionStream(requestId, metadata) {
+        const pending = this.pendingOzonPromotionOperations.get(requestId);
+        if (!pending) return this.#reportUnsettled('ozon-stream-end', requestId);
+        if (
+            pending.state !== 'streaming' ||
+            metadata.size !== pending.receivedStreamBytes ||
+            (pending.declaredStreamBytes !== null && metadata.size !== pending.declaredStreamBytes)
+        ) {
+            return this.#rejectInvalidOzonStream(requestId, pending);
+        }
+        pending.state = 'finalizing';
+        const { frameId: _frameId, ...handlerMetadata } = metadata;
+        return this.#enqueueOzonHandler(requestId, pending, pending.streamHandlers.onEnd, [handlerMetadata], () => {
+            pending.state = 'awaiting-result';
+        });
     }
 
     async startSellerStream(requestId, metadata) {
@@ -308,6 +410,7 @@ export class RequestBroker {
                           : {};
                 const authorizationScope = {
                     authorizationId: authorization?.authorizationId,
+                    jobType: authorization?.jobType,
                     isRouteActive: routeBinding.isActive,
                     releaseRoute: routeBinding.release,
                     expiryTimer: setTimeout(
@@ -329,6 +432,27 @@ export class RequestBroker {
                             authorization?.authorizationId,
                             requestId
                         ),
+                    requestOzonPromotionReport: (() => {
+                        let consumed = false;
+                        return (operation, streamHandlers, ozonTimeout = OZON_PROMOTION_OPERATION_MAX_MS) => {
+                            if (consumed) {
+                                return Promise.reject(
+                                    ozonPromotionError(
+                                        'OZON_AUTHORIZATION_REJECTED',
+                                        'This signed Ozon promotion authorization has already been used.'
+                                    )
+                                );
+                            }
+                            consumed = true;
+                            return this.requestOzonPromotionReport(
+                                operation,
+                                streamHandlers,
+                                ozonTimeout,
+                                authorization?.authorizationId,
+                                requestId
+                            );
+                        };
+                    })(),
                     isActive: () => this.#authorizationScopeIsActive(requestId, authorizationScope),
                     release: () => this.#releaseAuthorizationScope(requestId, true),
                 };
@@ -441,6 +565,140 @@ export class RequestBroker {
         });
     }
 
+    requestOzonPromotionReport(operation, streamHandlers, timeout, authorizationId, authorizationScopeId) {
+        const authorizationScope = this.activeAuthorizationScopes.get(authorizationScopeId);
+        if (!authorizationScope || !this.#authorizationScopeIsActive(authorizationScopeId, authorizationScope)) {
+            return Promise.reject(
+                ozonPromotionError(
+                    'OZON_AUTHORIZATION_REJECTED',
+                    'The signed Ozon promotion authorization is no longer active.'
+                )
+            );
+        }
+        if (
+            authorizationScope.authorizationId !== authorizationId ||
+            authorizationScope.jobType !== 'ozon_seller_promotion_report' ||
+            !isValidOzonPromotionOperation(operation)
+        ) {
+            return Promise.reject(
+                ozonPromotionError(
+                    'OZON_AUTHORIZATION_REJECTED',
+                    'Only a matching signed Ozon promotion operation may use this authorization.'
+                )
+            );
+        }
+        if (
+            !streamHandlers ||
+            typeof streamHandlers.onStart !== 'function' ||
+            typeof streamHandlers.onChunk !== 'function' ||
+            typeof streamHandlers.onEnd !== 'function'
+        ) {
+            return Promise.reject(
+                ozonPromotionError(
+                    'ARTIFACT_REJECTED',
+                    'Ozon artifact storage is not ready to receive the report stream.'
+                )
+            );
+        }
+        if (!isValidOzonPromotionTimeout(timeout)) {
+            return Promise.reject(
+                ozonPromotionError(
+                    'OPERATION_DEADLINE_EXCEEDED',
+                    'The Ozon promotion operation timeout must be between one second and eight minutes.'
+                )
+            );
+        }
+        const deadlineRemaining = operation.deadlineAt - Date.now();
+        if (deadlineRemaining <= 0 || deadlineRemaining > OZON_PROMOTION_OPERATION_MAX_MS) {
+            return Promise.reject(
+                ozonPromotionError(
+                    'OPERATION_DEADLINE_EXCEEDED',
+                    deadlineRemaining <= 0
+                        ? 'The Ozon promotion operation deadline has expired.'
+                        : 'The Ozon promotion operation deadline exceeds the eight-minute lifecycle limit.'
+                )
+            );
+        }
+        const boundedTimeout = Math.min(timeout, deadlineRemaining, OZON_PROMOTION_OPERATION_MAX_MS);
+        if (this.ozonPromotionReservation !== null) {
+            return Promise.reject(
+                ozonPromotionError(
+                    'OZON_AUTHORIZATION_REJECTED',
+                    'Another Ozon promotion operation is already pending.'
+                )
+            );
+        }
+        if (typeof this.routeOzonPromotionReport !== 'function') {
+            return Promise.reject(
+                ozonPromotionError(
+                    'OZON_ROUTE_NOT_READY',
+                    'The Ozon promotion operation route is not available.'
+                )
+            );
+        }
+        const operationPromise = new Promise((resolve, reject) => {
+            const requestId = this.createRequestId();
+            const currentPending = {
+                resolve,
+                reject,
+                timer: undefined,
+                state: 'awaiting-stream',
+                nextChunkIndex: 0,
+                receivedStreamBytes: 0,
+                declaredStreamBytes: null,
+                maxStreamBytes: ARTIFACT_MAX_FILE_BYTES,
+                streamHandlers,
+                handlerChain: Promise.resolve(),
+                cancelled: false,
+                abortController: new AbortController(),
+                authorizationScopeId,
+            };
+            currentPending.timer = setTimeout(
+                () =>
+                    this.#cancelOzonPromotionOperation(
+                        requestId,
+                        currentPending,
+                        ozonPromotionError(
+                            'OPERATION_DEADLINE_EXCEEDED',
+                            'The Ozon promotion operation deadline expired.'
+                        )
+                    ),
+                Math.min(
+                    deadlineRemaining,
+                    OZON_PROMOTION_OPERATION_MAX_MS,
+                    timeout + REQUEST_TIMEOUT_GRACE_MS * Math.max(1, this.routeHopCount())
+                )
+            );
+            currentPending.timer.unref?.();
+            this.pendingOzonPromotionOperations.set(requestId, currentPending);
+            this.ozonPromotionReservation = currentPending;
+            try {
+                this.routeOzonPromotionReport({
+                    requestId,
+                    authorizationId,
+                    authorizationScopeId,
+                    dateFrom: operation.dateFrom,
+                    dateTo: operation.dateTo,
+                    deadlineAt: operation.deadlineAt,
+                    timeout: boundedTimeout,
+                });
+            } catch (error) {
+                this.#settleOzonPromotionOperation(
+                    requestId,
+                    currentPending,
+                    (reason) => reject(reason),
+                    normalizeOzonPromotionError(
+                        error,
+                        'OZON_ROUTE_NOT_READY',
+                        'The Ozon promotion operation route is not available.'
+                    ),
+                    { abort: true }
+                );
+            }
+        });
+        return operationPromise;
+    }
+
     // A seller export drives many reports through one scope, so it gets the longer ceiling its executor is
     // deadlined against rather than the single-round-trip default. Either way the signed token wins: a
     // scope must never outlive the authorization it was granted under.
@@ -534,6 +792,17 @@ export class RequestBroker {
             if (pending.authorizationScopeId !== requestId) continue;
             this.#cancelSellerOperation(sellerRequestId, pending, this.#reauthorizationRequired());
         }
+        for (const [ozonRequestId, pending] of this.pendingOzonPromotionOperations) {
+            if (pending.authorizationScopeId !== requestId) continue;
+            this.#cancelOzonPromotionOperation(
+                ozonRequestId,
+                pending,
+                ozonPromotionError(
+                    'OPERATION_CANCELLED',
+                    'The Ozon promotion operation was cancelled with its authorization.'
+                )
+            );
+        }
         if (notifyRoute && typeof authorizationScope.releaseRoute === 'function') {
             await authorizationScope.releaseRoute(authorizationScope.authorizationId);
         }
@@ -614,6 +883,98 @@ export class RequestBroker {
             new ToolExecutionError('SELLER_STREAM_INVALID', reason, 'extension', false)
         );
         return false;
+    }
+
+    #takeOzonPromotionOperation(requestId, pending) {
+        if (this.pendingOzonPromotionOperations.get(requestId) !== pending) return false;
+        this.pendingOzonPromotionOperations.delete(requestId);
+        pending.cancelled = true;
+        clearTimeout(pending.timer);
+        if (this.ozonPromotionReservation === pending) this.ozonPromotionReservation = null;
+        return true;
+    }
+
+    #signalOzonCancellation(requestId, pending, error) {
+        pending.abortController.abort(error);
+        // A relay handler may itself be waiting for downstream persistence acknowledgement. Break that wait
+        // synchronously; private handler/finalizer cleanup is observed separately and never owns broker capacity.
+        if (typeof pending.streamHandlers.onCancel === 'function') {
+            try {
+                pending.streamHandlers.onCancel(error);
+            } catch (cancelSignalError) {
+                this.#reportUnsettled('ozon-cancel-signal', requestId, cancelSignalError?.code);
+            }
+        }
+    }
+
+    #settleOzonPromotionOperation(requestId, pending, settle, value, { abort = false } = {}) {
+        if (!this.#takeOzonPromotionOperation(requestId, pending)) return false;
+        if (abort) this.#signalOzonCancellation(requestId, pending, value);
+        settle(value);
+        return true;
+    }
+
+    #cancelOzonPromotionOperation(requestId, pending, error) {
+        if (!this.#takeOzonPromotionOperation(requestId, pending)) return false;
+        this.#signalOzonCancellation(requestId, pending, error);
+        pending.reject(error);
+        return true;
+    }
+
+    #enqueueOzonHandler(requestId, pending, handler, args, onComplete) {
+        const handlerPromise = pending.handlerChain.then(async () => {
+            if (pending.cancelled || this.pendingOzonPromotionOperations.get(requestId) !== pending) return false;
+            await handler(...args, pending.abortController.signal);
+            return !pending.cancelled && this.pendingOzonPromotionOperations.get(requestId) === pending;
+        });
+        pending.handlerChain = handlerPromise;
+        return handlerPromise.then(
+            (handled) => {
+                if (handled) onComplete?.();
+                return handled;
+            },
+            (error) => {
+                const settled = this.#settleOzonPromotionOperation(
+                    requestId,
+                    pending,
+                    (reason) => pending.reject(reason),
+                    normalizeOzonPromotionError(
+                        error,
+                        'ARTIFACT_REJECTED',
+                        'The Ozon promotion artifact could not be stored safely.'
+                    ),
+                    { abort: true }
+                );
+                if (!settled) this.#reportUnsettled('ozon-handler-error', requestId, error?.code);
+                return false;
+            }
+        );
+    }
+
+    #rejectInvalidOzonStream(requestId, pending) {
+        this.#cancelOzonPromotionOperation(
+            requestId,
+            pending,
+            ozonPromotionError(
+                'ARTIFACT_REJECTED',
+                'Ozon promotion stream frames arrived out of order.'
+            )
+        );
+        return false;
+    }
+
+    #rejectAllOzonPromotionOperations(errorOrMessage) {
+        for (const [requestId, pending] of this.pendingOzonPromotionOperations) {
+            this.#cancelOzonPromotionOperation(
+                requestId,
+                pending,
+                normalizeOzonPromotionError(
+                    errorOrMessage,
+                    'OPERATION_CANCELLED',
+                    'The Ozon promotion operation was cancelled because its extension route closed.'
+                )
+            );
+        }
     }
 
     #rejectAllSellerOperations(errorOrMessage) {

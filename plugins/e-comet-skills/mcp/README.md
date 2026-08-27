@@ -41,17 +41,21 @@ Local tools:
 - `wb_check_by_query` — checks whether one article appears in search for up to 100 phrases, without reporting a position;
 - `wb_recommendations_by_product` — discovers and executes signed recommendation-shelf requests;
 - `wb_seller_reviews` — exports original WB seller-review XLSX reports through the authenticated seller portal;
+- `ozon_seller_promotion_report` — exports one Ozon Seller promotion analytics XLSX report for one inclusive period;
 - `local_bridge_status` — reports whether the extension is connected, and why the bridge cannot reach a primary
   peer when it cannot;
 - `wb_product_images` — public WB image-CDN lookup; this tool does not require the extension.
 
 The agent discovers the matching typed local tool first. Its description then requires sending only the small task
 descriptor to remote `browser_job` before invoking the selected local tool.
-Claude uses the plugin's `PostToolUse` and `PreToolUse` hooks to hand off the exact opaque JWT. Codex/ChatGPT Desktop
-executes both MCP calls inside one `exec` and passes the value only through a local JavaScript variable. The model does
-not reproduce the token as text. The extension verifies the RS256 signature, expiry, account UUID, job type, and exact
-derived WB URLs. It rejects direct `wb_fetch` calls without that authorization. WB response bodies remain on the user's
-computer and do not pass through e-Comet backend services.
+Claude and Codex/ChatGPT Desktop use the plugin's trusted `PostToolUse` and `PreToolUse` hooks to stage and inject the
+exact opaque JWT in a one-use claim bound to the desktop session and exact local tool. The model-authored local call
+omits both trigger-field spellings, and the hook injects the transport-only field. This is an integrity guarantee, not
+a secrecy guarantee: the remote tool result may still be visible to the model, but the model does not author or
+reproduce the transport field. Hosts that do not run or cannot verify the trusted hooks fail closed. The extension
+verifies the RS256 signature, expiry, account UUID, job type, and exact signed scope. It rejects
+browser operations without matching authorization. Marketplace response bodies remain on the user's computer and do
+not pass through e-Comet backend services.
 
 `wb_seller_reviews` accepts the signed mixed export descriptor, expands an omitted `isAnswered` into separate answered and
 unanswered physical reports, and preserves successful work when another export fails. It returns compact status metadata plus

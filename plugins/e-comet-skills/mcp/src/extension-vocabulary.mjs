@@ -9,6 +9,8 @@ export const MESSAGE_TYPES = Object.freeze({
     wbFetch: 'wb_fetch',
     browserJobAuthorize: 'browser_job_authorize',
     browserJobAuthorizationRelease: 'browser_job_authorization_release',
+    ozonPromotionOperation: 'ozon_seller_promotion_report_operation',
+    ozonPromotionStreamAck: 'ozon_seller_promotion_report_stream_ack',
     // расширение -> local MCP
     helloAck: 'hello_ack',
     wbFetchResult: 'wb_fetch_result',
@@ -17,6 +19,10 @@ export const MESSAGE_TYPES = Object.freeze({
     wbFetchStreamEnd: 'wb_fetch_stream_end',
     browserJobAuthorizeResult: 'browser_job_authorize_result',
     browserJobAuthorizationReleaseResult: 'browser_job_authorization_release_result',
+    ozonPromotionStreamStart: 'ozon_seller_promotion_report_stream_start',
+    ozonPromotionStreamChunk: 'ozon_seller_promotion_report_stream_chunk',
+    ozonPromotionStreamEnd: 'ozon_seller_promotion_report_stream_end',
+    ozonPromotionResult: 'ozon_seller_promotion_report_result',
     error: 'error',
     // в обе стороны (heartbeat)
     ping: 'ping',
@@ -46,6 +52,9 @@ export const peerStatusMessage = ({
     instanceId: handoff.instanceId,
     capabilities: [PEER_CAPABILITIES.browserContextPropagation],
     browserContext: connections.browserContext,
+    ...(connections.extensionOzonPromotionReady === undefined
+        ? {}
+        : { ozonSellerPromotionReportSupported: connections.extensionOzonPromotionReady === true }),
     ...(connections.extensionLastConnectedAtMs === null ? {} : { extensionLastConnectedAtMs: connections.extensionLastConnectedAtMs }),
     ...(connections.extensionLastDisconnectedAtMs === null ? {} : { extensionLastDisconnectedAtMs: connections.extensionLastDisconnectedAtMs }),
     // Вторичный процесс сам расширение не видит, поэтому без этого поля конкуренция
@@ -80,6 +89,17 @@ export const EXTENSION_TO_CLIENT_MESSAGE_TYPES = Object.freeze([
     MESSAGE_TYPES.wbFetchStreamEnd,
 ]);
 
+export const OZON_PROMOTION_CAPABILITY = 'ozon_seller_promotion_report@1';
+export const OZON_PROMOTION_CLIENT_MESSAGE_TYPES = Object.freeze([
+    MESSAGE_TYPES.ozonPromotionOperation,
+    MESSAGE_TYPES.ozonPromotionStreamAck,
+]);
+export const OZON_PROMOTION_SERVER_MESSAGE_TYPES = Object.freeze([
+    MESSAGE_TYPES.ozonPromotionStreamStart,
+    MESSAGE_TYPES.ozonPromotionStreamChunk,
+    MESSAGE_TYPES.ozonPromotionStreamEnd,
+    MESSAGE_TYPES.ozonPromotionResult,
+]);
 export const EXTENSION_CAPABILITIES = Object.freeze(['wb_fetch', 'browser_job', 'seller_reviews']);
 
 // Стадия операции продавца внутри payload'а `wb_fetch`. Расширение решает по ней,

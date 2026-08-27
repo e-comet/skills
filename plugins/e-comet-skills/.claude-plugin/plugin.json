@@ -1,7 +1,7 @@
 {
   "name": "e-comet-skills",
   "displayName": "e-Comet MCP Tools",
-  "description": "MCP tools for e-Comet seller analytics, live Wildberries data, and seller review exports.",
+  "description": "MCP tools for e-Comet seller analytics, live Wildberries data, and Ozon Seller promotion reports.",
   "repository": "https://github.com/e-comet/skills",
   "license": "Apache-2.0",
   "mcpServers": {

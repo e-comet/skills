@@ -57,10 +57,12 @@ export class ConnectionState {
     extensionSocket = null;
     extensionReady = false;
     extensionBrowserJobReady = false;
+    extensionOzonPromotionReady = false;
     peerSocket = null;
     peerReady = false;
     peerExtensionReady = false;
     peerExtensionBrowserJobReady = false;
+    peerExtensionOzonPromotionReady = false;
     peerBrowserContext = { state: 'unknown' };
     peerExtensionLastConnectedAtMs = null;
     peerExtensionLastDisconnectedAtMs = null;
@@ -97,6 +99,10 @@ export class ConnectionState {
 
     get effectiveBrowserJobReady() {
         return this.extensionBrowserJobReady || (this.peerReady && this.peerExtensionBrowserJobReady);
+    }
+
+    get effectiveOzonPromotionReady() {
+        return this.extensionOzonPromotionReady || (this.peerReady && this.peerExtensionOzonPromotionReady);
     }
 
     get effectiveBrowserContext() {
@@ -139,6 +145,8 @@ export class ConnectionState {
 
     connectExtension(socket, options) {
         const browserJobSupported = typeof options === 'boolean' ? options : options.browserJobSupported;
+        const ozonSellerPromotionReportSupported =
+            typeof options === 'object' && options.ozonSellerPromotionReportSupported === true;
         const previousSocket = this.extensionSocket;
         const evicted = Boolean(previousSocket) && previousSocket !== socket;
         if (previousSocket !== socket) this.browserContext = { state: 'unknown' };
@@ -157,6 +165,7 @@ export class ConnectionState {
         this.extensionSocket = socket;
         this.extensionReady = true;
         this.extensionBrowserJobReady = browserJobSupported;
+        this.extensionOzonPromotionReady = ozonSellerPromotionReportSupported;
         this.extensionVersion = typeof options === 'object' ? options.version : undefined;
         this.extensionLastConnectedAtMs = this.#now();
         this.#resolveExtensionReadyWaiters();
@@ -168,6 +177,7 @@ export class ConnectionState {
         this.extensionSocket = null;
         this.extensionReady = false;
         this.extensionBrowserJobReady = false;
+        this.extensionOzonPromotionReady = false;
         this.extensionLastDisconnectedAtMs = this.#now();
         this.browserContext = { state: 'unknown' };
         return true;
@@ -193,6 +203,7 @@ export class ConnectionState {
         this.peerReady = true;
         this.peerExtensionReady = extensionConnected === true;
         this.peerExtensionBrowserJobReady = browserJobSupported === true;
+        this.peerExtensionOzonPromotionReady = message.ozonSellerPromotionReportSupported === true;
         this.peerBrowserContext = message.browserContext?.state === 'known' ? { ...message.browserContext } : { state: 'unknown' };
         this.peerExtensionLastConnectedAtMs = Number.isFinite(message.extensionLastConnectedAtMs) ? message.extensionLastConnectedAtMs : null;
         this.peerExtensionLastDisconnectedAtMs = Number.isFinite(message.extensionLastDisconnectedAtMs) ? message.extensionLastDisconnectedAtMs : null;
@@ -242,6 +253,7 @@ export class ConnectionState {
         this.peerReady = false;
         this.peerExtensionReady = false;
         this.peerExtensionBrowserJobReady = false;
+        this.peerExtensionOzonPromotionReady = false;
         this.peerBrowserContext = { state: 'unknown' };
         this.authenticatedPrimaryMetadata = undefined;
         return true;
@@ -253,6 +265,7 @@ export class ConnectionState {
         this.peerReady = false;
         this.peerExtensionReady = false;
         this.peerExtensionBrowserJobReady = false;
+        this.peerExtensionOzonPromotionReady = false;
         this.peerBrowserContext = { state: 'unknown' };
         this.authenticatedPrimaryMetadata = undefined;
         this.resetPeerReconnect();

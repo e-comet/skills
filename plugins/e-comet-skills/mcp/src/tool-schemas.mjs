@@ -9,6 +9,7 @@ import {
     MAX_RETURNED_PRODUCTS,
 } from './config.mjs';
 import { PEER_REJECTION_CODES } from './connection-state.mjs';
+import { OZON_PROMOTION_TERMINAL_CODE_STAGES } from './tool-errors.mjs';
 
 const string = { type: 'string' };
 const boolean = { type: 'boolean' };
@@ -391,9 +392,90 @@ const triggerUrlProperty = {
     minLength: 1,
     maxLength: MAX_BROWSER_JOB_TOKEN_BYTES,
     description:
-        'Browser authorization returned by the immediately preceding remote browser_job call. The conservative schema maxLength is a character count; ' +
-        'runtime authoritatively enforces the 128 KiB UTF-8 byte limit. Codex passes it programmatically in one atomic exec; omission is valid only when a trusted host hook injects it.',
+        'Opaque browser authorization injected by the trusted Claude or Codex host hook immediately before this local tool call. ' +
+        'It is transport-only; model-authored arguments must omit both triggerUrl and trigger_url. The conservative schema maxLength is a character count; ' +
+        'runtime authoritatively enforces the 128 KiB UTF-8 byte limit.',
 };
+
+const ozonTriggerUrlProperty = {
+    type: 'string',
+    minLength: 1,
+    maxLength: MAX_BROWSER_JOB_TOKEN_BYTES,
+    description:
+        'Opaque browser authorization injected by the trusted Claude or Codex host hook immediately before this Ozon tool call. It is transport-only; model-authored arguments must omit both triggerUrl and trigger_url.',
+};
+
+const canonicalDateProperty = {
+    type: 'string',
+    pattern: '^\\d{4}-\\d{2}-\\d{2}$',
+    description: 'Canonical Gregorian calendar date in YYYY-MM-DD form.',
+};
+
+const ozonPromotionArtifactSchema = object(
+    {
+        name: { type: 'string', pattern: '^ozon-seller-promotion-\\d{4}-\\d{2}-\\d{2}-\\d{4}-\\d{2}-\\d{2}\\.xlsx$' },
+        mimeType: { const: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+        size: nonNegativeInteger,
+        sha256: { type: 'string', minLength: 64, maxLength: 64 },
+    },
+    ['name', 'mimeType', 'size', 'sha256']
+);
+
+const ozonPromotionErrorSchema = objectUnion(
+    ...Object.entries(OZON_PROMOTION_TERMINAL_CODE_STAGES).map(([code, stage]) =>
+        object(
+            {
+                code: { const: code },
+                message: { type: 'string', minLength: 1, maxLength: 500 },
+                stage: { const: stage },
+                retryable: { const: false },
+            },
+            ['code', 'message', 'stage', 'retryable']
+        )
+    )
+);
+
+const ozonPromotionSuccessSchema = object(
+    {
+        ok: { const: true },
+        status: { const: 'complete' },
+        jobType: { const: 'ozon_seller_promotion_report' },
+        dateFrom: canonicalDateProperty,
+        dateTo: canonicalDateProperty,
+        artifact: ozonPromotionArtifactSchema,
+    },
+    ['ok', 'status', 'jobType', 'dateFrom', 'dateTo', 'artifact']
+);
+
+const ozonPromotionFailureSchema = object(
+    {
+        ok: { const: false },
+        status: { const: 'failed' },
+        jobType: { const: 'ozon_seller_promotion_report' },
+        dateFrom: canonicalDateProperty,
+        dateTo: canonicalDateProperty,
+        error: ozonPromotionErrorSchema,
+    },
+    ['ok', 'status', 'jobType', 'dateFrom', 'dateTo', 'error']
+);
+
+const ozonPromotionPreflightFailureSchema = object(
+    {
+        ok: { const: false },
+        status: { const: 'failed' },
+        jobType: { const: 'ozon_seller_promotion_report' },
+        error: object(
+            {
+                code: { const: 'PREFLIGHT_FAILED' },
+                message: { type: 'string', minLength: 1, maxLength: 500 },
+                stage: { const: 'preflight' },
+                retryable: { const: false },
+            },
+            ['code', 'message', 'stage', 'retryable']
+        ),
+    },
+    ['ok', 'status', 'jobType', 'error']
+);
 
 const projectionProperties = (limitName, scope) => ({
     [limitName]: {
@@ -426,6 +508,14 @@ export const toolInputSchemas = {
     wb_check_by_query: liveInputSchema(),
     wb_recommendations_by_product: liveInputSchema('productLimitPerSource', 'source product'),
     wb_seller_reviews: liveInputSchema(),
+    ozon_seller_promotion_report: object(
+        {
+            dateFrom: canonicalDateProperty,
+            dateTo: canonicalDateProperty,
+            triggerUrl: ozonTriggerUrlProperty,
+        },
+        ['dateFrom', 'dateTo']
+    ),
     wb_product_images: object(
         {
             nmIds: {
@@ -462,6 +552,7 @@ export const toolOutputSchemas = {
     wb_recommendations_by_product: objectUnion(...liveAggregateSchemas(recommendationsSuccessSchema), toolErrorSchema),
     wb_seller_reviews: objectUnion(sellerReviewsSuccessSchema, toolErrorSchema),
     wb_product_images: objectUnion(...liveAggregateSchemas(imagesSuccessSchema), toolErrorSchema),
+    ozon_seller_promotion_report: objectUnion(ozonPromotionSuccessSchema, ozonPromotionFailureSchema, ozonPromotionPreflightFailureSchema),
 };
 
 export const validateSchemaValue = (value, schema) => {
@@ -496,7 +587,8 @@ export const validateSchemaValue = (value, schema) => {
             typeof value === 'string' &&
             value.length >= (schema.minLength ?? 0) &&
             value.length <= (schema.maxLength ?? Infinity) &&
-            (!schema.enum || schema.enum.includes(value))
+            (!schema.enum || schema.enum.includes(value)) &&
+            (!schema.pattern || new RegExp(schema.pattern).test(value))
         );
     }
     if (schema.type === 'integer') {

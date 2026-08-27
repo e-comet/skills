@@ -1,7 +1,7 @@
 {
   "name": "e-comet-skills",
-  "version": "2026.8.13",
-  "description": "MCP tools for e-Comet seller analytics, live Wildberries data, and seller review exports.",
+  "version": "2026.8.14",
+  "description": "MCP tools for e-Comet seller analytics, live Wildberries data, and Ozon Seller promotion reports.",
   "author": {
     "name": "e-Comet",
     "url": "https://e-comet.io/"
@@ -9,7 +9,7 @@
   "homepage": "https://github.com/e-comet/skills",
   "repository": "https://github.com/e-comet/skills",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "wildberries", "wb", "e-comet"],
+  "keywords": ["mcp", "wildberries", "wb", "ozon", "seller", "e-comet"],
   "mcpServers": {
     "e-comet": {
       "type": "http",
@@ -24,8 +24,8 @@
   },
   "interface": {
     "displayName": "e-Comet MCP Tools",
-    "shortDescription": "Seller analytics and live Wildberries data",
-    "longDescription": "Analyze e-Comet account data, get current Wildberries data, and export seller review reports through the user's browser.",
+    "shortDescription": "Seller analytics and live marketplace reports",
+    "longDescription": "Analyze e-Comet account data, get current Wildberries data, and export seller reports from Wildberries and Ozon through the user's browser.",
     "developerName": "e-Comet",
     "category": "Developer Tools",
     "capabilities": ["Interactive"],
@@ -34,7 +34,8 @@
       "Find WB image URLs for product IDs",
       "Show WB stock by warehouse for an article",
       "Find my WB article position in search",
-      "Download a WB seller review report for a product ID"
+      "Download a WB seller review report for a product ID",
+      "Download an Ozon Seller promotion report for a date range"
     ],
     "brandColor": "#0F766E",
     "composerIcon": "./assets/icon.png",

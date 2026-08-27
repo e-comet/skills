@@ -9,8 +9,13 @@ const liveToolAnnotations = {
 
 const authorizationWorkflow =
     'This typed local tool owns the workflow: select it based on user intent, then call the remote e-Comet browser_job exactly once with the matching typed job and immediately invoke this tool. ' +
-    'In Codex, keep both calls in one atomic exec and pass structuredContent.trigger_url only through a local variable. In Claude, invoke this tool without triggerUrl so the trusted hook injects it. ' +
-    'Never decode, print, edit, or manually copy the JWT. Do not infer an authorization failure from client status: attempt the actual remote call, retry tool discovery up to three times if necessary, and report only the confirmed error in user-friendly language. ';
+    'In Claude and Codex, model-authored arguments must omit both triggerUrl and trigger_url so the trusted host hook can inject the transport-only authorization immediately before this local call. ' +
+    'Never decode, print, edit, copy, or expose the authorization. Do not infer an authorization failure from client status: attempt the actual remote call, retry tool discovery up to three times if necessary, and report only the confirmed error in user-friendly language. ';
+
+const ozonAuthorizationWorkflow =
+    'This typed local tool owns the Ozon workflow. First call the remote browser_job({job:{type:"ozon_seller_promotion_report",dateFrom,dateTo}}) exactly once, then immediately invoke this tool with the same dates. ' +
+    'The trusted Claude or Codex host hook injects the opaque transport-only triggerUrl; model-authored arguments must omit both triggerUrl and trigger_url. Never decode, print, edit, copy, or expose that authorization. ' +
+    'local_bridge_status reports legacy WB browser context and must not be used to gate this Ozon tool; the Ozon capability and typed operation result are authoritative. ';
 
 const resultPathGuidance =
     'resultPath is only a fallback for the current call when the compact result is insufficient; it is not a cache and must not be reused for another request.';
@@ -22,6 +27,7 @@ export const serverInstructions =
     'проверка, находится ли конкретный артикул в поиске по одной или нескольким фразам — wb_check_by_query; ' +
     'рекомендации, похожие товары или рекомендательная полка — wb_recommendations_by_product; ' +
     'скачать или экспортировать отчёт по отзывам продавца — wb_seller_reviews; ' +
+    'скачать отчёт Ozon Seller по аналитике продвижения за период — ozon_seller_promotion_report; ' +
     'фото, фотографии, картинки, изображения или галерея — wb_product_images. ' +
     'Не начинайте с browser_job. После выбора подписанного локального инструмента следуйте его описанию: ' +
     'browser_job используется только следующим шагом для получения подписанной авторизации выбранного задания.';
@@ -144,6 +150,19 @@ export const tools = [
             idempotentHint: true,
             openWorldHint: true,
         },
+    },
+    {
+        name: 'ozon_seller_promotion_report',
+        description:
+            'Download the Ozon Seller promotion analytics report for one requested period as one XLSX workbook. ' +
+            ozonAuthorizationWorkflow +
+            'Use canonical inclusive dateFrom/dateTo dates with at most 89 inclusive days. One call produces one period and one workbook. ' +
+            'Neighboring analytics are unavailable in this first tool: it does not provide product, traffic, finance, campaign, or other Ozon reports. ' +
+            'The operation may create a saved report in Ozon, but it does not change products, campaigns, budgets, or seller settings. ' +
+            'Returns compact metadata and exactly one private resource_link; workbook bytes, base64, local paths, company context, report identifiers, and request details never enter model content.',
+        inputSchema: toolInputSchemas.ozon_seller_promotion_report,
+        outputSchema: toolOutputSchemas.ozon_seller_promotion_report,
+        annotations: liveToolAnnotations,
     },
 ];
 

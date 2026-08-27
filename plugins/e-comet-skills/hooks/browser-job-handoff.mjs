@@ -22,7 +22,16 @@ const LOCK_RELEASE_RETRY_LIMIT = 20;
 const TRANSIENT_WINDOWS_LOCK_ERRORS = new Set(['EPERM', 'EBUSY']);
 const REMOTE_BROWSER_JOB_TOOL = /^mcp__.+__browser_job$/;
 const LOCAL_BROWSER_TOOL =
-    /^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:wb_product_card|wb_search_by_query|wb_check_by_query|wb_recommendations_by_product|wb_seller_reviews)$/;
+    /^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:wb_product_card|wb_search_by_query|wb_check_by_query|wb_recommendations_by_product|wb_seller_reviews|ozon_seller_promotion_report)$/;
+const LOCAL_TOOL_BY_BROWSER_JOB_TYPE = Object.freeze({
+    product_card: 'wb_product_card',
+    search_by_query: 'wb_search_by_query',
+    check_by_query: 'wb_check_by_query',
+    recommendations_by_product: 'wb_recommendations_by_product',
+    seller_reviews: 'wb_seller_reviews',
+    ozon_seller_promotion_report: 'ozon_seller_promotion_report',
+});
+const SIGNED_LOCAL_TOOLS = new Set(Object.values(LOCAL_TOOL_BY_BROWSER_JOB_TYPE));
 
 class HandoffError extends Error {
     constructor(code, message) {
@@ -56,6 +65,13 @@ const validateTriggerUrl = (triggerUrl) => {
     return triggerUrl;
 };
 
+const validateTargetTool = (targetTool) => {
+    if (typeof targetTool !== 'string' || !SIGNED_LOCAL_TOOLS.has(targetTool)) {
+        throw new HandoffError('HANDOFF_INVALID_TOOL', 'The browser authorization target is invalid.');
+    }
+    return targetTool;
+};
+
 const hashSessionId = (sessionId) => createHash('sha256').update(validateSessionId(sessionId), 'utf8').digest('hex');
 
 const resolveStoreDirectory = (env) => {
@@ -75,7 +91,7 @@ const stageFilePrefixForSession = (sessionId) => `${STAGE_FILE_PREFIX}${hashSess
 const collisionPathForSession = (storeDirectory, sessionId) =>
     join(storeDirectory, `${COLLISION_FILE_PREFIX}${hashSessionId(sessionId)}`);
 
-const parseStoredEntry = (text) => {
+const parseStoredEntry = (text, { requireTarget = false } = {}) => {
     let entry;
     try {
         entry = JSON.parse(text);
@@ -91,6 +107,12 @@ const parseStoredEntry = (text) => {
         throw new HandoffError('HANDOFF_INVALID_ENTRY', 'The pending browser authorization is invalid.');
     }
     validateTriggerUrl(entry.triggerUrl);
+    if (entry.targetTool !== undefined && !SIGNED_LOCAL_TOOLS.has(entry.targetTool)) {
+        throw new HandoffError('HANDOFF_INVALID_ENTRY', 'The pending browser authorization is invalid.');
+    }
+    if (requireTarget && entry.targetTool === undefined) {
+        throw new HandoffError('HANDOFF_INVALID_ENTRY', 'The pending browser authorization is invalid.');
+    }
     return entry;
 };
 
@@ -357,9 +379,17 @@ const cleanupStore = async (storeDirectory, nowMs, fileNowMs) => {
     return pendingCount;
 };
 
-export const stageTriggerUrl = async ({ dataDirectory, sessionId, triggerUrl, nowMs = Date.now(), fileNow = Date.now }) => {
+export const stageTriggerUrl = async ({
+    dataDirectory,
+    sessionId,
+    triggerUrl,
+    targetTool,
+    nowMs = Date.now(),
+    fileNow = Date.now,
+}) => {
     validateSessionId(sessionId);
     validateTriggerUrl(triggerUrl);
+    validateTargetTool(targetTool);
     await ensurePrivateStoreDirectory(dataDirectory);
     const stagePath = join(dataDirectory, `${stageFilePrefixForSession(sessionId)}${process.pid}-${randomUUID()}`);
     const observedCollision = await readCollision(dataDirectory, sessionId);
@@ -398,7 +428,12 @@ export const stageTriggerUrl = async ({ dataDirectory, sessionId, triggerUrl, no
                     );
                 }
             }
-            const payload = JSON.stringify({ version: 1, createdAtMs: nowMs, triggerUrl });
+            const payload = JSON.stringify({
+                version: 1,
+                createdAtMs: nowMs,
+                triggerUrl,
+                targetTool,
+            });
             try {
                 await writeFile(pendingPath, payload, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
             } catch (error) {
@@ -426,8 +461,15 @@ export const stageTriggerUrl = async ({ dataDirectory, sessionId, triggerUrl, no
     }
 };
 
-export const claimTriggerUrl = async ({ dataDirectory, sessionId, nowMs = Date.now(), fileNow = Date.now }) => {
+export const claimTriggerUrl = async ({
+    dataDirectory,
+    sessionId,
+    targetTool,
+    nowMs = Date.now(),
+    fileNow = Date.now,
+}) => {
     validateSessionId(sessionId);
+    validateTargetTool(targetTool);
     await ensurePrivateStoreDirectory(dataDirectory);
     return withSessionLock(dataDirectory, sessionId, fileNow, async () => {
         await cleanupStore(dataDirectory, nowMs, fileNow());
@@ -453,9 +495,15 @@ export const claimTriggerUrl = async ({ dataDirectory, sessionId, nowMs = Date.n
         }
 
         try {
-            const entry = parseStoredEntry(await readFile(claimPath, 'utf8'));
+            const entry = parseStoredEntry(await readFile(claimPath, 'utf8'), { requireTarget: true });
             if (!isEntryFresh(entry, nowMs)) {
                 throw new HandoffError('HANDOFF_EXPIRED', 'The pending browser authorization expired.');
+            }
+            if (entry.targetTool !== targetTool) {
+                throw new HandoffError(
+                    'HANDOFF_TOOL_MISMATCH',
+                    'The pending browser authorization does not match this local tool.'
+                );
             }
             return entry.triggerUrl;
         } finally {
@@ -534,6 +582,18 @@ const safeHookError = (error) => {
     return new HandoffError('HANDOFF_STORAGE_ERROR', 'The local browser authorization handoff failed.');
 };
 
+const browserJobTargetTool = (event) => {
+    const toolInput = event.tool_input ?? event.toolInput;
+    if (!toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) {
+        throw new HandoffError('HANDOFF_INVALID_TOOL', 'The browser authorization target is invalid.');
+    }
+    const job = toolInput.job;
+    if (!job || typeof job !== 'object' || Array.isArray(job)) {
+        throw new HandoffError('HANDOFF_INVALID_TOOL', 'The browser authorization target is invalid.');
+    }
+    return validateTargetTool(LOCAL_TOOL_BY_BROWSER_JOB_TYPE[job.type]);
+};
+
 export const processHookEvent = async (event, { env = process.env, nowMs = Date.now(), fileNow = Date.now } = {}) => {
     if (!event || typeof event !== 'object') {
         const error = new HandoffError('HANDOFF_INVALID_EVENT', 'The desktop hook event is invalid.');
@@ -541,9 +601,11 @@ export const processHookEvent = async (event, { env = process.env, nowMs = Date.
     }
 
     const eventName = event.hook_event_name || event.hookEventName;
-    if (eventName === 'PostToolUse' && REMOTE_BROWSER_JOB_TOOL.test(event.tool_name)) {
+    const toolName = event.tool_name ?? event.toolName;
+    const sessionId = event.session_id ?? event.sessionId;
+    if (eventName === 'PostToolUse' && REMOTE_BROWSER_JOB_TOOL.test(toolName)) {
         try {
-            const triggerUrl = extractTriggerUrl(event.tool_response);
+            const triggerUrl = extractTriggerUrl(event.tool_response ?? event.toolResponse);
             if (triggerUrl === null) {
                 throw new HandoffError(
                     'HANDOFF_TOKEN_NOT_FOUND',
@@ -552,8 +614,9 @@ export const processHookEvent = async (event, { env = process.env, nowMs = Date.
             }
             await stageTriggerUrl({
                 dataDirectory: resolveStoreDirectory(env),
-                sessionId: event.session_id,
+                sessionId,
                 triggerUrl,
+                targetTool: browserJobTargetTool(event),
                 nowMs,
                 fileNow,
             });
@@ -564,20 +627,33 @@ export const processHookEvent = async (event, { env = process.env, nowMs = Date.
         }
     }
 
-    if (eventName === 'PreToolUse' && LOCAL_BROWSER_TOOL.test(event.tool_name)) {
+    const isLocalBrowserTool = eventName === 'PreToolUse' && LOCAL_BROWSER_TOOL.test(toolName);
+    if (isLocalBrowserTool) {
         try {
-            if (!event.tool_input || typeof event.tool_input !== 'object' || Array.isArray(event.tool_input)) {
+            const toolInput = event.tool_input ?? event.toolInput;
+            if (!toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) {
                 throw new HandoffError('HANDOFF_INVALID_INPUT', 'The local browser-job arguments are invalid.');
+            }
+            const targetTool = toolName.slice(toolName.lastIndexOf('__') + 2);
+            if (
+                Object.prototype.hasOwnProperty.call(toolInput, 'triggerUrl') ||
+                Object.prototype.hasOwnProperty.call(toolInput, 'trigger_url')
+            ) {
+                throw new HandoffError(
+                    'HANDOFF_MODEL_AUTHORIZATION',
+                    'The browser authorization must be injected by the trusted host hook.'
+                );
             }
             const triggerUrl = await claimTriggerUrl({
                 dataDirectory: resolveStoreDirectory(env),
-                sessionId: event.session_id,
+                sessionId,
+                targetTool,
                 nowMs,
                 fileNow,
             });
             return {
                 exitCode: 0,
-                stdout: preToolUseOutput({ ...event.tool_input, triggerUrl }),
+                stdout: preToolUseOutput({ ...toolInput, triggerUrl }),
                 stderr: '',
             };
         } catch (error) {

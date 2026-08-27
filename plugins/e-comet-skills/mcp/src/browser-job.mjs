@@ -29,6 +29,7 @@ import {
     SEARCH_CONCURRENCY,
 } from './config.mjs';
 import { SELLER_OPERATION_STAGES } from './extension-vocabulary.mjs';
+import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
 import { ToolExecutionError } from './tool-errors.mjs';
 import {
     isSuccessfulWbResponse,
@@ -290,6 +291,19 @@ export const validateAuthorizedJobLimits = (authorization) => {
                     `Browser seller-review job requires at most ${MAX_SELLER_REVIEW_EXPORTS} exports and ${MAX_SELLER_REVIEW_PHYSICAL_REPORTS} physical reports`
                 );
             }
+            return;
+        }
+
+        if (authorization.jobType === 'ozon_seller_promotion_report') {
+            const keys = Object.keys(job);
+            if (
+                keys.length !== 4 ||
+                !keys.every((key) => ['jobId', 'type', 'dateFrom', 'dateTo'].includes(key)) ||
+                job.type !== 'ozon-seller-promotion-report'
+            ) {
+                throw new Error('Invalid Ozon promotion descriptor');
+            }
+            parseOzonPromotionPeriod(job.dateFrom, job.dateTo);
             return;
         }
 
