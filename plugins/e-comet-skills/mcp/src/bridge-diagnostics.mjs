@@ -50,6 +50,11 @@ export const deriveBridgeDiagnostics = (raw, nowMs) => {
             ...(lastConnectedAt === undefined ? {} : { lastConnectedAt }),
             ...(lastDisconnectedAt === undefined ? {} : { lastDisconnectedAt }),
             ...(raw.extensionVersion ? { version: raw.extensionVersion } : {}),
+            // Справочное поле: типизированный инструмент Ozon по-прежнему решает сам, а отсутствие
+            // поля означает «наблюдать было не по чему», а не «не поддерживается».
+            ...(typeof raw.ozonSellerPromotionReportSupported === 'boolean'
+                ? { ozonSellerPromotionReportSupported: raw.ozonSellerPromotionReportSupported }
+                : {}),
         },
         ...(raw.peer ? { peer: raw.peer } : {}),
         browserContext: raw.browserContext ?? { state: 'unknown' },

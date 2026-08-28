@@ -1,5 +1,5 @@
 import { localMessage, MESSAGE_TYPES } from './extension-vocabulary.mjs';
-import { ToolExecutionError } from './tool-errors.mjs';
+import { ozonExtensionOutdatedError, ToolExecutionError } from './tool-errors.mjs';
 import { sendWs, WS_OPEN } from './websocket.mjs';
 
 /**
@@ -9,6 +9,9 @@ import { sendWs, WS_OPEN } from './websocket.mjs';
  *     extensionSocket?: unknown,
  *     peerExtensionOzonPromotionReady?: boolean,
  *     peerSocket?: {readyState: number, send(message: string): void} | null,
+ *     effectiveExtensionVersion?: string,
+ *     effectiveOzonPromotionReady?: boolean,
+ *     effectiveOzonPromotionSupportKnown?: boolean,
  *   },
  *   sendExtension?: (socket: unknown, message: object) => void,
  * }} options
@@ -40,6 +43,13 @@ export const createOzonPromotionRoute = ({ connections, sendExtension = sendWs }
                 })
             );
             return;
+        }
+        // Ответ про возможность известен (а значит расширение подключено) и возможность не объявлена —
+        // дело в версии расширения, а не в закрытой странице отчёта. Во всех остальных случаях
+        // (расширения нет, пир о возможности не сообщал, маршрут отвалился на полпути) остаётся
+        // прежний общий отказ: приписывать пользователю устаревшее расширение по незнанию нельзя.
+        if (connections.effectiveOzonPromotionSupportKnown === true && connections.effectiveOzonPromotionReady !== true) {
+            throw ozonExtensionOutdatedError(connections.effectiveExtensionVersion);
         }
         throw new ToolExecutionError(
             'OZON_ROUTE_NOT_READY',

@@ -15,7 +15,8 @@ const authorizationWorkflow =
 const ozonAuthorizationWorkflow =
     'This typed local tool owns the Ozon workflow. First call the remote browser_job({job:{type:"ozon_seller_promotion_report",dateFrom,dateTo}}) exactly once, then immediately invoke this tool with the same dates. ' +
     'The trusted Claude or Codex host hook injects the opaque transport-only triggerUrl; model-authored arguments must omit both triggerUrl and trigger_url. Never decode, print, edit, copy, or expose that authorization. ' +
-    'local_bridge_status reports legacy WB browser context and must not be used to gate this Ozon tool; the Ozon capability and typed operation result are authoritative. ';
+    'local_bridge_status reports legacy WB browser context and must not be used to gate this Ozon tool; the Ozon capability and typed operation result are authoritative. ' +
+    'Its extension version and Ozon capability fields are informational only: use them to explain a failure, never to skip or pre-approve this call. ';
 
 const resultPathGuidance =
     'resultPath is only a fallback for the current call when the compact result is insufficient; it is not a cache and must not be reused for another request.';
@@ -47,7 +48,9 @@ export const tools = [
             'peer_context_unknown: «Расширение доступно через другой локальный процесс, но он не передаёт контекст вкладок; перезапустите или обновите desktop hosts. Не делайте вывод, что устарело само расширение.» ' +
             'ready: «Локальный bridge и расширение подключены; найдена вкладка Wildberries. Готовность конкретного задания проверит выбранный инструмент.» ' +
             'peer_unavailable + FIX_PEER_TOKEN_PERMISSIONS: «Другой локальный процесс уже владеет bridge, но этот агент не может подключиться из-за ограничений доступа к данным сопряжения в профиле пользователя. Разрешите desktop host доступ к профилю пользователя и повторите запрос.» Use this explanation only for the explicit FIX_PEER_TOKEN_PERMISSIONS action; do not expose raw filesystem paths or errors. ' +
-            'peer_unavailable: «Мостом уже владеет другой агент, и связаться с ним не удалось — работайте в нём.»',
+            'peer_unavailable: «Мостом уже владеет другой агент, и связаться с ним не удалось — работайте в нём.» ' +
+            'extension.version and extension.ozonSellerPromotionReportSupported are informational: false means the connected extension does not announce the Ozon promotion capability and has to be updated, ' +
+            'while an absent field means no connected extension reported it. Neither field gates a typed tool; each tool still decides for itself.',
         inputSchema: toolInputSchemas.local_bridge_status,
         outputSchema: toolOutputSchemas.local_bridge_status,
         annotations: {
@@ -159,6 +162,8 @@ export const tools = [
             'Use canonical inclusive dateFrom/dateTo dates with at most 89 inclusive days. One call produces one period and one workbook. ' +
             'Neighboring analytics are unavailable in this first tool: it does not provide product, traffic, finance, campaign, or other Ozon reports. ' +
             'The operation may create a saved report in Ozon, but it does not change products, campaigns, budgets, or seller settings. ' +
+            'An OZON_ROUTE_NOT_READY failure carrying error.details.reason "extension_outdated" means the installed e-Comet extension is too old for this report: tell the user to update the extension to the version in error.details and retry, ' +
+            'and do not tell them to open the report page. The same code without those details means no ready Ozon promotion route was reachable: usually the exact promotion page is not open, but the extension may also be disconnected or reachable only through an older local process, so read local_bridge_status before naming a remedy. ' +
             'Returns compact metadata and exactly one private resource_link; workbook bytes, base64, local paths, company context, report identifiers, and request details never enter model content.',
         inputSchema: toolInputSchemas.ozon_seller_promotion_report,
         outputSchema: toolOutputSchemas.ozon_seller_promotion_report,

@@ -9,7 +9,12 @@ import {
     MAX_RETURNED_PRODUCTS,
 } from './config.mjs';
 import { PEER_REJECTION_CODES } from './connection-state.mjs';
-import { OZON_PROMOTION_TERMINAL_CODE_STAGES } from './tool-errors.mjs';
+import {
+    EXTENSION_UPDATE_URL,
+    OZON_PROMOTION_CAPABILITY,
+    OZON_PROMOTION_MIN_EXTENSION_VERSION,
+} from './extension-vocabulary.mjs';
+import { OZON_EXTENSION_OUTDATED_REASON, OZON_PROMOTION_TERMINAL_CODE_STAGES } from './tool-errors.mjs';
 
 const string = { type: 'string' };
 const boolean = { type: 'boolean' };
@@ -361,6 +366,7 @@ const bridgeStatusSchema = object({
         lastConnectedAt: string,
         lastDisconnectedAt: string,
         version: string,
+        ozonSellerPromotionReportSupported: boolean,
     }, ['state', 'route']),
     peer: object({ bridgeVersion: string, browserContextPropagationSupported: boolean }),
     browserContext: object({
@@ -377,6 +383,7 @@ const bridgeStatusSchema = object({
         saturated: boolean,
     }, ['count', 'lastAtMs', 'saturated']),
     extensionVersion: string,
+    ozonSellerPromotionReportSupported: boolean,
     peerRejection: peerRejectionSchema,
     bridgeVersion: string,
     bridgeGeneration: positiveInteger,
@@ -421,6 +428,20 @@ const ozonPromotionArtifactSchema = object(
     ['name', 'mimeType', 'size', 'sha256']
 );
 
+// Устаревшее расширение не получает собственный терминальный код: набор кодов зафиксирован в общем
+// с расширением контракте. Диагноз едет в message и в этих полях, поэтому его видно и агенту, и в
+// структурированном ответе, а обычный отказ маршрута остаётся без details.
+const ozonExtensionOutdatedDetailsSchema = object(
+    {
+        reason: { const: OZON_EXTENSION_OUTDATED_REASON },
+        requiredCapability: { const: OZON_PROMOTION_CAPABILITY },
+        requiredExtensionVersion: { const: OZON_PROMOTION_MIN_EXTENSION_VERSION },
+        updateUrl: { const: EXTENSION_UPDATE_URL },
+        installedExtensionVersion: string,
+    },
+    ['reason', 'requiredCapability', 'requiredExtensionVersion', 'updateUrl']
+);
+
 const ozonPromotionErrorSchema = objectUnion(
     ...Object.entries(OZON_PROMOTION_TERMINAL_CODE_STAGES).map(([code, stage]) =>
         object(
@@ -429,6 +450,7 @@ const ozonPromotionErrorSchema = objectUnion(
                 message: { type: 'string', minLength: 1, maxLength: 500 },
                 stage: { const: stage },
                 retryable: { const: false },
+                ...(code === 'OZON_ROUTE_NOT_READY' ? { details: ozonExtensionOutdatedDetailsSchema } : {}),
             },
             ['code', 'message', 'stage', 'retryable']
         )

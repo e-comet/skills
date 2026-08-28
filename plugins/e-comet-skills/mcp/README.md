@@ -4,10 +4,12 @@ Codex and Claude launch `src/server.mjs` directly over STDIO with the `node` com
 dependencies; all required source modules are included in this directory. Node.js 22+ is required.
 
 `local_bridge_status` distinguishes bridge startup, extension waiting, Wildberries-tab readiness,
-update needs, and pairing failures, and returns a recommended next action. Peer-token storage affects
-pairing only; if a second agent reports `peer_unavailable`, continue in the agent that owns the bridge.
-Browser jobs may still return `LOCAL_STORAGE_FAILED` when result or artifact directories are
-unwritable; storage classification, fallback, and retry work is deferred.
+update needs, and pairing failures, and returns a recommended next action. It also reports the
+connected extension's version and whether that build announces the Ozon promotion capability; both
+are informational and never gate a typed tool. Peer-token storage affects pairing only; if a second
+agent reports `peer_unavailable`, continue in the agent that owns the bridge. Browser jobs may still
+return `LOCAL_STORAGE_FAILED` when result or artifact directories are unwritable; storage
+classification, fallback, and retry work is deferred.
 
 The canonical source and tests live under `e-comet-local-mcp/` in the private skills repository. This plugin contains a
 release snapshot of its `src/` directory.
@@ -63,6 +65,12 @@ one private local `resource_link` for each successful XLSX workbook. Workbook by
 context; opening or summarizing a workbook is a separate explicit action. Artifacts are retained locally for 24 hours. Each
 workbook is limited to 100 MiB and each job to 500 MiB; the shared artifact store is limited to 512 MiB and 1000 files, with
 oldest completed artifacts evicted first.
+
+`ozon_seller_promotion_report` needs an extension build that announces the Ozon promotion capability. An older
+build cannot run the report at all, so the tool answers with an explicit outdated-extension diagnosis naming the
+installed version, the minimum supported one, and the update page, instead of asking for the report route to be
+opened. The same code without that diagnosis says only that no ready Ozon route was reachable, which usually
+means the exact promotion page is not open.
 
 Multiple Codex tasks can use the fixed bridge port at the same time in MVP mode. The first MCP process owns the
 extension WebSocket; later bundled MCP processes connect to it over the loopback-only `/mcp-peer` channel and proxy

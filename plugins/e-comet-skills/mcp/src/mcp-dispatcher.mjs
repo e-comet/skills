@@ -16,7 +16,7 @@ import { createJobWriter } from './result-store.mjs';
 import { executeOzonPromotionJob, getOzonPromotionArtifactResource } from './ozon-promotion-job.mjs';
 import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
 import { serverInstructions, tools, validateToolArguments } from './tool-catalog.mjs';
-import { safeOzonPromotionToolError, ToolExecutionError, toolFailure } from './tool-errors.mjs';
+import { ozonExtensionOutdatedError, safeOzonPromotionToolError, ToolExecutionError, toolFailure } from './tool-errors.mjs';
 import { createConcurrencyLimiter, discoverImageBasket, imageExists, normalizeStatus, runWithConcurrency } from './wb-domain.mjs';
 
 export const createMcpMessageHandler = ({
@@ -445,6 +445,19 @@ export const createMcpMessageHandler = ({
         }
     };
 
+    // Диагноз строится только по статусу, который явно сообщил про возможность. Статус без этого
+    // поля (нет расширения, старый соседний процесс, тестовая заглушка) оставляет прежнее поведение.
+    const ozonExtensionOutdated = () => {
+        let status;
+        try {
+            status = getBridgeStatus();
+        } catch {
+            return undefined;
+        }
+        if (status?.extensionConnected !== true || status.ozonSellerPromotionReportSupported !== false) return undefined;
+        return ozonExtensionOutdatedError(status.extensionVersion);
+    };
+
     const handleOzonPromotionReport = async (id, args = {}) => {
         const toolName = 'ozon_seller_promotion_report';
         const dateFrom = args?.dateFrom;
@@ -461,7 +474,13 @@ export const createMcpMessageHandler = ({
                 normalized = undefined;
             }
             const safeError = normalized
-                ? { code: normalized.code, message: normalized.message, stage: normalized.stage, retryable: false }
+                ? {
+                      code: normalized.code,
+                      message: normalized.message,
+                      stage: normalized.stage,
+                      retryable: false,
+                      ...(normalized.details === undefined ? {} : { details: normalized.details }),
+                  }
                 : { code: 'ARTIFACT_REJECTED', message: 'The Ozon promotion report could not be completed safely.', stage: 'artifact', retryable: false };
             return {
                 ok: false,
@@ -491,6 +510,13 @@ export const createMcpMessageHandler = ({
                     false
                 );
             }
+            // Проверка до авторизации, а не только на маршрутизации. Расширение без объявленной
+            // возможности отвергает подписанное задание Ozon как неизвестный тип ещё в ответе на
+            // browser_job_authorize, поэтому до маршрута дело не доходит и пользователь получил бы
+            // отказ авторизации вместо диагноза. Заодно не тратится одноразовая подписанная
+            // авторизация на заведомо неисполнимую операцию.
+            const outdatedExtension = ozonExtensionOutdated();
+            if (outdatedExtension) throw outdatedExtension;
             try {
                 authorizationLease = await requestBrowserJobAuthorization(extractBrowserJobToken(args.triggerUrl));
             } catch (error) {

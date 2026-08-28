@@ -63,6 +63,10 @@ export class ConnectionState {
     peerExtensionReady = false;
     peerExtensionBrowserJobReady = false;
     peerExtensionOzonPromotionReady = false;
+    // Старая первичная сборка поле про возможность Ozon в peer_status не присылает вовсе, и её
+    // молчание нельзя читать как «расширение не умеет»: иначе вторичный агент посоветует обновить
+    // расширение там, где на самом деле устарел соседний процесс.
+    peerOzonPromotionSupportReported = false;
     peerBrowserContext = { state: 'unknown' };
     peerExtensionLastConnectedAtMs = null;
     peerExtensionLastDisconnectedAtMs = null;
@@ -103,6 +107,14 @@ export class ConnectionState {
 
     get effectiveOzonPromotionReady() {
         return this.extensionOzonPromotionReady || (this.peerReady && this.peerExtensionOzonPromotionReady);
+    }
+
+    // Отличает «расширение возможность не объявило» от «спросить было не у кого»: известно только
+    // когда расширение действительно подключено и ответ про возможность получен. Первичный процесс
+    // без расширения тоже присылает поле, поэтому одного факта присылки мало.
+    get effectiveOzonPromotionSupportKnown() {
+        if (this.extensionReady) return true;
+        return this.peerReady && this.peerExtensionReady && this.peerOzonPromotionSupportReported;
     }
 
     get effectiveBrowserContext() {
@@ -204,6 +216,7 @@ export class ConnectionState {
         this.peerExtensionReady = extensionConnected === true;
         this.peerExtensionBrowserJobReady = browserJobSupported === true;
         this.peerExtensionOzonPromotionReady = message.ozonSellerPromotionReportSupported === true;
+        this.peerOzonPromotionSupportReported = typeof message.ozonSellerPromotionReportSupported === 'boolean';
         this.peerBrowserContext = message.browserContext?.state === 'known' ? { ...message.browserContext } : { state: 'unknown' };
         this.peerExtensionLastConnectedAtMs = Number.isFinite(message.extensionLastConnectedAtMs) ? message.extensionLastConnectedAtMs : null;
         this.peerExtensionLastDisconnectedAtMs = Number.isFinite(message.extensionLastDisconnectedAtMs) ? message.extensionLastDisconnectedAtMs : null;
@@ -254,6 +267,7 @@ export class ConnectionState {
         this.peerExtensionReady = false;
         this.peerExtensionBrowserJobReady = false;
         this.peerExtensionOzonPromotionReady = false;
+        this.peerOzonPromotionSupportReported = false;
         this.peerBrowserContext = { state: 'unknown' };
         this.authenticatedPrimaryMetadata = undefined;
         return true;
@@ -266,6 +280,7 @@ export class ConnectionState {
         this.peerExtensionReady = false;
         this.peerExtensionBrowserJobReady = false;
         this.peerExtensionOzonPromotionReady = false;
+        this.peerOzonPromotionSupportReported = false;
         this.peerBrowserContext = { state: 'unknown' };
         this.authenticatedPrimaryMetadata = undefined;
         this.resetPeerReconnect();

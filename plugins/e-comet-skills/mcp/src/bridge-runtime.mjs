@@ -698,6 +698,11 @@ export const createBridgeRuntime = ({
             extensionLastDisconnectedAtMs: connections.effectiveExtensionLastDisconnectedAtMs,
             extensionTakeovers: connections.effectiveExtensionTakeovers,
             extensionVersion: connections.effectiveExtensionVersion,
+            // Только когда ответ действительно известен: у устаревшего первичного процесса поля в
+            // peer_status нет, и его отсутствие здесь честнее выдуманного false.
+            ...(connections.effectiveOzonPromotionSupportKnown
+                ? { ozonSellerPromotionReportSupported: connections.effectiveOzonPromotionReady === true }
+                : {}),
             ...(connections.peerReady && connections.authenticatedPrimaryMetadata
                 ? { peer: connections.authenticatedPrimaryMetadata }
                 : {}),
