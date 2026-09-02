@@ -12,6 +12,17 @@
             "statusMessage": "Securing e-Comet browser authorization"
           }
         ]
+      },
+      {
+        "matcher": "^mcp__(?:(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__prepare_e_comet_feedback|(?:e[-_]comet|e_comet_stage|https_mcp_stage_int_e_comet_io_mcp|plugin_e-comet-skills_e-comet|remote-devices__plugin_e-comet-skills_e-comet|2da262fd-fd1f-4636-90cb-75b02fd1f1f1)__report_issue)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/feedback-handoff.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Securing e-Comet feedback authorization"
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -27,13 +38,24 @@
         ]
       },
       {
-        "matcher": "^mcp__(?:(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet(?:[-_]local)?__.+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}__(?:info|describe_metrics|list_entities|query_metrics|query_forecast|browser_job))$",
+        "matcher": "^mcp__(?:(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet(?:[-_]local)?__.+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}__(?:info|describe_metrics|list_entities|query_metrics|query_forecast|browser_job|report_issue))$",
         "hooks": [
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/check-update.mjs\"",
             "timeout": 4,
             "statusMessage": "Checking e-Comet MCP Tools plugin version"
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:prepare_e_comet_feedback|submit_e_comet_feedback)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/feedback-handoff.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Restoring e-Comet feedback authorization"
           }
         ]
       }

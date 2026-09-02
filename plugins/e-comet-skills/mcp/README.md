@@ -43,6 +43,8 @@ Local tools:
 - `wb_check_by_query` — checks whether one article appears in search for up to 100 phrases, without reporting a position;
 - `wb_recommendations_by_product` — discovers and executes signed recommendation-shelf requests;
 - `wb_seller_reviews` — exports original WB seller-review XLSX reports through the authenticated seller portal;
+- `prepare_e_comet_feedback` — prepares one local e-Comet issue-report archive after explicit user consent;
+- `submit_e_comet_feedback` — uploads one prepared feedback archive with a trusted one-use grant;
 - `ozon_seller_promotion_report` — exports one Ozon Seller promotion analytics XLSX report for one inclusive period;
 - `local_bridge_status` — reports whether the extension is connected, and why the bridge cannot reach a primary
   peer when it cannot;

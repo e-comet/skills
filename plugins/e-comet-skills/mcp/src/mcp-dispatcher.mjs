@@ -10,6 +10,7 @@ import {
     SUPPORTED_MCP_PROTOCOL_VERSIONS,
 } from './config.mjs';
 import { createArtifactWriter, releaseArtifactJob } from './artifact-store.mjs';
+import { prepareECometFeedback, submitECometFeedback } from './feedback-tools.mjs';
 import { executeAuthorizedBrowserJob, executeSellerReviewsJob, extractBrowserJobToken, validateAuthorizedJobLimits } from './browser-job.mjs';
 import { mcpError, mcpResult, resourceLinkResult, textResult } from './mcp-protocol.mjs';
 import { createJobWriter } from './result-store.mjs';
@@ -38,6 +39,8 @@ export const createMcpMessageHandler = ({
     sendResult = mcpResult,
     createJobWriter: createWriter = createJobWriter,
     probeImageExists = imageExists,
+    prepareFeedback = prepareECometFeedback,
+    submitFeedback = submitECometFeedback,
     shutdownSignal,
     log = (..._args) => undefined,
     now = Date.now,
@@ -209,6 +212,53 @@ export const createMcpMessageHandler = ({
                     true
                 )
             );
+        }
+    };
+
+    const feedbackPrepareFailure = (error) => ({
+        ok: false,
+        status: 'failed',
+        error:
+            error?.code === 'TRANSCRIPT_TOO_LARGE'
+                ? { code: 'TRANSCRIPT_TOO_LARGE', message: 'The requested feedback transcript is too large to fit in the feedback archive.', stage: 'transcript', retryable: false }
+            : error?.code === 'TRANSCRIPT_UNAVAILABLE'
+                ? { code: 'TRANSCRIPT_UNAVAILABLE', message: 'The requested feedback transcript is unavailable.', stage: 'transcript', retryable: true }
+                : error?.code === 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE'
+                    ? { code: 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE', message: 'The trusted e-Comet hook handoff is unavailable.', stage: 'handoff', retryable: false }
+                : { code: 'FEEDBACK_PREPARATION_FAILED', message: 'The feedback archive could not be prepared.', stage: 'prepare', retryable: false },
+    });
+
+    const handleFeedbackPrepare = async (id, args = {}) => {
+        if (!validateToolArguments('prepare_e_comet_feedback', args)) {
+            sendResult(id, textResult(feedbackPrepareFailure(), true));
+            return;
+        }
+        try {
+            const prepared = await prepareFeedback(args, { getBridgeStatus });
+            const reportResource = prepared?.reportResource;
+            if (!reportResource || reportResource.name !== 'report.md') throw new Error('missing report resource');
+            sendResult(id, resourceLinkResult(prepared, JSON.stringify(prepared), [reportResource]));
+        } catch (error) {
+            sendResult(id, textResult(feedbackPrepareFailure(error), true));
+        }
+    };
+
+    const handleFeedbackSubmit = async (id, args = {}) => {
+        if (!validateToolArguments('submit_e_comet_feedback', args)) {
+            sendResult(
+                id,
+                textResult(
+                    { ok: false, status: 'failed', artifactId: '00000000-0000-4000-8000-000000000000', error: { code: 'UPLOAD_GRANT_INVALID', message: 'The feedback upload grant is invalid or has expired.', stage: 'grant', retryable: false } },
+                    true
+                )
+            );
+            return;
+        }
+        try {
+            const submitted = await submitFeedback(args);
+            sendResult(id, textResult(submitted, !submitted.ok));
+        } catch {
+            sendResult(id, textResult({ ok: false, status: 'failed', artifactId: args.artifactId, error: { code: 'ARTIFACT_UNAVAILABLE', message: 'The prepared feedback archive is unavailable.', stage: 'artifact', retryable: false } }, true));
         }
     };
 
@@ -603,6 +653,8 @@ export const createMcpMessageHandler = ({
         ],
         ['wb_seller_reviews', { needsBridge: true, run: (id, args) => handleSellerReviewsExport(id, args) }],
         ['ozon_seller_promotion_report', { needsBridge: true, run: (id, args) => handleOzonPromotionReport(id, args) }],
+        ['prepare_e_comet_feedback', { needsBridge: false, run: (id, args) => handleFeedbackPrepare(id, args) }],
+        ['submit_e_comet_feedback', { needsBridge: false, run: (id, args) => handleFeedbackSubmit(id, args) }],
         ['wb_product_images', { needsBridge: false, run: (id, args) => handleProductImages(id, args) }],
     ]);
 

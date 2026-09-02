@@ -1,6 +1,7 @@
 import {
     DEFAULT_IMAGE_PHOTOS,
     DEFAULT_RETURNED_PRODUCTS,
+    FEEDBACK_KINDS,
     MAX_BROWSER_JOB_TOKEN_BYTES,
     MAX_IMAGE_ARTICLES,
     MAX_IMAGE_BASKET,
@@ -523,6 +524,69 @@ const liveInputSchema = (limitName, scope) =>
         ...(limitName ? projectionProperties(limitName, scope) : {}),
     });
 
+const feedbackArtifactId = { type: 'string', pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' };
+const feedbackSha256 = { type: 'string', pattern: '^[a-f0-9]{64}$' };
+const feedbackClaim = { type: 'string', pattern: '^[A-Za-z0-9_-]{43}$' };
+const feedbackSession = { type: 'string', pattern: '^[a-f0-9]{64}$' };
+const hookOnlyFeedbackField = (description) => ({
+    ...description,
+    description:
+        `${description.description} Injected by the trusted Claude or Codex host hook immediately before this local tool call; ` +
+        'model-authored arguments must omit it and every snake_case alias.',
+});
+const feedbackPrepareSchema = object(
+    {
+        kind: { type: 'string', enum: FEEDBACK_KINDS },
+        summary: { type: 'string', minLength: 1, maxLength: 512 },
+        details: { type: 'string', minLength: 1, maxLength: 4096 },
+        includeTranscript: boolean,
+        transcriptPath: hookOnlyFeedbackField({ type: 'string', minLength: 1, maxLength: 4096, description: 'Trusted local transcript path.' }),
+        feedbackClaim: hookOnlyFeedbackField({ ...feedbackClaim, description: 'One-use local feedback handoff claim.' }),
+        feedbackSession: hookOnlyFeedbackField({ ...feedbackSession, description: 'Bound host-session digest for the feedback claim.' }),
+    },
+    ['kind', 'summary', 'details', 'includeTranscript']
+);
+const feedbackSubmitSchema = object(
+    {
+        artifactId: feedbackArtifactId,
+        uploadUrl: hookOnlyFeedbackField({ type: 'string', minLength: 1, maxLength: 8192, description: 'Signed HTTPS upload URL.' }),
+        requiredHeaders: hookOnlyFeedbackField({ type: 'object', properties: {}, additionalProperties: { type: 'string', maxLength: 8192 }, description: 'Signed required request headers.' }),
+        objectKey: hookOnlyFeedbackField({ type: 'string', minLength: 1, maxLength: 1024, description: 'Storage object key.' }),
+        expiresAt: hookOnlyFeedbackField({ type: 'integer', minimum: 1, description: 'Upload grant expiry timestamp.' }),
+        expectedSize: hookOnlyFeedbackField({ type: 'integer', minimum: 1, maximum: 1024 * 1024, description: 'Expected archive size in bytes.' }),
+        expectedSha256: hookOnlyFeedbackField({ ...feedbackSha256, description: 'Expected archive SHA-256.' }),
+        feedbackClaim: hookOnlyFeedbackField({ ...feedbackClaim, description: 'One-use local feedback handoff claim.' }),
+        feedbackSession: hookOnlyFeedbackField({ ...feedbackSession, description: 'Bound host-session digest for the feedback claim.' }),
+    },
+    ['artifactId']
+);
+const feedbackErrorSchema = objectUnion(
+    object({ code: { const: 'FEEDBACK_PREPARATION_FAILED' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'prepare' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    object({ code: { const: 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'handoff' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    object({ code: { const: 'TRANSCRIPT_TOO_LARGE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'transcript' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    object({ code: { const: 'TRANSCRIPT_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'transcript' }, retryable: { const: true } }, ['code', 'message', 'stage', 'retryable']),
+    object({ code: { const: 'ARTIFACT_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'artifact' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    object({ code: { const: 'UPLOAD_GRANT_INVALID' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'grant' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    object({ code: { const: 'UPLOAD_REJECTED' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    object({ code: { const: 'UPLOAD_UNCERTAIN' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable'])
+);
+const feedbackPrepareSuccessSchema = object(
+    { ok: { const: true }, status: { const: 'prepared' }, artifactId: feedbackArtifactId, kind: { type: 'string', enum: FEEDBACK_KINDS }, sizeBytes: positiveInteger, sha256: feedbackSha256, transcriptIncluded: boolean, summary: { type: 'string', minLength: 1, maxLength: 512 } },
+    ['ok', 'status', 'artifactId', 'kind', 'sizeBytes', 'sha256', 'transcriptIncluded', 'summary']
+);
+const feedbackPrepareFailureSchema = object(
+    { ok: { const: false }, status: { const: 'failed' }, error: feedbackErrorSchema },
+    ['ok', 'status', 'error']
+);
+const feedbackSubmitSuccessSchema = object(
+    { ok: { const: true }, status: { const: 'uploaded' }, artifactId: feedbackArtifactId, transcriptIncluded: boolean },
+    ['ok', 'status', 'artifactId', 'transcriptIncluded']
+);
+const feedbackSubmitFailureSchema = object(
+    { ok: { const: false }, status: { type: 'string', enum: ['failed', 'rejected', 'uncertain'] }, artifactId: feedbackArtifactId, error: feedbackErrorSchema },
+    ['ok', 'status', 'artifactId', 'error']
+);
+
 export const toolInputSchemas = {
     local_bridge_status: object({}),
     wb_product_card: liveInputSchema(),
@@ -530,6 +594,8 @@ export const toolInputSchemas = {
     wb_check_by_query: liveInputSchema(),
     wb_recommendations_by_product: liveInputSchema('productLimitPerSource', 'source product'),
     wb_seller_reviews: liveInputSchema(),
+    prepare_e_comet_feedback: feedbackPrepareSchema,
+    submit_e_comet_feedback: feedbackSubmitSchema,
     ozon_seller_promotion_report: object(
         {
             dateFrom: canonicalDateProperty,
@@ -573,6 +639,8 @@ export const toolOutputSchemas = {
     wb_check_by_query: objectUnion(...liveAggregateSchemas(checkSuccessSchema), toolErrorSchema),
     wb_recommendations_by_product: objectUnion(...liveAggregateSchemas(recommendationsSuccessSchema), toolErrorSchema),
     wb_seller_reviews: objectUnion(sellerReviewsSuccessSchema, toolErrorSchema),
+    prepare_e_comet_feedback: objectUnion(feedbackPrepareSuccessSchema, feedbackPrepareFailureSchema),
+    submit_e_comet_feedback: objectUnion(feedbackSubmitSuccessSchema, feedbackSubmitFailureSchema),
     wb_product_images: objectUnion(...liveAggregateSchemas(imagesSuccessSchema), toolErrorSchema),
     ozon_seller_promotion_report: objectUnion(ozonPromotionSuccessSchema, ozonPromotionFailureSchema, ozonPromotionPreflightFailureSchema),
 };

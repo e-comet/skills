@@ -24,6 +24,7 @@ import {
 import { ConnectionState } from './connection-state.mjs';
 import { deriveBridgeDiagnostics } from './bridge-diagnostics.mjs';
 import { createExtensionProtocol } from './extension-protocol.mjs';
+import { startFeedbackArtifactMaintenance } from './feedback-artifact-store.mjs';
 import { localMessage, MESSAGE_TYPES } from './extension-vocabulary.mjs';
 import { HandoffState } from './handoff-state.mjs';
 import { createMcpMessageHandler } from './mcp-dispatcher.mjs';
@@ -276,11 +277,15 @@ const handleMcpMessage = createMcpMessageHandler({
     log,
 });
 
+let feedbackMaintenance;
+let feedbackMaintenanceStart;
 let shuttingDown = false;
 let detachStdio = () => undefined;
 const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    if (feedbackMaintenanceStart !== undefined) clearImmediate(feedbackMaintenanceStart);
+    feedbackMaintenance?.stop();
     shutdownController.abort();
     detachStdio();
     runtime.close();
@@ -295,3 +300,18 @@ const shutdown = () => {
 };
 detachStdio = attachStdioTransport({ handleMessage: handleMcpMessage, sendError: mcpError, onClose: shutdown });
 runtime.start();
+// Artifact reconciliation is independent of MCP readiness. Schedule it only after STDIO and the bridge runtime
+// are live so a busy or delayed feedback filesystem can never extend the host's cold-start handshake.
+feedbackMaintenanceStart = setImmediate(() => {
+    feedbackMaintenanceStart = undefined;
+    if (shuttingDown) return;
+    try {
+        feedbackMaintenance = startFeedbackArtifactMaintenance({
+            // Paths and raw storage errors are intentionally excluded from diagnostics.
+            onError: () => log('feedback artifact maintenance failed'),
+        });
+    } catch {
+        log('feedback artifact maintenance failed');
+    }
+});
+feedbackMaintenanceStart.unref?.();
