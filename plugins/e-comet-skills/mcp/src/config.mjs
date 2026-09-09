@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { posix, win32 } from 'node:path';
+import { join } from 'node:path';
 import { resolveLocalStateDir, resolvePeerTokenDir } from './state-paths.mjs';
+import { resolveStorageLayout } from './storage-layout.mjs';
 
 const readBuildVersion = () => {
     for (const metadataUrl of [new URL('../package.json', import.meta.url), new URL('../../.codex-plugin/plugin.json', import.meta.url)]) {
@@ -41,9 +42,9 @@ export const CONTROL_PROTOCOL_VERSION = 1;
 export const EXTENSION_PROTOCOL_VERSION = 4;
 export const SUPPORTED_MCP_PROTOCOL_VERSIONS = ['2025-06-18'];
 export const LATEST_MCP_PROTOCOL_VERSION = SUPPORTED_MCP_PROTOCOL_VERSIONS[0];
-// 4: a build that can proxy Ozon promotion reports must replace an already-running generation-3 primary;
-// otherwise the capable secondary remains behind a primary that cannot advertise or route the Ozon operation.
-const DEFAULT_BRIDGE_GENERATION = 4;
+// 5: a build that can proxy indexed Ozon report packages must replace an already-running generation-4 primary;
+// otherwise the capable secondary remains behind a primary that cannot advertise or route the package operation.
+const DEFAULT_BRIDGE_GENERATION = 5;
 export const resolveBridgeGeneration = ({ env = process.env } = {}) => {
     const mode = env.NODE_ENV;
     if (mode !== 'test' && mode !== 'development') return DEFAULT_BRIDGE_GENERATION;
@@ -181,27 +182,19 @@ export const IMAGE_BASKET_BOUNDS = [
 export { resolveLocalStateDir, resolvePeerTokenDir };
 
 // Result-directory relocation is intentionally user-configurable in production; quota and retention overrides above are not.
-export const resolveResultDir = (options = {}) =>
-    options.env?.ECOMET_LOCAL_AGENT_RESULT_DIR || (!options.env && process.env.ECOMET_LOCAL_AGENT_RESULT_DIR) || resolveLocalStateDir(options);
-
-export const resolveArtifactDir = (options = {}) => {
-    const configuredDirectory = options.env?.ECOMET_LOCAL_AGENT_ARTIFACT_DIR || (!options.env && process.env.ECOMET_LOCAL_AGENT_ARTIFACT_DIR);
-    if (configuredDirectory) return configuredDirectory;
-    const stateDirectory = resolveLocalStateDir(options);
-    return (options.platform || process.platform) === 'win32' ? win32.join(stateDirectory, 'artifacts') : posix.join(stateDirectory, 'artifacts');
-};
-
-export const resolveFeedbackArtifactDir = (options = {}) => {
-    const configuredDirectory = options.env?.ECOMET_FEEDBACK_ARTIFACT_DIR || (!options.env && process.env.ECOMET_FEEDBACK_ARTIFACT_DIR);
-    if (configuredDirectory) return configuredDirectory;
-    const stateDirectory = resolveLocalStateDir(options);
-    return (options.platform || process.platform) === 'win32' ? win32.join(stateDirectory, 'feedback-artifacts') : posix.join(stateDirectory, 'feedback-artifacts');
-};
+export const resolveResultDir = (options = {}) => resolveStorageLayout(options).results;
+export const resolveArtifactDir = (options = {}) => resolveStorageLayout(options).marketplaceArtifacts;
+export const resolveFeedbackArtifactDir = (options = {}) => resolveStorageLayout(options).feedbackArtifacts;
 
 export const PEER_TOKEN_DIR = resolvePeerTokenDir();
-export const RESULT_DIR = resolveResultDir();
-export const ARTIFACT_DIR = resolveArtifactDir();
-export const FEEDBACK_ARTIFACT_DIR = resolveFeedbackArtifactDir();
+export const LEGACY_LOCAL_STATE_DIR = resolveLocalStateDir();
+export const LEGACY_RESULT_DIR = LEGACY_LOCAL_STATE_DIR;
+export const LEGACY_ARTIFACT_DIR = join(LEGACY_LOCAL_STATE_DIR, 'artifacts');
+export const LEGACY_FEEDBACK_ARTIFACT_DIR = join(LEGACY_LOCAL_STATE_DIR, 'feedback-artifacts');
+export const STORAGE_LAYOUT = resolveStorageLayout();
+export const RESULT_STORAGE = STORAGE_LAYOUT.results;
+export const ARTIFACT_STORAGE = STORAGE_LAYOUT.marketplaceArtifacts;
+export const FEEDBACK_ARTIFACT_STORAGE = STORAGE_LAYOUT.feedbackArtifacts;
 export const ARTIFACT_RETENTION_MS = positiveIntegerEnv('ECOMET_ARTIFACT_RETENTION_MS', 24 * 60 * 60 * 1000);
 export const ARTIFACT_MAX_TOTAL_BYTES = positiveIntegerEnv('ECOMET_ARTIFACT_MAX_TOTAL_BYTES', 512 * 1024 * 1024);
 export const ARTIFACT_MAX_FILE_BYTES = positiveIntegerEnv('ECOMET_ARTIFACT_MAX_FILE_BYTES', 100 * 1024 * 1024);
@@ -212,14 +205,7 @@ export const FEEDBACK_MAX_SUMMARY_LENGTH = 512;
 // This is the remote report_issue contract. Every local validator must consume this one list so a report that
 // prepares successfully cannot later be rejected while requesting its upload grant.
 export const FEEDBACK_KINDS = Object.freeze(['bug', 'wrong_data', 'missing_capability', 'unclear_contract']);
-export const FEEDBACK_MAX_DETAILS_LENGTH = 4096;
-export const FEEDBACK_MAX_REPORT_BYTES = 16 * 1024;
-export const FEEDBACK_MAX_METADATA_BYTES = 2048;
-export const FEEDBACK_MAX_ARCHIVE_BYTES = 1024 * 1024;
-export const FEEDBACK_MAX_TRANSCRIPT_BYTES = 1024 * 1024;
-// DEFLATE makes encoded size content-dependent. Bound the source bytes independently, then enforce the
-// one-MiB wire limit against the completed entry sizes before allocating the final ZIP container.
-export const FEEDBACK_MAX_TOTAL_ENTRY_BYTES = FEEDBACK_MAX_REPORT_BYTES + FEEDBACK_MAX_METADATA_BYTES + FEEDBACK_MAX_TRANSCRIPT_BYTES;
+export const FEEDBACK_MAX_BYTES = 32 * 1024 * 1024;
 export const FEEDBACK_ARTIFACT_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const FEEDBACK_ARTIFACT_MAX_TOTAL_BYTES = positiveIntegerEnv('ECOMET_FEEDBACK_ARTIFACT_MAX_TOTAL_BYTES', 64 * 1024 * 1024);
 export const FEEDBACK_ARTIFACT_MAX_FILES = positiveIntegerEnv('ECOMET_FEEDBACK_ARTIFACT_MAX_FILES', 100);

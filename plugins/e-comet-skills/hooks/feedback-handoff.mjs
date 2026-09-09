@@ -1,17 +1,24 @@
 #!/usr/bin/env node
 
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, resolve } from 'node:path';
+import { chmod, lstat, mkdir, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { MAX_MCP_MESSAGE_BYTES } from '../mcp/src/config.mjs';
 import { issueFeedbackClaim } from '../mcp/src/feedback-claim.mjs';
+import { redactFeedbackText } from '../mcp/src/feedback-report.mjs';
+import { toolInputSchemas, validateSchemaValue } from '../mcp/src/tool-schemas.mjs';
+import { FEEDBACK_DIAGNOSTIC_FILESYSTEM_CODES, feedbackDiagnostics, safeFeedbackProperty, withFeedbackOperation } from '../mcp/src/feedback-diagnostics.mjs';
+import { classifyProcessOwner, getOwnProcessIdentity, readCurrentProcessScope, readProcessIdentity } from '../mcp/src/process-identity.mjs';
 
-const MAX_HOOK_EVENT_BYTES = 1024 * 1024;
+// PostToolUse can carry one maximum-size MCP request and response. Reserve another 256 KiB for the
+// host's session/tool metadata and platform paths while keeping malformed stdin decisively bounded.
+const MAX_HOOK_EVENT_BYTES = 2 * MAX_MCP_MESSAGE_BYTES + 256 * 1024;
 const MAX_SESSION_ID_BYTES = 512;
 const MAX_TRANSCRIPT_PATH_BYTES = 4096;
 const MAX_STATE_FILE_BYTES = 64 * 1024;
-const MAX_FEEDBACK_ARCHIVE_BYTES = 1024 * 1024;
+const MAX_FEEDBACK_ARCHIVE_BYTES = 32 * 1024 * 1024;
 const MAX_PENDING_ENTRIES = 128;
 const STATE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const CLOCK_SKEW_MS = 5000;
@@ -35,12 +42,14 @@ const MAX_REQUIRED_HEADERS = 32;
 const MAX_HEADER_NAME_BYTES = 128;
 const MAX_HEADER_VALUE_BYTES = 8 * 1024;
 const MAX_GRANT_PAYLOAD_BYTES = 48 * 1024;
-const UPLOAD_TIMEOUT_MS = 15_000;
+// Numeric expiry uses the same calendar range as the four-digit ISO wire representation.
+const MAX_EXPIRES_AT_SECONDS = 253402300799;
+const GRANT_START_WINDOW_MS = 30_000;
 const GRANT_HANDOFF_RESERVE_MS = 5_000;
-// WHY: staging promises enough lifetime for both ordinary Post->Pre scheduling and the complete one-shot PUT.
-const MIN_STAGE_GRANT_REMAINING_MS = UPLOAD_TIMEOUT_MS + GRANT_HANDOFF_RESERVE_MS;
-// WHY: once PreToolUse starts, charging the scheduling reserve again rejects grants that still cover the complete PUT.
-const MIN_CLAIM_GRANT_REMAINING_MS = UPLOAD_TIMEOUT_MS;
+// WHY: the grant must survive ordinary Post->Pre scheduling and the start of the PUT. Its expiry
+// is not coupled to the uploader's longer wall deadline for completing an already-started request.
+const MIN_STAGE_GRANT_REMAINING_MS = GRANT_START_WINDOW_MS + GRANT_HANDOFF_RESERVE_MS;
+const MIN_CLAIM_GRANT_REMAINING_MS = GRANT_START_WINDOW_MS;
 const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const HEADER_VALUE_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const OBJECT_KEY_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
@@ -52,11 +61,15 @@ const REMOTE_REPORT_ISSUE_TOOL = new RegExp(
     `^mcp__(?:e[-_]comet|e_comet_stage|https_mcp_stage_int_e_comet_io_mcp|plugin_e-comet-skills_e-comet|remote-devices__plugin_e-comet-skills_e-comet|${COWORK_UUID_NAMESPACE})__report_issue$`
 );
 
+const ownedErrors = new WeakMap();
 class FeedbackHandoffError extends Error {
-    constructor(code, message) {
-        super(message);
+    constructor(code, message, cause) {
+        super(message, { cause });
         this.name = 'FeedbackHandoffError';
         this.code = code;
+        ownedErrors.set(this, { code, message });
+        if (code === 'FEEDBACK_BUSY') this.feedbackReason = 'storage_busy';
+        if (code === 'FEEDBACK_CAPACITY') this.feedbackReason = 'storage_capacity';
     }
 }
 
@@ -64,6 +77,65 @@ const byteLength = (value) => Buffer.byteLength(value, 'utf8');
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 const isRecord = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const wait = (delayMs) => new Promise((resolveWait) => setTimeout(resolveWait, delayMs));
+const HANDOFF_OWNER_PATTERN = /^([1-9]\d{0,9})-[0-9a-f-]{36}$/;
+const HANDOFF_LOCK_RESIDUE_PATTERN = /^\.(?:lock-candidate|stale-lock)-([1-9]\d{0,9}-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
+const readOwnerIdentity = async (path, unpublishedCandidate = false) => {
+    try {
+        const metadata = await lstat(path);
+        if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 4096) return undefined;
+        const contents = await readFile(path, 'utf8');
+        if (contents === '') return null;
+        let record;
+        try { record = JSON.parse(contents); }
+        catch (error) {
+            // A crash can interrupt an unpublished candidate's owner write. Only
+            // this readable syntax failure may fall back to creator PID evidence;
+            // published locks and quarantines must keep malformed ownership unknown.
+            return unpublishedCandidate && error instanceof SyntaxError ? null : undefined;
+        }
+        return record?.version === 1 && Object.keys(record).length === 2 && Object.hasOwn(record, 'process')
+            ? record.process ?? undefined : undefined;
+    } catch { return undefined; }
+};
+const createOwnerObserver = async () => {
+    // Probe self before starting the lock wait budget. Foreign probes are bounded
+    // and memoized by immutable marker name plus birth, never by PID alone.
+    const selfIdentity = await getOwnProcessIdentity();
+    const scope = selfIdentity ?? await readCurrentProcessScope();
+    const deadline = performance.now() + LOCK_RETRY_LIMIT * LOCK_RETRY_DELAY_MS;
+    const probes = new Map();
+    return { selfIdentity, scope, deadline, lookup: (pid, ownerKey) => {
+        if (!probes.has(ownerKey)) {
+            const remaining = deadline - performance.now();
+            probes.set(ownerKey, remaining < 1 ? Promise.resolve(null) : readProcessIdentity(pid, remaining));
+        }
+        return probes.get(ownerKey);
+    } };
+};
+const classifyHandoffOwner = (pid, recorded, ownerId, observer) => classifyProcessOwner(pid, recorded, {
+    scope: observer.scope, selfIdentity: observer.selfIdentity,
+    lookup: currentPid => observer.lookup(currentPid, `${ownerId}:${JSON.stringify(recorded)}`),
+});
+const hasProtectedOwner = async (directory, owners, observer) => {
+    for (const entry of owners) {
+        const match = entry.isFile() && HANDOFF_OWNER_PATTERN.exec(entry.name);
+        if (!match || await classifyHandoffOwner(Number(match[1]), await readOwnerIdentity(join(directory, entry.name)), entry.name, observer) !== 'dead') return true;
+    }
+    return false;
+};
+const reclaimLockResidue = async (path, creatorId, observer) => {
+    try {
+        const entries = await readdir(path, { withFileTypes: true });
+        const creator = entries.find(entry => entry.name === creatorId);
+        // Quarantine contents may name the displaced owner rather than the
+        // quarantine creator. Never attribute that other process's birth to it.
+        if (entries.length > 0 && (entries.length !== 1 || !creator?.isFile())) return;
+        const unpublishedCandidate = basename(path) === '.lock-candidate-' + creatorId;
+        const recorded = creator ? await readOwnerIdentity(join(path, creatorId), unpublishedCandidate) : null;
+        if (await classifyHandoffOwner(Number(creatorId.split('-')[0]), recorded, creatorId, observer) !== 'dead') return;
+        await rm(path, { recursive: true, force: true });
+    } catch { /* Residue cleanup cannot revoke an otherwise valid handoff. */ }
+};
 
 const validateSessionId = (sessionId) => {
     if (
@@ -139,24 +211,27 @@ const releaseStoreLock = async ({ lockPath, ownerPath }) => {
 
 const acquireStoreLock = async (dataDirectory, fileNow) => {
     const lockPath = join(dataDirectory, STORE_LOCK_NAME);
+    const observer = await createOwnerObserver();
     for (let attempt = 0; attempt < LOCK_RETRY_LIMIT; attempt += 1) {
         const ownerId = `${process.pid}-${randomUUID()}`;
         const candidatePath = join(dataDirectory, `.lock-candidate-${ownerId}`);
         const candidateOwnerPath = join(candidatePath, ownerId);
         await mkdir(candidatePath, { mode: 0o700 });
         try {
-            await writeFile(candidateOwnerPath, '', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+            await writeFile(candidateOwnerPath, observer.selfIdentity ? JSON.stringify({ version: 1, process: observer.selfIdentity }) : '', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
             await rename(candidatePath, lockPath);
-            return () => releaseStoreLock({ lockPath, ownerPath: join(lockPath, ownerId) });
+            return { observer, release: () => releaseStoreLock({ lockPath, ownerPath: join(lockPath, ownerId) }) };
         } catch (error) {
             await rm(candidatePath, { recursive: true, force: true });
-            if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes(error?.code)) throw error;
+            if (!['EEXIST', 'ENOTEMPTY', 'EPERM', 'EBUSY'].includes(error?.code)) throw error;
         }
 
         try {
             const lockStat = await stat(lockPath);
-            if (fileNow() - lockStat.mtimeMs > STORE_LOCK_STALE_MS) {
-                const stalePath = join(dataDirectory, `.stale-lock-${process.pid}-${randomUUID()}`);
+            const owners = await readdir(lockPath, { withFileTypes: true });
+            // Positively dead published ownership needs no stale grace. An unknown marker
+            // or a PID probe denied by the OS never authorizes taking another section.
+            if (!await hasProtectedOwner(lockPath, owners, observer) && (owners.length > 0 || fileNow() - lockStat.mtimeMs > STORE_LOCK_STALE_MS)) {
                 try {
                     const currentStat = await stat(lockPath);
                     if (
@@ -166,15 +241,17 @@ const acquireStoreLock = async (dataDirectory, fileNow) => {
                     ) {
                         continue;
                     }
-                    await rename(lockPath, stalePath);
-                    await rm(stalePath, { recursive: true, force: true });
+                    // A successor's unique marker survives even if it was installed
+                    // immediately after the stat above; rmdir then refuses removal.
+                    for (const owner of owners) await rm(join(lockPath, owner.name), { force: true });
+                    await rmdir(lockPath);
                 } catch (error) {
-                    if (error?.code !== 'ENOENT') throw error;
+                    if (!['ENOENT', 'EPERM', 'EBUSY', 'ENOTEMPTY', 'EEXIST'].includes(error?.code)) throw error;
                 }
                 continue;
             }
         } catch (error) {
-            if (error?.code !== 'ENOENT') throw error;
+            if (!['ENOENT', 'EPERM', 'EBUSY'].includes(error?.code)) throw error;
         }
         await wait(LOCK_RETRY_DELAY_MS);
     }
@@ -182,10 +259,10 @@ const acquireStoreLock = async (dataDirectory, fileNow) => {
 };
 
 const withStoreLock = async (dataDirectory, fileNow, operation) => {
-    const release = await acquireStoreLock(dataDirectory, fileNow);
+    const { release, observer } = await acquireStoreLock(dataDirectory, fileNow);
     let operationFailed = false;
     try {
-        return await operation();
+        return await operation(observer);
     } catch (error) {
         operationFailed = true;
         throw error;
@@ -315,7 +392,7 @@ export const normalizeExpiresAt = (value, nowMs) => {
     if (
         !Number.isSafeInteger(expiresAt) ||
         expiresAt < 1 ||
-        expiresAt > Math.floor(Number.MAX_SAFE_INTEGER / 1000) ||
+        expiresAt > MAX_EXPIRES_AT_SECONDS ||
         !Number.isSafeInteger(nowMs) ||
         nowMs < 0 ||
         expiresAt * 1000 <= nowMs
@@ -340,7 +417,7 @@ const validateUploadGrant = (grant, { nowMs, expectedSize, allowExpired = false 
         !isRecord(grant.requiredHeaders) ||
         !Number.isSafeInteger(grant.expiresAt) ||
         grant.expiresAt < 1 ||
-        grant.expiresAt > Math.floor(Number.MAX_SAFE_INTEGER / 1000) ||
+        grant.expiresAt > MAX_EXPIRES_AT_SECONDS ||
         !allowExpired && grant.expiresAt * 1000 <= nowMs ||
         !Number.isSafeInteger(expectedSize) ||
         expectedSize < 1 ||
@@ -450,7 +527,7 @@ const parseGrantEntry = (entry, { nowMs, retentionMs, allowExpired = false }) =>
 const isFreshEntry = (entry, nowMs, retentionMs) =>
     entry.createdAtMs <= nowMs + CLOCK_SKEW_MS && nowMs - entry.createdAtMs <= retentionMs;
 
-const cleanupStore = async (dataDirectory, nowMs, retentionMs) => {
+const cleanupStore = async (dataDirectory, nowMs, retentionMs, observer) => {
     let entries;
     try {
         entries = await readdir(dataDirectory, { withFileTypes: true });
@@ -460,6 +537,11 @@ const cleanupStore = async (dataDirectory, nowMs, retentionMs) => {
     }
     let active = 0;
     for (const entry of entries) {
+        const residue = entry.isDirectory() && HANDOFF_LOCK_RESIDUE_PATTERN.exec(entry.name);
+        if (residue) {
+            await reclaimLockResidue(join(dataDirectory, entry.name), residue[1], observer);
+            continue;
+        }
         if (!entry.isFile()) continue;
         const match = STATE_FILE_PATTERN.exec(entry.name);
         const path = join(dataDirectory, entry.name);
@@ -474,20 +556,26 @@ const cleanupStore = async (dataDirectory, nowMs, retentionMs) => {
                     parseGrantEntry(state, { nowMs, retentionMs, allowExpired: true });
                     fresh = true;
                 }
-            } catch {
-                fresh = false;
+            } catch (error) {
+                // Unreadable records retain their physical capacity slot, never authority.
+                fresh = !(error instanceof FeedbackHandoffError);
             }
             if (fresh) active += 1;
             else await removeFile(path);
             continue;
         }
         if (/^\.(?:stage|claim|backup)-/.test(entry.name)) {
+            let removed = false;
             try {
                 const fileStat = await stat(path);
-                if (fileStat.mtimeMs <= Date.now() - retentionMs) await removeFile(path);
+                if (fileStat.mtimeMs <= Date.now() - retentionMs) {
+                    await removeFile(path);
+                    removed = true;
+                }
             } catch (error) {
-                if (error?.code !== 'ENOENT') throw error;
+                removed = safeFeedbackProperty(error, 'code') === 'ENOENT';
             }
+            if (!removed) active += 1;
         }
     }
     return active;
@@ -503,6 +591,7 @@ const writeAtomicReplacement = async (path, value) => {
     }
     await writeFile(stagePath, serialized, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
     let displaced = false;
+    let published = false;
     try {
         try {
             await rename(stagePath, path);
@@ -513,7 +602,10 @@ const writeAtomicReplacement = async (path, value) => {
             await rename(stagePath, path);
         }
         if (process.platform !== 'win32') await chmod(path, 0o600);
-        if (displaced) await removeFile(backupPath);
+        // Successful rename publishes the validated bytes. A fallible readback must not restore
+        // prepared authority beside an already committed grant or undo a completed replacement.
+        published = true;
+        if (displaced) await removeFile(backupPath).catch(() => undefined);
     } catch (error) {
         if (displaced) {
             try {
@@ -524,11 +616,12 @@ const writeAtomicReplacement = async (path, value) => {
         }
         throw error;
     } finally {
-        await removeFile(stagePath);
+        if (published) await removeFile(stagePath).catch(() => undefined);
+        else await removeFile(stagePath);
     }
 };
 
-const MAX_TOOL_RESULT_JSON_BYTES = 8 * 1024;
+const MAX_TOOL_RESULT_JSON_BYTES = MAX_MCP_MESSAGE_BYTES;
 const PREPARED_RESULT_KEYS = [
     'artifactId',
     'kind',
@@ -716,12 +809,18 @@ export const stagePreparedArtifact = async ({
         throw new FeedbackHandoffError('FEEDBACK_INVALID_STATE', 'The feedback handoff state is invalid.');
     }
     await ensurePrivateStoreDirectory(dataDirectory);
-    await withStoreLock(dataDirectory, fileNow, async () => {
+    await withStoreLock(dataDirectory, fileNow, async observer => {
         const preparedPath = preparedPathForSession(dataDirectory, sessionId);
         const grantPath = grantPathForSession(dataDirectory, sessionId);
-        const active = await cleanupStore(dataDirectory, nowMs, retentionMs);
-        const ownsEntry = await stat(preparedPath).then(() => true, () => false) || await stat(grantPath).then(() => true, () => false);
-        if (active >= maxEntries && !ownsEntry) {
+        const active = await cleanupStore(dataDirectory, nowMs, retentionMs, observer);
+        const ownsCapacitySlot = await Promise.all([preparedPath, grantPath].map(path =>
+            stat(path).then(() => true, error => {
+                if (safeFeedbackProperty(error, 'code') === 'ENOENT') return false;
+                throw error;
+            })
+        )).then(paths => paths.some(Boolean));
+        // Reserve publication headroom, including a possible unclaimable replacement backup.
+        if (active >= maxEntries && !ownsCapacitySlot) {
             throw new FeedbackHandoffError('FEEDBACK_CAPACITY', 'Too many feedback handoffs are waiting locally.');
         }
         await removeFile(grantPath);
@@ -757,8 +856,8 @@ export const stageUploadGrant = async ({
         throw new FeedbackHandoffError('FEEDBACK_INVALID_STATE', 'The feedback handoff state is invalid.');
     }
     await ensurePrivateStoreDirectory(dataDirectory);
-    await withStoreLock(dataDirectory, fileNow, async () => {
-        await cleanupStore(dataDirectory, nowMs, retentionMs);
+    await withStoreLock(dataDirectory, fileNow, async observer => {
+        await cleanupStore(dataDirectory, nowMs, retentionMs, observer);
         const preparedPath = preparedPathForSession(dataDirectory, sessionId);
         const grantPath = grantPathForSession(dataDirectory, sessionId);
         if (await stat(grantPath).then(() => true, () => false)) {
@@ -826,7 +925,7 @@ export const stageUploadGrant = async ({
             published = true;
         } finally {
             if (published) {
-                await removeFile(claimPath);
+                await removeFile(claimPath).catch(() => undefined);
             } else {
                 try {
                     await rename(claimPath, preparedPath);
@@ -859,7 +958,7 @@ const retireGrantAndRestorePrepared = async ({ dataDirectory, sessionId, grantPa
         restored = true;
     } finally {
         if (restored) {
-            await removeFile(retirementPath);
+            await removeFile(retirementPath).catch(() => undefined);
         } else {
             try {
                 await rename(retirementPath, grantPath);
@@ -903,8 +1002,8 @@ export const claimUploadGrant = async ({
         throw new FeedbackHandoffError('FEEDBACK_INVALID_STATE', 'The feedback handoff state is invalid.');
     }
     await ensurePrivateStoreDirectory(dataDirectory);
-    return withStoreLock(dataDirectory, fileNow, async () => {
-        await cleanupStore(dataDirectory, nowMs, retentionMs);
+    return withStoreLock(dataDirectory, fileNow, async observer => {
+        await cleanupStore(dataDirectory, nowMs, retentionMs, observer);
         const grantPath = grantPathForSession(dataDirectory, sessionId);
         let entry;
         try {
@@ -914,10 +1013,12 @@ export const claimUploadGrant = async ({
                 allowExpired: true,
             });
         } catch (error) {
-            if (error?.code !== 'ENOENT') await removeFile(grantPath);
+            if (!(error instanceof FeedbackHandoffError) && safeFeedbackProperty(error, 'code') !== 'ENOENT') throw error;
+            if (error instanceof FeedbackHandoffError) await removeFile(grantPath);
             throw new FeedbackHandoffError(
                 'FEEDBACK_GRANT_MISSING',
-                'No valid feedback upload grant is waiting for this session.'
+                'No valid feedback upload grant is waiting for this session.',
+                error,
             );
         }
         if (entry.targetTool !== targetTool) {
@@ -962,7 +1063,7 @@ export const claimUploadGrant = async ({
             }
             throw error;
         }
-        await removeFile(claimPath);
+        await removeFile(claimPath).catch(() => undefined);
         return publication === undefined ? transport : { ...transport, publication };
     });
 };
@@ -1007,22 +1108,28 @@ const deniedPreToolUseOutput = (error) => {
     const recovery = error.code === 'FEEDBACK_GRANT_REFRESH_REQUIRED'
         ? 'Call report_issue again for the same prepared artifact.'
         : error.code === 'FEEDBACK_GRANT_MISSING'
-            ? 'The trusted e-Comet feedback handoff is unavailable. A disabled, untrusted, or modified hook is one possible cause. Check the client hook settings, then start a new feedback flow. Do not retry automatically.'
+            ? 'This submit call was blocked before upload; the hook ran. No upload was attempted by this call. This does not establish the outcome of an earlier submit. Do not retry automatically with unchanged state. Check the observed call sequence: if report_issue has not been called for this prepared artifact and no earlier upload has an uncertain outcome, find remote e-Comet report_issue and call it once with the prepared kind and size_bytes, then submit the same artifactId, preserving the existing consent and history choice. If report_issue is unavailable, stop and report that the remote authorization tool is unavailable; check the remote e-Comet connector status and ask to connect only when it is observed disconnected. If report_issue was already called, inspect its result and handoff evidence instead of repeating it or guessing a cause.'
             : 'Do not retry automatically. Ask the user before starting a new feedback flow.';
     return JSON.stringify({
         hookSpecificOutput: {
             hookEventName: 'PreToolUse',
             permissionDecision: 'deny',
             permissionDecisionReason:
-                `${error.code}: e-Comet could not safely complete the trusted feedback handoff. ` +
-                recovery,
+                `${error.code}: ${error.message} ${JSON.stringify(error.details)} ` + recovery,
         },
     });
 };
 
-const safeHookError = (error) => {
-    if (error instanceof FeedbackHandoffError) return error;
-    return new FeedbackHandoffError('FEEDBACK_STORAGE_ERROR', 'The local feedback handoff failed.');
+const safeHookError = (error, operation) => {
+    const details = feedbackDiagnostics(error, operation);
+    const owned = ownedErrors.get(error);
+    if (owned) return { ...owned, details };
+    const filesystemBlocked = FEEDBACK_DIAGNOSTIC_FILESYSTEM_CODES.includes(details.systemCode);
+    if (filesystemBlocked) return { code: 'FEEDBACK_STORAGE_ERROR', message: 'A local feedback filesystem operation could not complete.', details };
+    if (safeFeedbackProperty(error, 'code') === 'FEEDBACK_CLAIM_INVALID') {
+        return { code: 'FEEDBACK_CLAIM_INVALID', message: 'The trusted feedback handoff claim could not be verified.', details };
+    }
+    return { code: 'FEEDBACK_INTERNAL_ERROR', message: 'The local feedback handoff failed internally.', details: { ...details, reason: 'internal_error' } };
 };
 
 const prepareInputWithTrustedTranscript = (event) => {
@@ -1044,6 +1151,9 @@ const prepareInputWithTrustedTranscript = (event) => {
             'Trusted feedback fields must not be supplied in model-authored input.'
         );
     }
+    if (!validateSchemaValue(toolInput, toolInputSchemas.prepare_e_comet_feedback)) {
+        throw new FeedbackHandoffError('FEEDBACK_INVALID_INPUT', 'The feedback preparation arguments are invalid.');
+    }
     if (!toolInput.includeTranscript) return { ...toolInput };
     const transcriptPath = transcriptPathFromEvent(event);
     if (transcriptPath === undefined) {
@@ -1053,6 +1163,51 @@ const prepareInputWithTrustedTranscript = (event) => {
         );
     }
     return { ...toolInput, transcriptPath };
+};
+
+// Hooks receive arguments, not the host's JSON-RPC id/_meta. Leave bounded headroom
+// for supported host envelopes, in addition to measuring the injected fields themselves.
+const FEEDBACK_ENVELOPE_RESERVE_BYTES = 4096;
+const REPORT_SHORTENING_MARKER = '\n[... middle omitted to fit the feedback request size limit ...]\n';
+const shortenReportMiddle = (text, retained) => {
+    if (retained >= text.length) return text;
+    let head = Math.ceil(retained / 2);
+    let tail = text.length - Math.floor(retained / 2);
+    // Keep surrogate pairs intact without materializing a code-point array of a huge report.
+    if (head > 0 && /[\uD800-\uDBFF]/u.test(text[head - 1]) && /[\uDC00-\uDFFF]/u.test(text[head] ?? '')) head -= 1;
+    if (tail > 0 && /[\uD800-\uDBFF]/u.test(text[tail - 1]) && /[\uDC00-\uDFFF]/u.test(text[tail] ?? '')) tail += 1;
+    return text.slice(0, head) + REPORT_SHORTENING_MARKER + text.slice(tail);
+};
+const fitPrepareWireInput = (input) => {
+    const fits = (value) => byteLength(JSON.stringify({
+        ...value, feedbackClaim: 'a'.repeat(43), feedbackSession: 'a'.repeat(64),
+    })) <= MAX_MCP_MESSAGE_BYTES - FEEDBACK_ENVELOPE_RESERVE_BYTES;
+    if (fits(input)) return input;
+    // Cutting a header/key away from its credential value defeats contextual redaction.
+    // Redact whole source fields before any cut, then bind only the final safe text.
+    let fitted = { ...input, summary: redactFeedbackText(input.summary), details: redactFeedbackText(input.details) };
+    // Details are the ordinary oversized field. Summary is only a last resort when
+    // it alone exhausts the budget; normal inputs and the trusted transcript path stay unchanged.
+    for (const field of ['details', 'summary']) {
+        if (fits(fitted)) return fitted;
+        const original = fitted[field];
+        const minimumRetained = Math.min(original.length, 128);
+        const shortened = shortenReportMiddle(original, minimumRetained);
+        // An omission marker must not enlarge an ordinary field just because another field is huge.
+        if (byteLength(JSON.stringify(shortened)) >= byteLength(JSON.stringify(original))) continue;
+        const minimum = { ...fitted, [field]: shortened };
+        if (!fits(minimum)) { fitted = minimum; continue; }
+        let low = minimumRetained;
+        let high = original.length - 1;
+        while (low < high) {
+            const retained = Math.ceil((low + high) / 2);
+            if (fits({ ...fitted, [field]: shortenReportMiddle(original, retained) })) low = retained;
+            else high = retained - 1;
+        }
+        return { ...fitted, [field]: shortenReportMiddle(original, low) };
+    }
+    if (!fits(fitted)) throw new FeedbackHandoffError('FEEDBACK_INVALID_INPUT', 'The feedback request envelope is too large.');
+    return fitted;
 };
 
 const issueLocalClaim = async ({ event, effectiveInput, targetTool, env, nowMs, expiresAt, issueFeedbackClaimImpl = issueFeedbackClaim }) => {
@@ -1070,8 +1225,8 @@ const issueLocalClaim = async ({ event, effectiveInput, targetTool, env, nowMs, 
             },
             { env, now: () => nowMs, ttlMs },
         );
-    } catch {
-        throw new FeedbackHandoffError('FEEDBACK_STORAGE_ERROR', 'The local feedback handoff failed.');
+    } catch (error) {
+        throw withFeedbackOperation(error, 'claim_issue');
     }
 };
 
@@ -1107,8 +1262,8 @@ export const processHookEvent = async (event, _options = {}) => {
             });
             return { exitCode: 0, stdout: '', stderr: '' };
         } catch (error) {
-            const safeError = safeHookError(error);
-            return { exitCode: 2, stdout: '', stderr: `${safeError.code}: ${safeError.message}` };
+            const safeError = safeHookError(error, 'handoff_authorize');
+            return { exitCode: 2, stdout: '', stderr: `${safeError.code}: ${safeError.message} ${JSON.stringify(safeError.details)}` };
         }
     }
     if (
@@ -1117,6 +1272,10 @@ export const processHookEvent = async (event, _options = {}) => {
         LOCAL_FEEDBACK_TOOL.test(toolName) &&
         toolName.endsWith('__prepare_e_comet_feedback')
     ) {
+        // A failed tool already supplies its diagnostic. Blocking PostToolUse would replace it.
+        if (isRecord(toolResponseFromEvent(event)) && toolResponseFromEvent(event).isError === true) {
+            return { exitCode: 0, stdout: '', stderr: '' };
+        }
         try {
             const { env = process.env, nowMs = Date.now(), fileNow = Date.now } = _options;
             const sessionId = sessionIdFromEvent(event);
@@ -1150,8 +1309,8 @@ export const processHookEvent = async (event, _options = {}) => {
             });
             return { exitCode: 0, stdout: '', stderr: '' };
         } catch (error) {
-            const safeError = safeHookError(error);
-            return { exitCode: 2, stdout: '', stderr: `${safeError.code}: ${safeError.message}` };
+            const safeError = safeHookError(error, 'handoff_prepare');
+            return { exitCode: 2, stdout: '', stderr: `${safeError.code}: ${safeError.message} ${JSON.stringify(safeError.details)}` };
         }
     }
     if (
@@ -1162,7 +1321,8 @@ export const processHookEvent = async (event, _options = {}) => {
     ) {
         try {
             const { env = process.env, nowMs = Date.now(), issueFeedbackClaimImpl = issueFeedbackClaim } = _options;
-            const effectiveInput = prepareInputWithTrustedTranscript(event);
+            // Bind the shortened report, never issue a claim for text that will be rewritten later.
+            const effectiveInput = fitPrepareWireInput(prepareInputWithTrustedTranscript(event));
             const claim = await issueLocalClaim({
                 event,
                 effectiveInput,
@@ -1181,7 +1341,7 @@ export const processHookEvent = async (event, _options = {}) => {
                 stderr: '',
             };
         } catch (error) {
-            const safeError = safeHookError(error);
+            const safeError = safeHookError(error, 'handoff_prepare');
             return { exitCode: 0, stdout: deniedPreToolUseOutput(safeError), stderr: '' };
         }
     }
@@ -1239,7 +1399,7 @@ export const processHookEvent = async (event, _options = {}) => {
                 stderr: '',
             };
         } catch (error) {
-            const safeError = safeHookError(error);
+            const safeError = safeHookError(error, 'handoff_submit');
             return { exitCode: 0, stdout: deniedPreToolUseOutput(safeError), stderr: '' };
         }
     }

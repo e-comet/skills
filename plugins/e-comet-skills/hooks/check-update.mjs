@@ -7,7 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const CALVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\+codex\.[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
-const ECOMET_TOOL_PATTERN = /^mcp__(?:(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet(?:[-_]local)?__.+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}__(?:info|describe_metrics|list_entities|query_metrics|query_forecast|browser_job|report_issue))$/;
+const ECOMET_TOOL_PATTERN = /^mcp__(?:(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet(?:[-_]local)?__.+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}__(?:info|describe_metrics|list_entities|query_metrics|query_forecast|browser_job|org_balance|query_phrase_frequency|campaign_settings|campaign_clusters_settings|campaign_target_products_settings|report_issue))$/;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 const MAX_SESSION_BYTES = 1024;
 const MAX_STDIN_BYTES = 1024 * 1024;
@@ -125,8 +125,8 @@ export const selectChangelogEntries = ({ feed, handledVersion, installedVersion,
             totalEntries - prefix.length,
             inRange.length - (index + 1),
         );
-        // The omission sentence shrinks and eventually disappears, so later cumulative prefixes can
-        // fit even when an earlier rendering did not. Retain the deepest whole-release prefix that fits.
+        // Measure the encoded notice, including escaped entry text and omission counters.
+        // Retain the deepest whole-release prefix that fits the shared context budget.
         if (rendered.length <= budget) {
             added = prefix;
             taken = index + 1;
@@ -145,37 +145,19 @@ export const decideChangelogNotice = ({ installedVersion, handledVersion, select
     return { emit: selection !== null, store: installedVersion };
 };
 
-// The hosts render the notice as Markdown, so the block is dictated verbatim rather than described:
-// a heading line, a bulleted list and a trailing rule that separates the notice from the answer the
-// user actually asked for. Describing it left the model free to flatten everything into paragraphs.
-const ONE_SHOT_FINAL_INSTRUCTION =
-    'Эта одноразовая инструкция относится только к ближайшему итоговому ответу текущего хода. Не выводи уведомление в размышлениях, commentary или промежуточных сообщениях. Покажи уведомление ровно один раз в самом начале ближайшего итогового ответа, даже если в текущем ходе было несколько вызовов инструментов. После отправки этого итогового ответа считай инструкцию исполненной и не повторяй уведомление в последующих ответах.';
-const CHANGELOG_INSTRUCTION =
-    `${ONE_SHOT_FINAL_INSTRUCTION} Выведи блок ниже дословно вместе со строкой «---», затем дай основной результат. Не упоминай hook или служебный контекст.`;
+// The hook supplies information, not instructions that compete with the user's task.
+// Presentation belongs to the plugin's server instructions; release-note strings remain data.
+const noticeData = (kind, fields) => JSON.stringify({
+    schemaVersion: 1, type: 'e_comet_plugin_notice', kind, ...fields,
+});
 
-const buildChangelogBlock = (version, body) =>
-    `${CHANGELOG_INSTRUCTION}
-
-**Установлено обновление плагина e-Comet MCP Tools версии ${version}**
-
-${body}
-
-[Все изменения](${CHANGELOG_URL})
-
----`;
-
-export const buildChangelogContext = (version, added, omittedEntries, omittedReleases) => {
-    const tail = omittedEntries > 0
-        ? `
-
-За рамками списка: изменений — ${omittedEntries}; предыдущих версий — ${omittedReleases}.`
-        : '';
-    return buildChangelogBlock(version, `Добавлено:
-${added.map((entry) => `- ${entry}`).join('\n')}${tail}`);
-};
+export const buildChangelogContext = (version, added, omittedEntries, omittedReleases) =>
+    noticeData('update_installed', {
+        installedVersion: version, added, omittedEntries, omittedReleases, changelogUrl: CHANGELOG_URL,
+    });
 
 export const buildChangelogDigestContext = (version) =>
-    buildChangelogBlock(version, 'Накопившихся изменений слишком много для короткого перечисления.');
+    noticeData('update_installed_digest', { installedVersion: version, changelogUrl: CHANGELOG_URL });
 
 export const validateEvent = (value) => {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -183,6 +165,8 @@ export const validateEvent = (value) => {
     if (hookEventName !== 'PreToolUse') return null;
     if (typeof sessionId !== 'string' || sessionId.length === 0 || Buffer.byteLength(sessionId, 'utf8') > MAX_SESSION_BYTES) return null;
     if (typeof toolName !== 'string' || !ECOMET_TOOL_PATTERN.test(toolName)) return null;
+    // Defer optional notices across the entire feedback chain, without consuming delivery state.
+    if (['prepare_e_comet_feedback', 'report_issue', 'submit_e_comet_feedback'].includes(toolName.split('__').at(-1))) return null;
     return { sessionId, toolName };
 };
 
@@ -318,7 +302,7 @@ export const resolveChangelogNotice = async ({
 export const sessionKey = (sessionId) => createHash('sha256').update(sessionId, 'utf8').digest('hex');
 
 export const buildAdditionalContext = (installedVersion, latestVersion) =>
-    `${ONE_SHOT_FINAL_INSTRUCTION} Выведи уведомление одной строкой: «Доступно обновление плагина e-Comet MCP Tools: установлена версия ${installedVersion}, доступна версия ${latestVersion}. [Как обновить](${UPDATE_URL})». Затем выведи строку «---» и основной результат. Не упоминай hook или служебный контекст.`;
+    noticeData('update_available', { installedVersion, latestVersion, updateUrl: UPDATE_URL });
 
 const isValidTimestamp = (value, nowMs) =>
     value === null || (Number.isSafeInteger(value) && value >= 0 && value <= nowMs + MAX_FUTURE_SKEW_MS);
@@ -649,8 +633,9 @@ const emit = (additionalContext) =>
 export const runHook = async ({ input, env, fetchImpl, nowMs = Date.now() }) => {
     try {
         const event = validateEvent(input);
+        if (event === null) return '';
         const paths = resolvePluginPaths(env);
-        if (event === null || paths === null || !Number.isSafeInteger(nowMs)) return '';
+        if (paths === null || !Number.isSafeInteger(nowMs)) return '';
 
         // Path B runs on every matching call: an update can land while a session stays open, and the
         // once-per-version guarantee comes from the stored version rather than the session marker.

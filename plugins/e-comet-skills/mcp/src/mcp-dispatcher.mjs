@@ -1,6 +1,8 @@
+import { deliverReportResult } from './report-delivery.mjs';
 import { randomUUID } from 'node:crypto';
 
 import {
+    ARTIFACT_STORAGE,
     BRIDGE_VERSION,
     DEFAULT_IMAGE_PHOTOS,
     DEFAULT_RETURNED_PRODUCTS,
@@ -11,14 +13,158 @@ import {
 } from './config.mjs';
 import { createArtifactWriter, releaseArtifactJob } from './artifact-store.mjs';
 import { prepareECometFeedback, submitECometFeedback } from './feedback-tools.mjs';
+import { FeedbackPreparationError, feedbackPreparationFailure, feedbackSubmissionFailure } from './feedback-errors.mjs';
+import { feedbackDiagnostics, safeFeedbackProperty, withFeedbackOperation } from './feedback-diagnostics.mjs';
+import { feedbackDiagnosticsSchema, validateSchemaValue } from './tool-schemas.mjs';
 import { executeAuthorizedBrowserJob, executeSellerReviewsJob, extractBrowserJobToken, validateAuthorizedJobLimits } from './browser-job.mjs';
 import { mcpError, mcpResult, resourceLinkResult, textResult } from './mcp-protocol.mjs';
 import { createJobWriter } from './result-store.mjs';
-import { executeOzonPromotionJob, getOzonPromotionArtifactResource } from './ozon-promotion-job.mjs';
+import { requireStorageTarget, StorageUnavailableError } from './storage-layout.mjs';
+import { EXTENSION_UPDATE_URL, OZON_ANALYTICS_CAPABILITY, OZON_PROMOTION_PACKAGE_CAPABILITY } from './extension-vocabulary.mjs';
+import {
+    executeOzonPromotionJob,
+    executeOzonPromotionPackageJob,
+    getOzonPromotionArtifactResource,
+} from './ozon-promotion-job.mjs';
+import { executeOzonAnalyticsJob, safeOzonAnalyticsToolError } from './ozon-analytics-job.mjs';
+import { getOzonReportPackageArtifactResources } from './ozon-report-package-job.mjs';
+import { rejectedOzonPackage } from './ozon-report-package-result.mjs';
+import { parsePromotionPeriods } from './ozon-report-package-domain.mjs';
+import { parseAnalyticsDateRange } from './ozon-analytics-domain.mjs';
 import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
 import { serverInstructions, tools, validateToolArguments } from './tool-catalog.mjs';
-import { ozonExtensionOutdatedError, safeOzonPromotionToolError, ToolExecutionError, toolFailure } from './tool-errors.mjs';
-import { createConcurrencyLimiter, discoverImageBasket, imageExists, normalizeStatus, runWithConcurrency } from './wb-domain.mjs';
+import {
+    ozonExtensionOutdatedError,
+    ozonRouteUnavailableError,
+    safeOzonPromotionToolError,
+    ToolExecutionError,
+    toolFailure,
+} from './tool-errors.mjs';
+import { createConcurrencyLimiter, discoverImageBasket, imageExists, runWithConcurrency } from './wb-domain.mjs';
+
+// Diagnose from a fresh locally-owned status only. Peer text and stale pre-wait snapshots
+// cannot establish a login failure or turn a local bind problem into a marketplace chore.
+const bridgeUnavailableError = (status) => {
+    const explanations = {
+        token_permission_denied: 'The local bridge cannot access its pairing file. Restore filesystem access for the agent process.',
+        token_unavailable: 'The local bridge pairing state is unavailable. Inspect local_bridge_status and report persistent failure to e-Comet.',
+        listen_failed: 'The local bridge could not bind its listener. Inspect local_bridge_status; opening a marketplace tab cannot repair the listener.',
+        authentication_failed: 'The local peer handshake failed authentication. Inspect local_bridge_status; this is not a marketplace login failure.',
+        protocol_mismatch: 'The local bridge processes use incompatible peer protocols. Restart the agent hosts to load the same plugin version.',
+        handshake_required: 'The local peer handshake did not complete. Inspect local_bridge_status and report persistent failure to e-Comet.',
+        connection_failed: 'The local bridge could not connect to its peer. Inspect local_bridge_status and report persistent failure to e-Comet.',
+    };
+    const reason = status?.peerRejection?.code ?? (status?.state === 'listen_failed' ? 'listen_failed' : undefined);
+    if (Object.hasOwn(explanations, reason)) return new ToolExecutionError(
+        `LOCAL_BRIDGE_${reason.toUpperCase()}`, `${explanations[reason]} Observed reason: ${reason}.`, 'local', false);
+    return new ToolExecutionError('EXTENSION_DISCONNECTED',
+        'The extension route did not become ready; the cause is not established. Inspect local_bridge_status before choosing a recovery action.',
+        'extension', true);
+};
+
+const OZON_AUTHORIZATION_ROUTE_CODES = new Set([
+    'EXTENSION_DISCONNECTED',
+    'BROWSER_JOB_AUTHORIZATION_TIMEOUT',
+    'EXTENSION_UPDATE_REQUIRED',
+]);
+
+const storageCreationEvidence = new WeakMap();
+const resultCreationFailure = (cause) => {
+    const messages = {
+        EBUSY: 'Local output storage is busy. Let any other pending work finish, then retry; report a persistent failure to e-Comet.',
+        EEXIST: 'A local output path conflicts with an existing entry. Check the configured output location.',
+        EACCES: 'The agent process cannot access local output storage. Restore access to the configured output location.',
+        EPERM: 'The operating system denied access to local output storage. Check access or a file sharing lock.',
+        ENOSPC: 'Local output storage has no free space. Free space before requesting the report again.',
+        EDQUOT: 'The local output storage quota is exhausted. Restore available quota before requesting the report again.',
+        EROFS: 'Local output storage is read-only. Use a writable output location.',
+        ENOTDIR: 'A local output path contains an entry that is not a directory. Check the configured output location.',
+    };
+    const code = safeFeedbackProperty(cause, 'code');
+    const known = typeof code === 'string' && Object.hasOwn(messages, code);
+    const error = new ToolExecutionError('LOCAL_STORAGE_FAILED', known ? messages[code] : 'The local result file could not be created.',
+        'storage', true, { cause });
+    if (known) storageCreationEvidence.set(error, { operation: 'create_result', systemCode: code });
+    return error;
+};
+
+// Package capability floor, also enforced by scripts/extension_gate.py for publication.
+// The released singular @1 tool intentionally retains its independent 1.5.6 floor.
+const OZON_PACKAGE_MIN_EXTENSION_VERSION = '1.5.7';
+// Only this dispatcher can attest a missing capability from bridge status.
+// Remote error fields and message text cannot select the public stop reason.
+const ozonPackageCapabilityErrors = new WeakSet();
+const ozonPackageCapabilityFailure = (family, status) => {
+    const supportField = family === 'analytics' ? 'ozonSellerAnalyticsReportSupported' : 'ozonSellerPromotionReportsSupported';
+    if (status?.extensionConnected !== true || status[supportField] !== false) return undefined;
+    const capability = family === 'analytics' ? OZON_ANALYTICS_CAPABILITY : OZON_PROMOTION_PACKAGE_CAPABILITY;
+    const error = new ToolExecutionError(
+        family === 'analytics' ? 'OZON_ANALYTICS_CAPABILITY_UNAVAILABLE' : 'OZON_ROUTE_NOT_READY',
+        `The connected extension does not announce ${capability} and cannot run this Ozon ${family} report package. ` +
+            `Update the e-Comet extension to ${OZON_PACKAGE_MIN_EXTENSION_VERSION} or newer at ${EXTENSION_UPDATE_URL}, then request a new report authorization and retry.`,
+        family === 'analytics' ? 'context' : 'route',
+        false
+    );
+    ozonPackageCapabilityErrors.add(error);
+    return error;
+};
+
+export const classifyOzonAuthorizationFailure = (error, status, packageFamily) => {
+    if (packageFamily !== undefined) {
+        const capabilityFailure = ozonPackageCapabilityFailure(packageFamily, status);
+        if (capabilityFailure) return capabilityFailure;
+    }
+    if (packageFamily === undefined && error instanceof ToolExecutionError && OZON_AUTHORIZATION_ROUTE_CODES.has(error.code)
+        && status?.extensionConnected === true && status.ozonSellerPromotionReportSupported === false) {
+        return ozonExtensionOutdatedError(status.extensionVersion);
+    }
+    if (error instanceof ToolExecutionError && error.code === 'EXTENSION_DISCONNECTED' && status?.extensionConnected !== true) {
+        const localFailure = bridgeUnavailableError(status);
+        // A locally observed pairing/listener failure precedes any Seller probe. Preserve
+        // its recovery within the existing Ozon authorization schema, not a Seller diagnosis.
+        if (localFailure.stage === 'local') return new ToolExecutionError(
+            'OZON_AUTHORIZATION_REJECTED', localFailure.message, 'authorization', false, { cause: error });
+    }
+    if (error instanceof ToolExecutionError && error.code === 'BROWSER_JOB_AUTHORIZATION_TIMEOUT') {
+        // No Seller probe has occurred. A missing authorization response cannot
+        // establish a tab/company prerequisite or authorize repeating a create.
+        return new ToolExecutionError('OZON_AUTHORIZATION_REJECTED',
+            'The Ozon report authorization response timed out. The cause is not established; no report operation was dispatched by this call. ' +
+            'Inspect local_bridge_status and include this authorization failure in a bug report if it persists.',
+            'authorization', false, { cause: error });
+    }
+    if (error instanceof ToolExecutionError && OZON_AUTHORIZATION_ROUTE_CODES.has(error.code)) {
+        if (packageFamily !== undefined) {
+            return new ToolExecutionError(
+                'OZON_ROUTE_NOT_READY',
+                (error.code === 'EXTENSION_DISCONNECTED' ? 'The e-Comet extension is not connected to the local bridge. '
+                    : 'The Ozon report authorization route did not complete; its cause is not established. ') +
+                    `Ensure e-Comet extension ${OZON_PACKAGE_MIN_EXTENSION_VERSION} or newer is enabled in the same browser profile, refresh an authenticated Ozon Seller page, then request a new report authorization and retry.`,
+                'route', false
+            );
+        }
+        if (status?.extensionConnected === true && status.ozonSellerPromotionReportSupported === false) {
+            return ozonExtensionOutdatedError(status.extensionVersion);
+        }
+        return ozonRouteUnavailableError(error.code === 'EXTENSION_DISCONNECTED' ? 'disconnected'
+            : error.code === 'BROWSER_JOB_AUTHORIZATION_TIMEOUT' ? 'timeout' : 'unavailable');
+    }
+    let message = packageFamily === undefined ? 'The Ozon promotion report authorization was rejected.'
+        : `The Ozon ${packageFamily} report package authorization was rejected.`;
+    if (error instanceof ToolExecutionError && error.code === 'BROWSER_JOB_REJECTED'
+        && error.message === 'Extension is not authenticated with e-Comet') {
+        message = 'The e-Comet extension is not signed in. Open the e-Comet extension and sign in to the same e-Comet account used for this request.';
+    } else if (error instanceof ToolExecutionError && error.code === 'BROWSER_JOB_ACCOUNT_MISMATCH') {
+        message = 'The e-Comet extension is signed in to a different e-Comet account. Open the e-Comet extension and sign in to the same e-Comet account used for this request.';
+    }
+    return new ToolExecutionError(
+        'OZON_AUTHORIZATION_REJECTED',
+        message,
+        'authorization',
+        false,
+        { cause: error }
+    );
+};
 
 export const createMcpMessageHandler = ({
     getBridgeStatus,
@@ -30,6 +176,8 @@ export const createMcpMessageHandler = ({
     // would otherwise each have to remember to nudge.
     ensureBridgeConnected = () => undefined,
     requestBrowserJobAuthorization,
+    artifactStorageTarget = ARTIFACT_STORAGE,
+    reportOutputDirectory = undefined,
     createSellerArtifactWriter = createArtifactWriter,
     releaseSellerArtifactJob = releaseArtifactJob,
     createOzonArtifactWriter = createArtifactWriter,
@@ -74,7 +222,7 @@ export const createMcpMessageHandler = ({
         }
         const productNmIds = args.productNmIds;
         if (!validateToolArguments(toolName, args)) {
-            sendResult(
+            await sendResult(
                 id,
                 textResult(
                     toolFailure(
@@ -91,7 +239,7 @@ export const createMcpMessageHandler = ({
             return;
         }
         if (typeof triggerUrl !== 'string' || !triggerUrl) {
-            sendResult(
+            await sendResult(
                 id,
                 textResult(
                     toolFailure(
@@ -117,12 +265,7 @@ export const createMcpMessageHandler = ({
         };
         try {
             if (!(await waitForExtensionReady())) {
-                throw new ToolExecutionError(
-                    'EXTENSION_DISCONNECTED',
-                    'Open an authenticated Wildberries tab, then retry the e-Comet request.',
-                    'extension',
-                    true
-                );
+                throw bridgeUnavailableError(getBridgeStatus());
             }
             const token = extractBrowserJobToken(triggerUrl);
             authorizationLease = await requestBrowserJobAuthorization(token);
@@ -156,13 +299,8 @@ export const createMcpMessageHandler = ({
             try {
                 writer = await createWriter(authorization.job.jobId);
             } catch (error) {
-                throw new ToolExecutionError(
-                    'LOCAL_STORAGE_FAILED',
-                    'The local result file could not be created.',
-                    'storage',
-                    true,
-                    { cause: error }
-                );
+                if (error instanceof StorageUnavailableError) throw error;
+                throw resultCreationFailure(error);
             }
             const result = await executeAuthorizedBrowserJob({
                 authorization,
@@ -173,12 +311,12 @@ export const createMcpMessageHandler = ({
             });
             releaseAuthorization('after job completion');
             const writeErrors = await writer.close();
-            sendResult(
+            await sendResult(
                 id,
                 textResult(
                     {
                         ...result,
-                        resultPath: writer.resultPath,
+                        ...(writer.published !== false ? { resultPath: writer.resultPath } : {}),
                         ...(writeErrors.length > 0 ? { storageWarnings: writeErrors.map((error) => error.message) } : {}),
                     },
                     !result.ok
@@ -190,14 +328,14 @@ export const createMcpMessageHandler = ({
             if (writer) {
                 const writeErrors = await writer.close().catch(() => []);
                 partialResult = {
-                    ...(writer.persistedBytes > 0 ? { resultPath: writer.resultPath } : {}),
+                    ...(writer.published !== false && writer.persistedBytes > 0 ? { resultPath: writer.resultPath } : {}),
                     ...(writeErrors.length > 0 ? { storageWarnings: writeErrors.map((writeError) => writeError.message) } : {}),
                 };
             }
             if (error instanceof ToolExecutionError && error.code === 'BROWSER_JOB_DESCRIPTOR_INVALID' && error.cause instanceof Error) {
                 log('rejected signed browser job descriptor:', error.cause.message);
             }
-            sendResult(
+            await sendResult(
                 id,
                 textResult(
                     {
@@ -207,39 +345,40 @@ export const createMcpMessageHandler = ({
                             stage: 'execution',
                             retryable: false,
                         }),
+                        // Public-only evidence: shared toolFailure is also a strict
+                        // peer-wire serializer and must not gain these extra keys.
+                        ...(storageCreationEvidence.has(error) ? { details: storageCreationEvidence.get(error) } : {}),
                         ...partialResult,
                     },
                     true
                 )
             );
+        } finally {
+            try { await writer?.release?.(); }
+            catch { log('result ownership cleanup failed after browser job response; result remains protected'); }
         }
     };
 
-    const feedbackPrepareFailure = (error) => ({
-        ok: false,
-        status: 'failed',
-        error:
-            error?.code === 'TRANSCRIPT_TOO_LARGE'
-                ? { code: 'TRANSCRIPT_TOO_LARGE', message: 'The requested feedback transcript is too large to fit in the feedback archive.', stage: 'transcript', retryable: false }
-            : error?.code === 'TRANSCRIPT_UNAVAILABLE'
-                ? { code: 'TRANSCRIPT_UNAVAILABLE', message: 'The requested feedback transcript is unavailable.', stage: 'transcript', retryable: true }
-                : error?.code === 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE'
-                    ? { code: 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE', message: 'The trusted e-Comet hook handoff is unavailable.', stage: 'handoff', retryable: false }
-                : { code: 'FEEDBACK_PREPARATION_FAILED', message: 'The feedback archive could not be prepared.', stage: 'prepare', retryable: false },
-    });
+    const feedbackPrepareFailure = (error) => {
+        const failure = feedbackPreparationFailure(error);
+        console.error('[McpDispatcher] Feedback preparation failed:', JSON.stringify(failure.error));
+        return failure;
+    };
 
     const handleFeedbackPrepare = async (id, args = {}) => {
         if (!validateToolArguments('prepare_e_comet_feedback', args)) {
-            sendResult(id, textResult(feedbackPrepareFailure(), true));
+            sendResult(id, textResult(feedbackPrepareFailure(new FeedbackPreparationError('FEEDBACK_INPUT_INVALID')), true));
             return;
         }
+        let operation = 'prepare';
         try {
             const prepared = await prepareFeedback(args, { getBridgeStatus });
+            operation = 'prepare_result';
             const reportResource = prepared?.reportResource;
             if (!reportResource || reportResource.name !== 'report.md') throw new Error('missing report resource');
             sendResult(id, resourceLinkResult(prepared, JSON.stringify(prepared), [reportResource]));
         } catch (error) {
-            sendResult(id, textResult(feedbackPrepareFailure(error), true));
+            sendResult(id, textResult(feedbackPrepareFailure(operation === 'prepare_result' ? withFeedbackOperation(error, operation) : error), true));
         }
     };
 
@@ -248,7 +387,7 @@ export const createMcpMessageHandler = ({
             sendResult(
                 id,
                 textResult(
-                    { ok: false, status: 'failed', artifactId: '00000000-0000-4000-8000-000000000000', error: { code: 'UPLOAD_GRANT_INVALID', message: 'The feedback upload grant is invalid or has expired.', stage: 'grant', retryable: false } },
+                    { ok: false, status: 'failed', error: { code: 'UPLOAD_GRANT_INVALID', message: 'The feedback upload grant is invalid or has expired.', stage: 'grant', retryable: false, details: feedbackDiagnostics(undefined, 'input_validation') } },
                     true
                 )
             );
@@ -256,9 +395,15 @@ export const createMcpMessageHandler = ({
         }
         try {
             const submitted = await submitFeedback(args);
+            if (!submitted.ok) {
+                const details = safeFeedbackProperty(safeFeedbackProperty(submitted, 'error'), 'details');
+                if (validateSchemaValue(details, feedbackDiagnosticsSchema)) console.error('[McpDispatcher] Feedback submission failed:', JSON.stringify(details));
+            }
             sendResult(id, textResult(submitted, !submitted.ok));
-        } catch {
-            sendResult(id, textResult({ ok: false, status: 'failed', artifactId: args.artifactId, error: { code: 'ARTIFACT_UNAVAILABLE', message: 'The prepared feedback archive is unavailable.', stage: 'artifact', retryable: false } }, true));
+        } catch (error) {
+            const failure = feedbackSubmissionFailure(error, args.artifactId);
+            console.error('[McpDispatcher] Feedback submission failed:', JSON.stringify(failure.error));
+            sendResult(id, textResult(failure, true));
         }
     };
 
@@ -269,7 +414,7 @@ export const createMcpMessageHandler = ({
         const size = args.size ?? 'big';
         const timeout = args.timeout ?? 5000;
         if (!validateToolArguments('wb_product_images', args)) {
-            sendResult(
+            await sendResult(
                 id,
                 textResult(
                     toolFailure(
@@ -288,74 +433,110 @@ export const createMcpMessageHandler = ({
 
         const jobId = randomUUID();
         let writer;
+        let writerClosePromise;
         const closeWriter = async () => {
             if (!writer) return [];
-            const currentWriter = writer;
-            writer = undefined;
-            return currentWriter.close();
+            writerClosePromise ??= writer.close();
+            return writerClosePromise;
         };
         try {
-            writer = await createWriter(jobId);
+            try { writer = await createWriter(jobId); }
+            catch (error) {
+                if (error instanceof StorageUnavailableError) throw error;
+                throw resultCreationFailure(error);
+            }
             const currentWriter = writer;
             const resultPath = writer.resultPath;
-            const limitedImageExists = createConcurrencyLimiter(IMAGE_CONCURRENCY, (url, requestTimeout) =>
-                probeImageExists(url, requestTimeout, shutdownSignal)
-            );
-            const products = await runWithConcurrency(nmIds, IMAGE_CONCURRENCY, async (nmId) => {
-                const discovered = await discoverImageBasket(nmId, maxBasket, size, timeout, limitedImageExists);
-                if (!discovered) {
-                    const result = { nmId, status: 'not_found', imageUrls: [] };
-                    await currentWriter.append(result);
-                    return result;
+            let rateLimitError;
+            const stopProbes = new AbortController();
+            const probeSignal = shutdownSignal ? AbortSignal.any([shutdownSignal, stopProbes.signal]) : stopProbes.signal;
+            const limitedImageExists = createConcurrencyLimiter(IMAGE_CONCURRENCY, async (url, requestTimeout, markStarted) => {
+                if (rateLimitError) throw rateLimitError;
+                markStarted();
+                try { return await probeImageExists(url, requestTimeout, probeSignal); }
+                catch (error) {
+                    if (error?.code === 'WB_IMAGE_RATE_LIMITED') {
+                        rateLimitError ??= error;
+                        stopProbes.abort();
+                    }
+                    throw rateLimitError ?? error;
                 }
-                const imageUrls = (
-                    await runWithConcurrency(
-                        Array.from({ length: maxPhotos }, (_, index) => index + 1),
-                        IMAGE_CONCURRENCY,
-                        async (photo) => {
-                            const url = `${discovered.baseUrl}/${size}/${photo}.webp`;
-                            return (await limitedImageExists(url, timeout)) ? url : null;
+            });
+            const imageError = (error) => ({
+                code: error?.code === 'WB_IMAGE_RATE_LIMITED' ? 'WB_IMAGE_RATE_LIMITED' : 'WB_IMAGE_PROBE_FAILED',
+                message: error?.code === 'WB_IMAGE_RATE_LIMITED'
+                    ? 'Wildberries limited image requests. Further probes were skipped; found URLs are preserved. Do not retry automatically.'
+                    : 'The image lookup could not establish whether all requested images exist.',
+                stage: 'images', retryable: false,
+            });
+            const products = await runWithConcurrency(nmIds, IMAGE_CONCURRENCY, async (nmId) => {
+                const imageUrls = [];
+                let discovered;
+                let failure;
+                let started = false;
+                const probe = (url, requestTimeout) => limitedImageExists(url, requestTimeout, () => { started = true; });
+                const skipped = Boolean(rateLimitError);
+                try {
+                    if (skipped) throw rateLimitError;
+                    discovered = await discoverImageBasket(nmId, maxBasket, size, timeout, probe);
+                    if (discovered) {
+                        // Discovery already proved photo 1 exists; retain it even if later probes stop.
+                        imageUrls.push(`${discovered.baseUrl}/${size}/1.webp`);
+                        const outcomes = await runWithConcurrency(
+                            Array.from({ length: maxPhotos - 1 }, (_, index) => index + 2), IMAGE_CONCURRENCY,
+                            async (photo) => {
+                                const url = `${discovered.baseUrl}/${size}/${photo}.webp`;
+                                try { return (await probe(url, timeout)) ? { url } : {}; }
+                                catch (error) { return { error }; }
+                            });
+                        for (const outcome of outcomes) {
+                            if (outcome.url) imageUrls.push(outcome.url);
+                            if (outcome.error) failure ??= outcome.error;
                         }
-                    )
-                ).filter(Boolean);
+                    }
+                } catch (error) { failure = error; }
                 const result = {
                     nmId,
-                    status: imageUrls.length > 0 ? 'ok' : 'not_found',
-                    basket: discovered.basket,
-                    baseUrl: discovered.baseUrl,
+                    status: failure ? (!started ? 'skipped' : imageUrls.length ? 'partial' : 'failed')
+                        : imageUrls.length ? 'ok' : 'not_found',
+                    ...(discovered ? { basket: discovered.basket, baseUrl: discovered.baseUrl } : {}),
                     imageUrls,
+                    ...(failure ? { error: imageError(failure) } : {}),
                 };
                 await currentWriter.append(result);
                 return result;
             });
             const writeErrors = await closeWriter();
-            const succeeded = products.filter((product) => product.status === 'ok').length;
+            const succeeded = products.filter((product) => product.imageUrls.length > 0).length;
+            const complete = products.every(product => product.status === 'ok');
+            const hasErrors = products.some(product => product.error);
             // A completed probe with only not_found rows is a normal negative result; only execution failures set MCP isError below.
-            sendResult(
+            await sendResult(
                 id,
                 textResult({
                     ok: succeeded > 0,
-                    status: normalizeStatus(succeeded, products.length),
+                    status: complete ? 'done' : succeeded > 0 ? 'partial' : 'failed',
+                    ...(rateLimitError ? { stopReason: 'rate_limited' } : {}),
                     jobId,
                     total: products.length,
                     succeeded,
                     failed: products.length - succeeded,
                     size,
                     products,
-                    resultPath,
+                    ...(writer.published !== false ? { resultPath } : {}),
                     ...(writeErrors.length > 0 ? { storageWarnings: writeErrors.map((error) => error.message) } : {}),
-                })
+                }, hasErrors)
             );
         } catch (error) {
             const partialWriter = writer;
             const writeErrors = await closeWriter().catch(() => []);
             const partialResult = partialWriter
                 ? {
-                      ...(partialWriter.persistedBytes > 0 ? { resultPath: partialWriter.resultPath } : {}),
+                      ...(partialWriter.published !== false && partialWriter.persistedBytes > 0 ? { resultPath: partialWriter.resultPath } : {}),
                       ...(writeErrors.length > 0 ? { storageWarnings: writeErrors.map((writeError) => writeError.message) } : {}),
                   }
                 : {};
-            sendResult(
+            await sendResult(
                 id,
                 textResult(
                     {
@@ -365,11 +546,15 @@ export const createMcpMessageHandler = ({
                             stage: 'images',
                             retryable: true,
                         }),
+                        ...(storageCreationEvidence.has(error) ? { details: storageCreationEvidence.get(error) } : {}),
                         ...partialResult,
                     },
                     true
                 )
             );
+        } finally {
+            try { await writer?.release?.(); }
+            catch { log('result ownership cleanup failed after image lookup response; result remains protected'); }
         }
     };
 
@@ -409,13 +594,9 @@ export const createMcpMessageHandler = ({
         let sellerArtifacts = [];
         const artifactJobId = randomUUID();
         try {
+            requireStorageTarget(artifactStorageTarget, 'marketplace-artifacts');
             if (!(await waitForExtensionReady())) {
-                throw new ToolExecutionError(
-                    'EXTENSION_DISCONNECTED',
-                    'Open an authenticated Wildberries tab, then retry the e-Comet request.',
-                    'extension',
-                    true
-                );
+                throw bridgeUnavailableError(getBridgeStatus());
             }
             authorizationLease = await requestBrowserJobAuthorization(extractBrowserJobToken(triggerUrl));
             const authorization = authorizationLease?.authorization;
@@ -485,10 +666,13 @@ export const createMcpMessageHandler = ({
             }
         }
         try {
-            sendResult(id, terminalResult);
+            sendResult(id, await deliverReportResult(terminalResult, sellerArtifacts, reportOutputDirectory));
         } finally {
             try {
-                await releaseSellerArtifactJob(artifactJobId);
+                // Cancellation may publish a partial response while another writer
+                // still owns cleanup. Register this response owner's release now;
+                // the store completes it when the final writer/cleanup leaves.
+                await releaseSellerArtifactJob(artifactJobId, { deferWhileActive: true });
             } catch (error) {
                 log('failed to release seller artifact pins after terminal response:', error?.message);
             }
@@ -497,13 +681,15 @@ export const createMcpMessageHandler = ({
 
     // Диагноз строится только по статусу, который явно сообщил про возможность. Статус без этого
     // поля (нет расширения, старый соседний процесс, тестовая заглушка) оставляет прежнее поведение.
-    const ozonExtensionOutdated = () => {
-        let status;
+    const currentOzonStatus = () => {
         try {
-            status = getBridgeStatus();
+            return getBridgeStatus();
         } catch {
             return undefined;
         }
+    };
+
+    const ozonExtensionOutdated = (status) => {
         if (status?.extensionConnected !== true || status.ozonSellerPromotionReportSupported !== false) return undefined;
         return ozonExtensionOutdatedError(status.extensionVersion);
     };
@@ -515,11 +701,13 @@ export const createMcpMessageHandler = ({
         const artifactJobId = randomUUID();
         let authorizationLease;
         let terminalResult;
+        let reportArtifacts = [];
         let periodValidated = false;
         const failureResult = (error) => {
             let normalized;
             try {
                 if (error instanceof ToolExecutionError) normalized = safeOzonPromotionToolError(error);
+                else if (error instanceof StorageUnavailableError) normalized = error;
             } catch {
                 normalized = undefined;
             }
@@ -529,7 +717,9 @@ export const createMcpMessageHandler = ({
                       message: normalized.message,
                       stage: normalized.stage,
                       retryable: false,
-                      ...(normalized.details === undefined ? {} : { details: normalized.details }),
+                      ...(normalized instanceof ToolExecutionError && normalized.details !== undefined
+                          ? { details: normalized.details }
+                          : {}),
                   }
                 : { code: 'ARTIFACT_REJECTED', message: 'The Ozon promotion report could not be completed safely.', stage: 'artifact', retryable: false };
             return {
@@ -560,23 +750,25 @@ export const createMcpMessageHandler = ({
                     false
                 );
             }
+            requireStorageTarget(artifactStorageTarget, 'marketplace-artifacts');
             // Проверка до авторизации, а не только на маршрутизации. Расширение без объявленной
             // возможности отвергает подписанное задание Ozon как неизвестный тип ещё в ответе на
             // browser_job_authorize, поэтому до маршрута дело не доходит и пользователь получил бы
             // отказ авторизации вместо диагноза. Заодно не тратится одноразовая подписанная
             // авторизация на заведомо неисполнимую операцию.
-            const outdatedExtension = ozonExtensionOutdated();
+            const outdatedExtension = ozonExtensionOutdated(currentOzonStatus());
             if (outdatedExtension) throw outdatedExtension;
+            if (!(await waitForExtensionReady())) {
+                throw classifyOzonAuthorizationFailure(
+                    new ToolExecutionError('EXTENSION_DISCONNECTED', 'disconnected', 'extension'), currentOzonStatus());
+            }
+            // WHY: readiness can attach an older extension after the first snapshot; do not spend its signed authorization.
+            const readyExtensionOutdated = ozonExtensionOutdated(currentOzonStatus());
+            if (readyExtensionOutdated) throw readyExtensionOutdated;
             try {
                 authorizationLease = await requestBrowserJobAuthorization(extractBrowserJobToken(args.triggerUrl));
             } catch (error) {
-                throw new ToolExecutionError(
-                    'OZON_AUTHORIZATION_REJECTED',
-                    'The Ozon promotion report authorization was rejected.',
-                    'authorization',
-                    false,
-                    { cause: error }
-                );
+                throw classifyOzonAuthorizationFailure(error, currentOzonStatus());
             }
             if (
                 !authorizationLease ||
@@ -599,6 +791,7 @@ export const createMcpMessageHandler = ({
                 artifactJobId,
                 now,
             });
+            reportArtifacts = [getOzonPromotionArtifactResource(result)];
             terminalResult = renderOzonResult(
                 result,
                 `Ozon Seller promotion report complete: one XLSX workbook for ${dateFrom} through ${dateTo}.`,
@@ -612,12 +805,145 @@ export const createMcpMessageHandler = ({
             releaseAuthorizationInBackground(currentLease, 'after Ozon promotion report completion');
         }
         try {
-            sendResult(id, terminalResult);
+            sendResult(id, await deliverReportResult(terminalResult, reportArtifacts, reportOutputDirectory));
         } finally {
             try {
                 await releaseOzonArtifactJob(artifactJobId, { deferWhileActive: true });
             } catch (error) {
                 log('failed to release Ozon promotion artifact pins after terminal response:', error?.message);
+            }
+        }
+    };
+
+    // Keep package admission/result shaping distinct from the released singular contract:
+    // valid pre-execution failures preserve item order/cardinality and a package stopReason,
+    // while singular errors retain their legacy details schema and extension version floor.
+    // Both handlers start background lease release before publication and release pins after
+    // the terminal response; neither waits for the extension to acknowledge lease cleanup.
+    const handleOzonReportPackage = async (id, toolName, family, args = {}) => {
+        const itemProperty = family === 'promotion' ? 'periods' : 'reports';
+        const items = args?.[itemProperty];
+        const artifactJobId = randomUUID();
+        let authorizationLease;
+        let terminalResult;
+        let reportArtifacts = [];
+        let argumentsValid = false;
+        const safeFailure = (error) => {
+            if (error instanceof StorageUnavailableError) {
+                return { code: error.code, message: error.message, stage: error.stage, retryable: false };
+            }
+            try {
+                const safe =
+                    family === 'analytics' ? safeOzonAnalyticsToolError(error) : safeOzonPromotionToolError(error);
+                return { code: safe.code, message: safe.message, stage: safe.stage, retryable: false };
+            } catch {
+                return {
+                    code: 'ARTIFACT_REJECTED',
+                    message: `The Ozon ${family} report package could not be completed safely.`,
+                    stage: 'artifact',
+                    retryable: false,
+                };
+            }
+        };
+        const failedPackage = (error) => {
+            if (!argumentsValid) {
+                return { ok: false, status: 'failed', jobType: toolName, error: safeFailure(error), stopReason: null };
+            }
+            const safeItem = (item) => ({
+                ...(typeof item?.dateFrom === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item.dateFrom)
+                    ? { dateFrom: item.dateFrom }
+                    : {}),
+                ...(typeof item?.dateTo === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item.dateTo)
+                    ? { dateTo: item.dateTo }
+                    : {}),
+                ...(family === 'analytics' && (item?.breakdown === 'period' || item?.breakdown === 'daily')
+                    ? { breakdown: item.breakdown }
+                    : {}),
+            });
+            const result = rejectedOzonPackage(toolName, itemProperty, items.map(safeItem), safeFailure(error));
+            if (ozonPackageCapabilityErrors.has(error)) result.stopReason = 'capability_unavailable';
+            return result;
+        };
+        const capabilityFailure = () => {
+            return ozonPackageCapabilityFailure(family, currentOzonStatus());
+        };
+        try {
+            if (!validateToolArguments(toolName, args)) {
+                throw new ToolExecutionError('PREFLIGHT_FAILED', `The Ozon ${family} report package is invalid.`, 'preflight', false);
+            }
+            try {
+                if (family === 'promotion') parsePromotionPeriods(items);
+                else items.forEach(({ dateFrom, dateTo }) => parseAnalyticsDateRange(dateFrom, dateTo));
+            } catch {
+                throw new ToolExecutionError('PREFLIGHT_FAILED', `The Ozon ${family} report package is invalid.`, 'preflight', false);
+            }
+            argumentsValid = true;
+            if (typeof args.triggerUrl !== 'string' || !args.triggerUrl) {
+                throw new ToolExecutionError(
+                    'OZON_AUTHORIZATION_REJECTED',
+                    'The trusted browser-job hook did not provide Ozon authorization.',
+                    'authorization',
+                    false
+                );
+            }
+            const unavailableBeforeWait = capabilityFailure();
+            requireStorageTarget(artifactStorageTarget, 'marketplace-artifacts');
+            if (unavailableBeforeWait) throw unavailableBeforeWait;
+            if (!(await waitForExtensionReady())) {
+                throw classifyOzonAuthorizationFailure(new ToolExecutionError('EXTENSION_DISCONNECTED', 'disconnected', 'extension'), currentOzonStatus(), family);
+            }
+            const unavailableAfterWait = capabilityFailure();
+            if (unavailableAfterWait) throw unavailableAfterWait;
+            try {
+                authorizationLease = await requestBrowserJobAuthorization(extractBrowserJobToken(args.triggerUrl));
+            } catch (error) {
+                throw classifyOzonAuthorizationFailure(error, currentOzonStatus(), family);
+            }
+            if (
+                !authorizationLease ||
+                typeof authorizationLease.requestOzonReportPackage !== 'function' ||
+                typeof authorizationLease.release !== 'function'
+            ) {
+                throw new ToolExecutionError(
+                    'OZON_AUTHORIZATION_REJECTED',
+                    `The extension returned an invalid Ozon ${family} report package authorization.`,
+                    'authorization',
+                    false
+                );
+            }
+            const sharedExecution = {
+                authorization: authorizationLease.authorization,
+                requestOzonReportPackage: authorizationLease.requestOzonReportPackage,
+                createArtifactWriter: createOzonArtifactWriter,
+                artifactJobId,
+                now,
+            };
+            const result =
+                family === 'promotion'
+                    ? await executeOzonPromotionPackageJob({ ...sharedExecution, periods: items })
+                    : await executeOzonAnalyticsJob({ ...sharedExecution, reports: items });
+            const resources = getOzonReportPackageArtifactResources(result);
+            reportArtifacts = resources;
+            terminalResult = renderOzonResult(
+                result,
+                `Ozon Seller ${family} report package ${result.status}: ${resources.length} of ${items.length} XLSX workbook(s) available.`,
+                resources,
+                !result.ok
+            );
+        } catch (error) {
+            terminalResult = textResult(failedPackage(error), true);
+        } finally {
+            const currentLease = authorizationLease;
+            authorizationLease = undefined;
+            releaseAuthorizationInBackground(currentLease, `after Ozon ${family} report package completion`);
+        }
+        try {
+            sendResult(id, await deliverReportResult(terminalResult, reportArtifacts, reportOutputDirectory));
+        } finally {
+            try {
+                await releaseOzonArtifactJob(artifactJobId, { deferWhileActive: true });
+            } catch (error) {
+                log(`failed to release Ozon ${family} package artifact pins after terminal response:`, error?.message);
             }
         }
     };
@@ -653,6 +979,14 @@ export const createMcpMessageHandler = ({
         ],
         ['wb_seller_reviews', { needsBridge: true, run: (id, args) => handleSellerReviewsExport(id, args) }],
         ['ozon_seller_promotion_report', { needsBridge: true, run: (id, args) => handleOzonPromotionReport(id, args) }],
+        [
+            'ozon_seller_promotion_reports',
+            { needsBridge: true, run: (id, args) => handleOzonReportPackage(id, 'ozon_seller_promotion_reports', 'promotion', args) },
+        ],
+        [
+            'ozon_seller_analytics_report',
+            { needsBridge: true, run: (id, args) => handleOzonReportPackage(id, 'ozon_seller_analytics_report', 'analytics', args) },
+        ],
         ['prepare_e_comet_feedback', { needsBridge: false, run: (id, args) => handleFeedbackPrepare(id, args) }],
         ['submit_e_comet_feedback', { needsBridge: false, run: (id, args) => handleFeedbackSubmit(id, args) }],
         ['wb_product_images', { needsBridge: false, run: (id, args) => handleProductImages(id, args) }],

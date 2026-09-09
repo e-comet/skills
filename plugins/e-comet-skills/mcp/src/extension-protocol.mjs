@@ -5,12 +5,19 @@ import {
     isSellerOperationStage,
     localMessage,
     MESSAGE_TYPES,
+    OZON_ANALYTICS_CAPABILITY,
+    OZON_ANALYTICS_SERVER_MESSAGE_TYPES,
+    OZON_ANALYTICS_TERMINAL_CODE_STAGES,
+    isOzonAnalyticsTerminalDetails,
+    isOzonExecutionInterruptionDetails,
     OZON_PROMOTION_CAPABILITY,
+    OZON_PROMOTION_PACKAGE_CAPABILITY,
     OZON_PROMOTION_SERVER_MESSAGE_TYPES,
     RETRYABLE_FETCH_ERROR_CODES,
     SELLER_OPERATION_STAGES,
     UNCLASSIFIED_FETCH_ERROR_CODE,
 } from './extension-vocabulary.mjs';
+import { parseAnalyticsDateRange } from './ozon-analytics-domain.mjs';
 import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
 import { ToolExecutionError, safeExternalToolError, safeOzonPromotionToolError } from './tool-errors.mjs';
 import { encodeFrame } from './websocket.mjs';
@@ -39,6 +46,12 @@ const isValidBase64Chunk = (value) => {
     const decoded = Buffer.from(value, 'base64');
     return decoded.toString('base64') === value && decoded.byteLength <= MAX_STREAM_CHUNK_BYTES;
 };
+export const isValidOzonReportPhase = (value) =>
+    isRecord(value) && hasOnlyKeys(value, ['family', 'frameId', 'itemIndex', 'phase']) &&
+    ['promotion', 'analytics'].includes(value.family) && isBoundedString(value.frameId, 128) &&
+    isNonNegativeSafeInteger(value.itemIndex) && value.itemIndex < 50 &&
+    ['pre_create', 'create_dispatched', 'create_settled', 'polling', 'downloading', 'streaming'].includes(value.phase);
+
 export const isValidSellerOperation = (value) => {
     if (!isRecord(value) || !hasOnlyKeys(value, ['exportIndex', 'isAnswered', 'stage', 'reportId'])) return false;
     if (
@@ -82,35 +95,78 @@ export const isValidOzonPromotionOperation = (value) => {
         return false;
     }
 };
-const isValidOzonStreamStart = (value) =>
+export const isValidOzonReportPackageRequest = (value) => {
+    if (
+        !isRecord(value) ||
+        !hasOnlyKeys(value, ['family', 'items', 'deadlineAt']) ||
+        !Number.isSafeInteger(value.deadlineAt) ||
+        value.deadlineAt <= 0 ||
+        !Array.isArray(value.items) ||
+        value.items.length < 1 ||
+        value.items.length > 50 ||
+        (value.family !== 'promotion' && value.family !== 'analytics')
+    ) {
+        return false;
+    }
+    return value.items.every((item) => {
+        if (!isRecord(item)) return false;
+        if (value.family === 'promotion') {
+            if (!hasOnlyKeys(item, ['dateFrom', 'dateTo']) || Object.keys(item).length !== 2) return false;
+            try {
+                parseOzonPromotionPeriod(item.dateFrom, item.dateTo);
+                return true;
+            } catch {
+                return false;
+            }
+        }
+        if (!hasOnlyKeys(item, ['dateFrom', 'dateTo', 'breakdown']) || Object.keys(item).length !== 3) return false;
+        if (item.breakdown !== 'period' && item.breakdown !== 'daily') return false;
+        try {
+            parseAnalyticsDateRange(item.dateFrom, item.dateTo);
+            return true;
+        } catch {
+            return false;
+        }
+    });
+};
+const isValidOzonStreamStart = (value, indexed = false) =>
     isRecord(value) &&
-    hasOnlyKeys(value, ['frameId', 'name', 'mimeType', 'declaredSize']) &&
+    hasOnlyKeys(value, ['frameId', 'itemIndex', 'name', 'mimeType', 'declaredSize']) &&
+    (!indexed || isNonNegativeSafeInteger(value.itemIndex)) &&
+    (indexed || value.itemIndex === undefined) &&
     isBoundedString(value.frameId, MAX_ID_LENGTH) &&
     isBoundedString(value.name, MAX_BROWSER_JOB_TEXT_LENGTH) &&
     value.mimeType === XLSX_MIME_TYPE &&
     (value.declaredSize === undefined ||
         (isNonNegativeSafeInteger(value.declaredSize) && value.declaredSize <= ARTIFACT_MAX_FILE_BYTES));
-const isValidOzonStreamChunk = (value) =>
+const isValidOzonStreamChunk = (value, indexed = false) =>
     isRecord(value) &&
-    hasOnlyKeys(value, ['frameId', 'index', 'data']) &&
+    hasOnlyKeys(value, ['frameId', 'itemIndex', 'index', 'data']) &&
+    (!indexed || isNonNegativeSafeInteger(value.itemIndex)) &&
+    (indexed || value.itemIndex === undefined) &&
     isBoundedString(value.frameId, MAX_ID_LENGTH) &&
     isNonNegativeSafeInteger(value.index) &&
     isValidBase64Chunk(value.data);
-const isValidOzonStreamEnd = (value) =>
+const isValidOzonStreamEnd = (value, indexed = false) =>
     isRecord(value) &&
-    hasOnlyKeys(value, ['frameId', 'size', 'sha256']) &&
+    hasOnlyKeys(value, ['frameId', 'itemIndex', 'size', 'sha256']) &&
+    (!indexed || isNonNegativeSafeInteger(value.itemIndex)) &&
+    (indexed || value.itemIndex === undefined) &&
     isBoundedString(value.frameId, MAX_ID_LENGTH) &&
     isNonNegativeSafeInteger(value.size) &&
     value.size <= ARTIFACT_MAX_FILE_BYTES &&
     typeof value.sha256 === 'string' &&
     SHA256_PATTERN.test(value.sha256);
-const isValidOzonResult = (value) => {
-    if (!isRecord(value) || !hasOnlyKeys(value, ['ok', 'error'])) return false;
+const isValidOzonResult = (value, allowSkipped = false) => {
+    // Promotion may carry date context; analytics below deliberately requires its own exact error keys.
+    if (!isRecord(value) || !hasOnlyKeys(value, ['ok', 'status', 'error'])) return false;
     if (value.ok === true) return Object.keys(value).length === 1;
-    if (value.ok !== false || !isRecord(value.error) || Object.keys(value).length !== 2) return false;
+    const skipped = allowSkipped && value.status === 'skipped' && Object.keys(value).length === 3;
+    if (value.ok !== false || (!skipped && Object.keys(value).length !== 2) || !isRecord(value.error)) return false;
     const error = value.error;
     if (
-        !hasOnlyKeys(error, ['code', 'stage', 'retryable', 'message', 'dateFrom', 'dateTo']) ||
+        !hasOnlyKeys(error, ['code', 'stage', 'retryable', 'message', 'dateFrom', 'dateTo', 'details']) ||
+        (Object.hasOwn(error, 'details') && (!allowSkipped || !isOzonExecutionInterruptionDetails(error.code, error.details))) ||
         typeof error.message !== 'string' ||
         error.message.length === 0 ||
         error.message.length > MAX_SAFE_MESSAGE_LENGTH
@@ -126,6 +182,26 @@ const isValidOzonResult = (value) => {
         return false;
     }
 };
+const isValidIndexedOzonResult = (value, family) => {
+    if (!isRecord(value) || !isNonNegativeSafeInteger(value.itemIndex)) return false;
+    const { itemIndex: _itemIndex, ...result } = value;
+    if (family === 'promotion') return isValidOzonResult(result, true);
+    if (!isRecord(result) || !hasOnlyKeys(result, ['ok', 'status', 'error'])) return false;
+    if (result.ok === true) return Object.keys(result).length === 1;
+    const skipped = result.status === 'skipped' && Object.keys(result).length === 3;
+    if (result.ok !== false || (!skipped && Object.keys(result).length !== 2) || !isRecord(result.error)) return false;
+    const error = result.error;
+    return (
+        hasOnlyKeys(error, ['code', 'stage', 'retryable', 'message', 'details']) &&
+        (!Object.hasOwn(error, 'details') || (!skipped && isOzonAnalyticsTerminalDetails(error.code, error.details)) ||
+            isOzonExecutionInterruptionDetails(error.code, error.details)) &&
+        OZON_ANALYTICS_TERMINAL_CODE_STAGES[error.code] === error.stage &&
+        error.retryable === false &&
+        typeof error.message === 'string' &&
+        error.message.length > 0 &&
+        error.message.length <= MAX_SAFE_MESSAGE_LENGTH
+    );
+};
 export const parseExtensionServerMessage = (value) => {
     if (
         !isRecord(value) ||
@@ -133,13 +209,16 @@ export const parseExtensionServerMessage = (value) => {
         value.id.length === 0 ||
         value.id.length > MAX_ID_LENGTH ||
         typeof value.type !== 'string' ||
-        (!EXTENSION_TO_CLIENT_MESSAGE_TYPES.includes(value.type) && !OZON_PROMOTION_SERVER_MESSAGE_TYPES.includes(value.type)) ||
+        (!EXTENSION_TO_CLIENT_MESSAGE_TYPES.includes(value.type) &&
+            !OZON_PROMOTION_SERVER_MESSAGE_TYPES.includes(value.type) &&
+            !OZON_ANALYTICS_SERVER_MESSAGE_TYPES.includes(value.type) && value.type !== MESSAGE_TYPES.ozonReportPhase) ||
         !isRecord(value.payload)
     ) {
         return { ok: false };
     }
 
     const { payload, type } = value;
+    if (type === MESSAGE_TYPES.ozonReportPhase && !isValidOzonReportPhase(payload)) return { ok: false };
     if (type === MESSAGE_TYPES.wbFetchStreamStart) {
         if (!isValidSellerStreamStart(payload)) return { ok: false };
     }
@@ -161,10 +240,27 @@ export const parseExtensionServerMessage = (value) => {
             typeof payload.error.message === 'string';
         if (!validSuccess && !validError) return { ok: false };
     }
-    if (type === MESSAGE_TYPES.ozonPromotionStreamStart && !isValidOzonStreamStart(payload)) return { ok: false };
-    if (type === MESSAGE_TYPES.ozonPromotionStreamChunk && !isValidOzonStreamChunk(payload)) return { ok: false };
-    if (type === MESSAGE_TYPES.ozonPromotionStreamEnd && !isValidOzonStreamEnd(payload)) return { ok: false };
-    if (type === MESSAGE_TYPES.ozonPromotionResult && !isValidOzonResult(payload)) return { ok: false };
+    if (
+        type === MESSAGE_TYPES.ozonPromotionStreamStart &&
+        !isValidOzonStreamStart(payload, Object.hasOwn(payload, 'itemIndex'))
+    )
+        return { ok: false };
+    if (
+        type === MESSAGE_TYPES.ozonPromotionStreamChunk &&
+        !isValidOzonStreamChunk(payload, Object.hasOwn(payload, 'itemIndex'))
+    )
+        return { ok: false };
+    if (type === MESSAGE_TYPES.ozonPromotionStreamEnd && !isValidOzonStreamEnd(payload, Object.hasOwn(payload, 'itemIndex')))
+        return { ok: false };
+    if (
+        type === MESSAGE_TYPES.ozonPromotionResult &&
+        !(Object.hasOwn(payload, 'itemIndex') ? isValidIndexedOzonResult(payload, 'promotion') : isValidOzonResult(payload))
+    )
+        return { ok: false };
+    if (type === MESSAGE_TYPES.ozonAnalyticsStreamStart && !isValidOzonStreamStart(payload, true)) return { ok: false };
+    if (type === MESSAGE_TYPES.ozonAnalyticsStreamChunk && !isValidOzonStreamChunk(payload, true)) return { ok: false };
+    if (type === MESSAGE_TYPES.ozonAnalyticsStreamEnd && !isValidOzonStreamEnd(payload, true)) return { ok: false };
+    if (type === MESSAGE_TYPES.ozonAnalyticsResult && !isValidIndexedOzonResult(payload, 'analytics')) return { ok: false };
 
     return { ok: true, message: value };
 };
@@ -219,6 +315,10 @@ export const createExtensionProtocol = ({
                     browserJobSupported: Array.isArray(payload.capabilities) && payload.capabilities.includes('browser_job'),
                     ozonSellerPromotionReportSupported:
                         Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_PROMOTION_CAPABILITY),
+                    ozonSellerPromotionReportsSupported:
+                        Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_PROMOTION_PACKAGE_CAPABILITY),
+                    ozonSellerAnalyticsReportSupported:
+                        Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_ANALYTICS_CAPABILITY),
                     version: payload.extensionVersion,
                 }
             );
@@ -272,6 +372,8 @@ export const createExtensionProtocol = ({
                   ? requestBroker.rejectAuthorizationRelease(message.id, rejection)
                   : requestBroker.hasPendingOzonPromotionOperation(message.id)
                     ? requestBroker.rejectOzonPromotionReport(message.id, rejection)
+                  : requestBroker.hasPendingOzonReportPackage(message.id)
+                    ? requestBroker.rejectOzonReportPackage(message.id, rejection)
                   : requestBroker.hasPendingSellerOperation(message.id)
                     ? requestBroker.rejectSellerOperation(message.id, rejection)
                     : requestBroker.rejectFetch(message.id, rejection);
@@ -318,30 +420,79 @@ export const createExtensionProtocol = ({
             return;
         }
 
+        if (type === MESSAGE_TYPES.ozonReportPhase) {
+            const handled = await requestBroker.recordOzonReportPackagePhase(message.id, payload.family, payload);
+            if (handled) send(socket, localMessage(message.id,
+                payload.family === 'promotion' ? MESSAGE_TYPES.ozonPromotionStreamAck : MESSAGE_TYPES.ozonAnalyticsStreamAck,
+                { frameId: payload.frameId }));
+            return;
+        }
         if (type === MESSAGE_TYPES.ozonPromotionStreamStart) {
-            if (await requestBroker.startOzonPromotionStream(message.id, payload)) {
+            const handled = Object.hasOwn(payload, 'itemIndex')
+                ? await requestBroker.startOzonReportPackageStream(message.id, 'promotion', payload)
+                : await requestBroker.startOzonPromotionStream(message.id, payload);
+            if (handled) {
                 send(socket, localMessage(message.id, MESSAGE_TYPES.ozonPromotionStreamAck, { frameId: payload.frameId }));
             }
             return;
         }
 
         if (type === MESSAGE_TYPES.ozonPromotionStreamChunk) {
-            if (await requestBroker.appendOzonPromotionStreamChunk(message.id, payload)) {
+            const handled = Object.hasOwn(payload, 'itemIndex')
+                ? await requestBroker.appendOzonReportPackageStreamChunk(message.id, 'promotion', payload)
+                : await requestBroker.appendOzonPromotionStreamChunk(message.id, payload);
+            if (handled) {
                 send(socket, localMessage(message.id, MESSAGE_TYPES.ozonPromotionStreamAck, { frameId: payload.frameId }));
             }
             return;
         }
 
         if (type === MESSAGE_TYPES.ozonPromotionStreamEnd) {
-            if (await requestBroker.endOzonPromotionStream(message.id, payload)) {
+            const handled = Object.hasOwn(payload, 'itemIndex')
+                ? await requestBroker.endOzonReportPackageStream(message.id, 'promotion', payload)
+                : await requestBroker.endOzonPromotionStream(message.id, payload);
+            if (handled) {
                 send(socket, localMessage(message.id, MESSAGE_TYPES.ozonPromotionStreamAck, { frameId: payload.frameId }));
             }
             return;
         }
 
         if (type === MESSAGE_TYPES.ozonPromotionResult) {
-            if (payload.ok) requestBroker.resolveOzonPromotionReport(message.id, payload);
+            if (Object.hasOwn(payload, 'itemIndex')) {
+                const { itemIndex, ...result } = payload;
+                await requestBroker.resolveOzonReportPackageItem(message.id, 'promotion', itemIndex, result);
+            } else if (requestBroker.hasPendingOzonReportPackage(message.id)) {
+                requestBroker.rejectOzonReportPackage(message.id, new ToolExecutionError(
+                    'ARTIFACT_REJECTED',
+                    'The Ozon report package received a result without its item index.',
+                    'artifact',
+                    false
+                ));
+            } else if (payload.ok) requestBroker.resolveOzonPromotionReport(message.id, payload);
             else requestBroker.rejectOzonPromotionReport(message.id, safeOzonPromotionToolError(payload.error));
+            return;
+        }
+
+        if (
+            type === MESSAGE_TYPES.ozonAnalyticsStreamStart ||
+            type === MESSAGE_TYPES.ozonAnalyticsStreamChunk ||
+            type === MESSAGE_TYPES.ozonAnalyticsStreamEnd
+        ) {
+            const handled =
+                type === MESSAGE_TYPES.ozonAnalyticsStreamStart
+                    ? await requestBroker.startOzonReportPackageStream(message.id, 'analytics', payload)
+                    : type === MESSAGE_TYPES.ozonAnalyticsStreamChunk
+                      ? await requestBroker.appendOzonReportPackageStreamChunk(message.id, 'analytics', payload)
+                      : await requestBroker.endOzonReportPackageStream(message.id, 'analytics', payload);
+            if (handled) {
+                send(socket, localMessage(message.id, MESSAGE_TYPES.ozonAnalyticsStreamAck, { frameId: payload.frameId }));
+            }
+            return;
+        }
+
+        if (type === MESSAGE_TYPES.ozonAnalyticsResult) {
+            const { itemIndex, ...result } = payload;
+            await requestBroker.resolveOzonReportPackageItem(message.id, 'analytics', itemIndex, result);
             return;
         }
 

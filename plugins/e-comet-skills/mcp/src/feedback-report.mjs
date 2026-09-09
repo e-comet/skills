@@ -1,13 +1,15 @@
-import { FEEDBACK_KINDS, FEEDBACK_MAX_DETAILS_LENGTH, FEEDBACK_MAX_REPORT_BYTES, FEEDBACK_MAX_SUMMARY_LENGTH } from './config.mjs';
+import { FEEDBACK_KINDS } from './config.mjs';
+import { PEER_REJECTION_CODES } from './connection-state.mjs';
+import { FeedbackPreparationError } from './feedback-errors.mjs';
 
 const FEEDBACK_KIND_SET = new Set(FEEDBACK_KINDS);
+const PEER_REJECTION_CODE_SET = new Set(Object.values(PEER_REJECTION_CODES));
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 
-const normalizeText = (value, name, maximumLength) => {
-    if (typeof value !== 'string') throw new TypeError(`Feedback ${name} must be a string`);
+const normalizeText = (value) => {
+    if (typeof value !== 'string') throw new FeedbackPreparationError('FEEDBACK_INPUT_INVALID');
     const normalized = value.replace(/\r\n?/g, '\n');
-    if (CONTROL_CHARACTERS.test(normalized)) throw new TypeError(`Feedback ${name} contains a control character`);
-    if (normalized.length > maximumLength) throw new RangeError(`Feedback ${name} exceeds the ${maximumLength}-character limit`);
+    if (CONTROL_CHARACTERS.test(normalized)) throw new FeedbackPreparationError('FEEDBACK_INPUT_INVALID');
     return normalized;
 };
 
@@ -47,6 +49,23 @@ const copyBoolean = (value) => (typeof value === 'boolean' ? value : undefined);
 const copyPositiveInteger = (value) => (Number.isSafeInteger(value) && value > 0 ? value : undefined);
 const compact = (value) => Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
 
+const selectStorageDiagnostics = (storage) => {
+    if (!storage || typeof storage !== 'object' || Array.isArray(storage)) return undefined;
+    const selected = {};
+    // Status is already path-free at the server boundary, but archived reports enforce their
+    // own closed projection: never copy paths, arbitrary reason strings, or future store fields.
+    for (const name of ['results', 'marketplaceArtifacts', 'feedbackArtifacts']) {
+        const target = storage[name];
+        if (!target || typeof target !== 'object' || Array.isArray(target)) continue;
+        if (target.state === 'ready' && ['plugin_data', 'application_data', 'override'].includes(target.backend)) {
+            selected[name] = { state: target.state, backend: target.backend };
+        } else if (target.state === 'unavailable' && ['plugin_data_missing', 'plugin_data_invalid', 'plugin_data_conflict', 'application_data_invalid', 'override_invalid'].includes(target.reason)) {
+            selected[name] = { state: target.state, reason: target.reason };
+        }
+    }
+    return Object.keys(selected).length > 0 ? selected : undefined;
+};
+
 export const selectFeedbackDiagnostics = (bridgeStatus) => {
     if (!bridgeStatus || typeof bridgeStatus !== 'object' || Array.isArray(bridgeStatus)) return {};
     const extension = bridgeStatus.extension && typeof bridgeStatus.extension === 'object' && !Array.isArray(bridgeStatus.extension)
@@ -57,6 +76,8 @@ export const selectFeedbackDiagnostics = (bridgeStatus) => {
               lastConnectedAt: copyString(bridgeStatus.extension.lastConnectedAt),
               lastDisconnectedAt: copyString(bridgeStatus.extension.lastDisconnectedAt),
               ozonSellerPromotionReportSupported: copyBoolean(bridgeStatus.extension.ozonSellerPromotionReportSupported),
+              ozonSellerPromotionReportsSupported: copyBoolean(bridgeStatus.extension.ozonSellerPromotionReportsSupported),
+              ozonSellerAnalyticsReportSupported: copyBoolean(bridgeStatus.extension.ozonSellerAnalyticsReportSupported),
           })
         : undefined;
     const peer = bridgeStatus.peer && typeof bridgeStatus.peer === 'object' && !Array.isArray(bridgeStatus.peer)
@@ -80,16 +101,21 @@ export const selectFeedbackDiagnostics = (bridgeStatus) => {
         state: copyString(bridgeStatus.state),
         extension: extension && Object.keys(extension).length > 0 ? extension : undefined,
         peer: peer && Object.keys(peer).length > 0 ? peer : undefined,
+        // Preserve observed rejection evidence, never raw socket text or a guessed root cause.
+        peerRejection: PEER_REJECTION_CODE_SET.has(bridgeStatus.peerRejection?.code)
+            ? { code: bridgeStatus.peerRejection.code } : undefined,
         browserContext: browserContext && Object.keys(browserContext).length > 0 ? browserContext : undefined,
+        storage: selectStorageDiagnostics(bridgeStatus.storage),
     });
 };
 
 /** @param {{ kind?: string, summary?: string, details?: string, diagnostics?: unknown, includeTranscript?: boolean }} input */
 export const renderFeedbackReport = ({ kind, summary, details, diagnostics, includeTranscript } = {}) => {
-    if (!FEEDBACK_KIND_SET.has(kind)) throw new RangeError('Feedback kind is invalid');
-    if (typeof includeTranscript !== 'boolean') throw new TypeError('Feedback includeTranscript must be a boolean');
-    const normalizedSummary = redactFeedbackText(normalizeText(summary, 'summary', FEEDBACK_MAX_SUMMARY_LENGTH));
-    const normalizedDetails = redactFeedbackText(normalizeText(details, 'details', FEEDBACK_MAX_DETAILS_LENGTH));
+    // WHY: report validation owns this safe category before transcript or artifact I/O can begin.
+    if (!FEEDBACK_KIND_SET.has(kind)) throw new FeedbackPreparationError('FEEDBACK_INPUT_INVALID');
+    if (typeof includeTranscript !== 'boolean') throw new FeedbackPreparationError('FEEDBACK_INPUT_INVALID');
+    const normalizedSummary = redactFeedbackText(normalizeText(summary));
+    const normalizedDetails = redactFeedbackText(normalizeText(details));
     const selectedDiagnostics = selectFeedbackDiagnostics(diagnostics);
     const report = [
         '<!-- e-comet-feedback:v1 -->',
@@ -113,7 +139,5 @@ export const renderFeedbackReport = ({ kind, summary, details, diagnostics, incl
         `Transcript: ${includeTranscript ? 'included' : 'not included'}`,
         '',
     ].join('\n');
-    const bytes = Buffer.from(report, 'utf8');
-    if (bytes.length > FEEDBACK_MAX_REPORT_BYTES) throw new RangeError(`Feedback report exceeds the ${FEEDBACK_MAX_REPORT_BYTES}-byte limit`);
-    return bytes;
+    return Buffer.from(report, 'utf8');
 };

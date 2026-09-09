@@ -1,3 +1,4 @@
+import { isValidOzonReportPhase } from './extension-protocol.mjs';
 import { randomUUID } from 'node:crypto';
 
 import {
@@ -11,6 +12,7 @@ import {
 import { PEER_REJECTION_CODES } from './connection-state.mjs';
 import {
     isValidOzonPromotionOperation,
+    isValidOzonReportPackageRequest,
     isValidSellerOperation,
     isValidSellerStreamChunk,
     isValidSellerStreamEnd,
@@ -136,6 +138,105 @@ const isValidPeerOzonResult = (message) => {
         return false;
     }
 };
+const OZON_PACKAGE_PEER_TYPES = Object.freeze({
+    promotion: Object.freeze({
+        operation: 'peer_ozon_promotion_reports_operation',
+        start: 'peer_ozon_promotion_reports_stream_start',
+        chunk: 'peer_ozon_promotion_reports_stream_chunk',
+        end: 'peer_ozon_promotion_reports_stream_end',
+        ack: 'peer_ozon_promotion_reports_stream_ack',
+        resultAck: 'peer_ozon_promotion_reports_result_ack',
+        result: 'peer_ozon_promotion_reports_result',
+        directStart: MESSAGE_TYPES.ozonPromotionStreamStart,
+        directChunk: MESSAGE_TYPES.ozonPromotionStreamChunk,
+        directEnd: MESSAGE_TYPES.ozonPromotionStreamEnd,
+        directResult: MESSAGE_TYPES.ozonPromotionResult,
+    }),
+    analytics: Object.freeze({
+        operation: 'peer_ozon_analytics_report_operation',
+        start: 'peer_ozon_analytics_report_stream_start',
+        chunk: 'peer_ozon_analytics_report_stream_chunk',
+        end: 'peer_ozon_analytics_report_stream_end',
+        ack: 'peer_ozon_analytics_report_stream_ack',
+        resultAck: 'peer_ozon_analytics_report_result_ack',
+        result: 'peer_ozon_analytics_report_result',
+        directStart: MESSAGE_TYPES.ozonAnalyticsStreamStart,
+        directChunk: MESSAGE_TYPES.ozonAnalyticsStreamChunk,
+        directEnd: MESSAGE_TYPES.ozonAnalyticsStreamEnd,
+        directResult: MESSAGE_TYPES.ozonAnalyticsResult,
+    }),
+});
+const packageFamilyForType = (type, field) =>
+    Object.entries(OZON_PACKAGE_PEER_TYPES).find(([, types]) => types[field] === type)?.[0];
+const isValidPeerOzonPackageOperation = (message) => {
+    const family = packageFamilyForType(message?.type, 'operation');
+    return (
+        family !== undefined &&
+        hasOnlyKeys(message, ['type', 'requestId', 'authorizationScopeId', 'authorizationId', 'package', 'timeout']) &&
+        isValidPeerRequestId(message.requestId) &&
+        isValidPeerRequestId(message.authorizationScopeId) &&
+        isValidPeerRequestId(message.authorizationId) &&
+        message.package?.family === family &&
+        isValidOzonReportPackageRequest(message.package) &&
+        Number.isSafeInteger(message.timeout) &&
+        message.timeout >= 1000 &&
+        message.timeout <= 8 * 60 * 1000
+    );
+};
+const parsePeerOzonPackageStream = (message) => {
+    for (const [family, types] of Object.entries(OZON_PACKAGE_PEER_TYPES)) {
+        const kind = ['start', 'chunk', 'end'].find((field) => types[field] === message?.type);
+        if (!kind) continue;
+        const commonKeys = ['type', 'requestId', 'ackId', 'itemIndex'];
+        const keys = kind === 'chunk' ? [...commonKeys, 'index', 'data'] : [...commonKeys, 'metadata'];
+        // Nested fields must not give validation, broker dispatch, and the ACK different identities.
+        if (
+            !hasOnlyKeys(message, keys) ||
+            !isValidPeerRequestId(message.requestId) ||
+            !isValidPeerRequestId(message.ackId) ||
+            !Number.isSafeInteger(message.itemIndex) ||
+            message.itemIndex < 0 ||
+            (kind !== 'chunk' && !hasOnlyKeys(message.metadata,
+                kind === 'start' ? ['name', 'mimeType', 'declaredSize'] : ['size', 'sha256']))
+        ) {
+            return null;
+        }
+        const payload =
+            kind === 'chunk'
+                ? { frameId: message.ackId, itemIndex: message.itemIndex, index: message.index, data: message.data }
+                : { ...message.metadata, frameId: message.ackId, itemIndex: message.itemIndex };
+        if (!isValidPeerOzonPayload(message.requestId, types[`direct${kind[0].toUpperCase()}${kind.slice(1)}`], payload)) return null;
+        return { family, kind, payload };
+    }
+    return null;
+};
+const parsePeerOzonPackageResult = (message) => {
+    const family = packageFamilyForType(message?.type, 'result');
+    if (!family || !isValidPeerRequestId(message.requestId)) return null;
+    const types = OZON_PACKAGE_PEER_TYPES[family];
+    if (message.response !== undefined) {
+        if (
+            !hasOnlyKeys(message, ['type', 'requestId', 'ackId', 'itemIndex', 'response']) ||
+            !isValidPeerRequestId(message.ackId) ||
+            !Number.isSafeInteger(message.itemIndex) ||
+            message.itemIndex < 0 ||
+            !hasOnlyKeys(message.response, ['ok', 'status', 'error']) ||
+            !isValidPeerOzonPayload(message.requestId, types.directResult, { ...message.response, itemIndex: message.itemIndex })
+        ) {
+            return null;
+        }
+        return { family, ackId: message.ackId, itemIndex: message.itemIndex, response: message.response };
+    }
+    if (
+        typeof message.error !== 'string' ||
+        message.error.length === 0 ||
+        message.error.length > 500 ||
+        !hasOnlyKeys(message, ['type', 'requestId', 'error', 'toolError'])
+    ) {
+        return null;
+    }
+    return { family, error: message.toolError };
+};
 
 export const createPeerProtocol = ({
     connections,
@@ -172,13 +273,13 @@ export const createPeerProtocol = ({
     const createOzonAckId = createOzonAckIdOverride || (() => randomUUID());
     const waitForOzonAck =
         waitForOzonAckOverride ||
-        ((state, ackId, requestId, authorizationScopeId, timeout) =>
+        ((state, ackId, requestId, authorizationScopeId, timeout, family = undefined, itemIndex = undefined, ackType = undefined) =>
             new Promise((resolve, reject) => {
                 const timer = setTimeout(() => {
                     state.ozonFrameAcks.delete(ackId);
-                    reject(new Error('Secondary Ozon stream acknowledgement timed out.'));
+                    reject(new Error('Secondary Ozon frame acknowledgement timed out.'));
                 }, timeout);
-                state.ozonFrameAcks.set(ackId, { requestId, authorizationScopeId, resolve, reject, timer });
+                state.ozonFrameAcks.set(ackId, { requestId, authorizationScopeId, family, itemIndex, ackType, resolve, reject, timer });
             }));
     const rejectOzonAcks = (state, predicate, error) => {
         for (const [ackId, pendingAck] of state.ozonFrameAcks) {
@@ -289,6 +390,12 @@ export const createPeerProtocol = ({
             ...(connections.extensionOzonPromotionReady === undefined
                 ? {}
                 : { ozonSellerPromotionReportSupported: connections.extensionOzonPromotionReady === true }),
+            ...(connections.extensionOzonPromotionPackageReady === undefined
+                ? {}
+                : { ozonSellerPromotionReportsSupported: connections.extensionOzonPromotionPackageReady === true }),
+            ...(connections.extensionOzonAnalyticsReady === undefined
+                ? {}
+                : { ozonSellerAnalyticsReportSupported: connections.extensionOzonAnalyticsReady === true }),
             ...(connections.extensionLastConnectedAtMs === null ? {} : { extensionLastConnectedAtMs: connections.extensionLastConnectedAtMs }),
             ...(connections.extensionLastDisconnectedAtMs === null ? {} : { extensionLastDisconnectedAtMs: connections.extensionLastDisconnectedAtMs }),
             // Тот же набор, что и в `peer_status`: иначе пир до первого пуша считает,
@@ -480,6 +587,72 @@ export const createPeerProtocol = ({
             }
             return;
         }
+        if (message?.type === 'peer_ozon_report_phase') {
+            const { type: _type, requestId, ackId, ...evidence } = message;
+            if (!hasOnlyKeys(message, ['type', 'requestId', 'ackId', 'family', 'itemIndex', 'phase']) ||
+                !isValidPeerRequestId(requestId) || !isValidPeerRequestId(ackId) ||
+                !isValidOzonReportPhase({ ...evidence, frameId: ackId })) return;
+            const handled = await requestBroker.recordOzonReportPackagePhase(requestId, evidence.family, evidence);
+            if (handled) state.socket.send(JSON.stringify({ type: OZON_PACKAGE_PEER_TYPES[evidence.family].ack,
+                requestId, ackId, itemIndex: evidence.itemIndex }));
+            return;
+        }
+        const packageStream = parsePeerOzonPackageStream(message);
+        if (packageStream) {
+            const handled =
+                packageStream.kind === 'start'
+                    ? await requestBroker.startOzonReportPackageStream(message.requestId, packageStream.family, packageStream.payload)
+                    : packageStream.kind === 'chunk'
+                      ? await requestBroker.appendOzonReportPackageStreamChunk(
+                            message.requestId,
+                            packageStream.family,
+                            packageStream.payload
+                        )
+                      : await requestBroker.endOzonReportPackageStream(message.requestId, packageStream.family, packageStream.payload);
+            if (handled) {
+                state.socket.send(
+                    JSON.stringify({
+                        type: OZON_PACKAGE_PEER_TYPES[packageStream.family].ack,
+                        requestId: message.requestId,
+                        ackId: message.ackId,
+                        itemIndex: message.itemIndex,
+                    })
+                );
+            }
+            return;
+        }
+        const packageResult = parsePeerOzonPackageResult(message);
+        if (packageResult) {
+            if (packageResult.response) {
+                const handled = await requestBroker.resolveOzonReportPackageItem(
+                    message.requestId,
+                    packageResult.family,
+                    packageResult.itemIndex,
+                    packageResult.response
+                );
+                if (handled) {
+                    state.socket.send(
+                        JSON.stringify({
+                            type: OZON_PACKAGE_PEER_TYPES[packageResult.family].resultAck,
+                            requestId: message.requestId,
+                            ackId: packageResult.ackId,
+                            itemIndex: packageResult.itemIndex,
+                        })
+                    );
+                }
+            } else {
+                const error = packageResult.error
+                    ? peerOzonToolError(packageResult.error)
+                    : new ToolExecutionError(
+                          'OZON_AUTHORIZATION_REJECTED',
+                          'The primary local bridge rejected the Ozon report package.',
+                          'authorization',
+                          false
+                      );
+                requestBroker.rejectOzonReportPackage(message.requestId, error);
+            }
+            return;
+        }
         if (isValidPeerOzonStreamStart(message) || isValidPeerOzonStreamChunk(message) || isValidPeerOzonStreamEnd(message)) {
             let handled = false;
             if (message.type === 'peer_ozon_promotion_stream_start') {
@@ -650,6 +823,32 @@ export const createPeerProtocol = ({
             }
             return;
         }
+        const packageAck = Object.entries(OZON_PACKAGE_PEER_TYPES).find(
+            ([, types]) => types.ack === message?.type || types.resultAck === message?.type
+        );
+        const packageAckFamily = packageAck?.[0];
+        if (
+            packageAckFamily &&
+            isValidPeerRequestId(message.requestId) &&
+            isValidPeerRequestId(message.ackId) &&
+            Number.isSafeInteger(message.itemIndex) &&
+            message.itemIndex >= 0 &&
+            hasOnlyKeys(message, ['type', 'requestId', 'ackId', 'itemIndex'])
+        ) {
+            const pendingAck = state.ozonFrameAcks.get(message.ackId);
+            if (
+                pendingAck &&
+                pendingAck.requestId === message.requestId &&
+                pendingAck.family === packageAckFamily &&
+                pendingAck.itemIndex === message.itemIndex &&
+                pendingAck.ackType === message.type
+            ) {
+                state.ozonFrameAcks.delete(message.ackId);
+                clearTimeout(pendingAck.timer);
+                pendingAck.resolve();
+            }
+            return;
+        }
         if (
             message?.type === 'peer_ozon_promotion_stream_ack' &&
             isValidPeerRequestId(message.requestId) &&
@@ -710,6 +909,164 @@ export const createPeerProtocol = ({
                     }),
                 });
             }
+            return;
+        }
+        if (isValidPeerOzonPackageOperation(message)) {
+            const family = message.package.family;
+            const types = OZON_PACKAGE_PEER_TYPES[family];
+            if (!state.mutualPeerAuthentication) {
+                send(state.socket, {
+                    type: types.result,
+                    requestId: message.requestId,
+                    error: 'Mutual peer authentication is required for Ozon report packages.',
+                });
+                return;
+            }
+            if (state.ozonOperationRequests.has(message.requestId)) {
+                send(state.socket, { type: types.result, requestId: message.requestId, error: 'Duplicate peer Ozon package request' });
+                return;
+            }
+            const authorizationLease = state.authorizationLeases.get(message.authorizationScopeId);
+            if (
+                !authorizationLease ||
+                authorizationLease.authorization?.authorizationId !== message.authorizationId ||
+                typeof authorizationLease.requestOzonReportPackage !== 'function'
+            ) {
+                send(state.socket, {
+                    type: types.result,
+                    requestId: message.requestId,
+                    error: 'Ozon report package authorization is no longer active.',
+                    toolError: toolFailure(
+                        new ToolExecutionError(
+                            'OZON_AUTHORIZATION_REJECTED',
+                            'The signed Ozon report package authorization is no longer active.',
+                            'authorization',
+                            false
+                        )
+                    ),
+                });
+                return;
+            }
+            state.ozonOperationRequests.add(message.requestId);
+            let preexecutionRelayed = false;
+            try {
+                const relay = async (type, itemIndex, fields) => {
+                    const ackId = createOzonAckId({ requestId: message.requestId, type, itemIndex });
+                    if (!isValidPeerRequestId(ackId)) {
+                        throw new ToolExecutionError(
+                            'ARTIFACT_REJECTED',
+                            'The Ozon peer stream acknowledgement identifier is invalid.',
+                            'artifact',
+                            false
+                        );
+                    }
+                    send(state.socket, { type, requestId: message.requestId, ackId, itemIndex, ...fields });
+                    await waitForOzonAck(
+                        state,
+                        ackId,
+                        message.requestId,
+                        message.authorizationScopeId,
+                        message.timeout,
+                        family,
+                        itemIndex,
+                        types.ack
+                    );
+                };
+                const relayResult = async (itemIndex, response) => {
+                    const ackId = createOzonAckId({ requestId: message.requestId, type: types.result, itemIndex });
+                    if (!isValidPeerRequestId(ackId)) {
+                        throw new ToolExecutionError(
+                            'ARTIFACT_REJECTED',
+                            'The Ozon peer item-result acknowledgement identifier is invalid.',
+                            'artifact',
+                            false
+                        );
+                    }
+                    send(state.socket, { type: types.result, requestId: message.requestId, ackId, itemIndex, response });
+                    await waitForOzonAck(
+                        state,
+                        ackId,
+                        message.requestId,
+                        message.authorizationScopeId,
+                        message.timeout,
+                        family,
+                        itemIndex,
+                        types.resultAck
+                    );
+                };
+                await authorizationLease.requestOzonReportPackage(message.package, {
+                    onNotStarted: async (error) => {
+                        const safe = safeOzonPromotionToolError(error);
+                        for (let itemIndex = 0; itemIndex < message.package.items.length; itemIndex += 1) {
+                            const period = message.package.items[itemIndex];
+                            await relayResult(itemIndex, {
+                                ok: false,
+                                status: 'skipped',
+                                error: {
+                                    code: safe.code, stage: safe.stage, retryable: false, message: safe.message,
+                                    ...(family === 'promotion' ? { dateFrom: period.dateFrom, dateTo: period.dateTo } : {}),
+                                },
+                            });
+                        }
+                        preexecutionRelayed = true;
+                    },
+                    onItemPhase: (itemIndex, phase) => relay('peer_ozon_report_phase', itemIndex, { family, phase }),
+                    onItemStart: (itemIndex, metadata) => relay(types.start, itemIndex, { metadata }),
+                    onItemChunk: (itemIndex, index, data) => relay(types.chunk, itemIndex, { index, data }),
+                    onItemEnd: (itemIndex, metadata) => relay(types.end, itemIndex, { metadata }),
+                    onItemResult: relayResult,
+                    onCancel: (error) =>
+                        rejectOzonAcks(
+                            state,
+                            (pendingAck) =>
+                                pendingAck.authorizationScopeId === message.authorizationScopeId &&
+                                pendingAck.requestId === message.requestId,
+                            error
+                        ),
+                });
+            } catch (error) {
+                if (preexecutionRelayed) return;
+                let normalizedError;
+                try {
+                    normalizedError = safeOzonPromotionToolError(error);
+                } catch {
+                    normalizedError = new ToolExecutionError(
+                        'ARTIFACT_REJECTED',
+                        'The Ozon report package failed while crossing the local peer bridge.',
+                        'artifact',
+                        false
+                    );
+                }
+                send(state.socket, {
+                    type: types.result,
+                    requestId: message.requestId,
+                    error: 'Ozon report package failed.',
+                    toolError: toolFailure(normalizedError),
+                });
+            } finally {
+                rejectOzonAcks(
+                    state,
+                    (pendingAck) =>
+                        pendingAck.authorizationScopeId === message.authorizationScopeId &&
+                        pendingAck.requestId === message.requestId,
+                    new ToolExecutionError(
+                        'OPERATION_CANCELLED',
+                        'The Ozon report package ended before its stream acknowledgement arrived.',
+                        'cancelled',
+                        false
+                    )
+                );
+                state.ozonOperationRequests.delete(message.requestId);
+            }
+            return;
+        }
+        if (packageFamilyForType(message?.type, 'operation')) {
+            const family = packageFamilyForType(message.type, 'operation');
+            send(state.socket, {
+                type: OZON_PACKAGE_PEER_TYPES[family].result,
+                requestId: isValidPeerRequestId(message.requestId) ? message.requestId : undefined,
+                error: 'Invalid peer Ozon package request',
+            });
             return;
         }
         if (isValidPeerOzonOperationRequest(message)) {

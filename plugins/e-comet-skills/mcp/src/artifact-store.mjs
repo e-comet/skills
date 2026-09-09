@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFile, chmod, mkdir, readFile, readdir, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { appendFile, chmod, lstat, mkdir, readFile, readdir, realpath, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { inflateRawSync } from 'node:zlib';
 
 import {
-    ARTIFACT_DIR,
+    ARTIFACT_STORAGE,
+    LEGACY_ARTIFACT_DIR,
     ARTIFACT_MAX_CHUNK_BYTES,
     ARTIFACT_MAX_FILE_BYTES,
     ARTIFACT_MAX_FILES,
@@ -13,10 +14,14 @@ import {
     ARTIFACT_MAX_TOTAL_BYTES,
     ARTIFACT_RETENTION_MS,
 } from './config.mjs';
+import { requireStorageTarget } from './storage-layout.mjs';
+import { createOwnedLockReleaseTracker } from './owned-lock-release.mjs';
+import { classifyProcessOwner, getOwnProcessIdentity, hasComparableProcessScope, isDifferentProcess, readCurrentProcessScope, readProcessIdentity } from './process-identity.mjs';
 
-const defaultFileSystem = { appendFile, chmod, mkdir, readFile, readdir, rename, rm, rmdir, stat, writeFile };
+const defaultFileSystem = { appendFile, chmod, lstat, mkdir, readFile, readdir, realpath, rename, rm, rmdir, stat, writeFile };
 const jobUsage = new Map();
 const activePartPaths = new Set();
+const pendingSetupCleanups = createOwnedLockReleaseTracker();
 const ARTIFACT_LOCK_RETRY_LIMIT = 200;
 const ARTIFACT_LOCK_RETRY_DELAY_MS = 25;
 const ARTIFACT_LOCK_STALE_MS = 30_000;
@@ -638,20 +643,104 @@ const acquireJob = (jobId, maxJobBytes) => {
     jobUsage.set(jobId, usage);
     return usage;
 };
-const ACTIVE_PART_PATTERN = /^\.active-([1-9]\d{0,9})-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.part$/;
+const ACTIVE_PART_PATTERN = /^\.active-([1-9]\d{0,9})-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.part$/;
 const ACTIVE_ARTIFACT_PIN_PATTERN =
-    /^\.active-artifact-([1-9]\d{0,9})-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.pin$/;
-const partOwnerPid = (name) => {
-    const match = ACTIVE_PART_PATTERN.exec(name);
-    if (!match) return null;
-    const pid = Number(match[1]);
-    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+    /^\.active-artifact-([1-9]\d{0,9})-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.pin$/;
+const ARTIFACT_OWNER_PATTERN = /^\.artifact-owner-([1-9]\d{0,9})-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/;
+const OWNER_RECORD_MAX_BYTES = 4096;
+const PROTECTED_OWNER_CACHE_MS = 1000;
+const PROTECTED_OWNER_CACHE_ENTRIES = 64;
+// This only avoids redundant native queries. Expiry/eviction never grants cleanup
+// authority; the next lookup runs again and PID absence is checked on every use.
+const protectedOwnerObservations = new Map();
+const ownerSidecarPath = (directory, pid, identity) => join(directory, `.artifact-owner-${pid}-${identity}.json`);
+const readOwnerRecord = async (path, fileSystem, legacyEmpty = false) => {
+    try {
+        const metadata = await fileSystem.lstat(path);
+        if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > OWNER_RECORD_MAX_BYTES) return undefined;
+        const contents = await fileSystem.readFile(path, 'utf8');
+        if (legacyEmpty && contents === '') return null;
+        const record = JSON.parse(contents);
+        return record?.version === 1 && Object.hasOwn(record, 'process') ? record : undefined;
+    } catch (error) {
+        return error?.code === 'ENOENT' ? null : undefined;
+    }
 };
-const artifactPinOwnerPid = (name) => {
-    const match = ACTIVE_ARTIFACT_PIN_PATTERN.exec(name);
-    if (!match) return null;
-    const pid = Number(match[1]);
-    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+const createArtifactOwnerObserver = (artifactDir, deadline, isProcessAlive, ownIdentity) => {
+    let scope;
+    const lookups = new Map();
+    return async (pid, recorded) => {
+        if (recorded === null || recorded === undefined) return classifyProcessOwner(pid, recorded, { scope: null, selfIdentity: null, isProcessAlive });
+        const lookup = () => {
+            const key = JSON.stringify([artifactDir, pid, recorded]);
+            if (!lookups.has(key)) lookups.set(key, (async () => {
+                const now = performance.now();
+                for (const [oldKey, entry] of protectedOwnerObservations) {
+                    if (entry.until <= now) protectedOwnerObservations.delete(oldKey);
+                }
+                const cached = protectedOwnerObservations.get(key);
+                if (cached) return cached.identity;
+                const identity = await readProcessIdentity(pid, deadline - performance.now());
+                // Cache matches only, never a dead/replaced verdict or a failed probe.
+                // Including the stored birth prevents an old PID sample from condemning a new owner.
+                if (identity && hasComparableProcessScope(recorded, identity) && !isDifferentProcess(recorded, identity)) {
+                    while (protectedOwnerObservations.size >= PROTECTED_OWNER_CACHE_ENTRIES) {
+                        protectedOwnerObservations.delete(protectedOwnerObservations.keys().next().value);
+                    }
+                    protectedOwnerObservations.set(key, { identity, until: performance.now() + PROTECTED_OWNER_CACHE_MS });
+                }
+                return identity;
+            })());
+            return lookups.get(key);
+        };
+        return classifyProcessOwner(pid, recorded, {
+            scope: await (scope ??= Promise.resolve(ownIdentity ?? readCurrentProcessScope())),
+            selfIdentity: pid === process.pid ? (ownIdentity ?? await getOwnProcessIdentity()) : undefined,
+            lookup, isProcessAlive,
+        });
+    };
+};
+const readArtifactOwner = async (artifactDir, match, fileSystem) => {
+    const record = await readOwnerRecord(ownerSidecarPath(artifactDir, match[1], match[2]), fileSystem);
+    if (record === null) return null;
+    if (!record || typeof record.artifactName !== 'string' || basename(record.artifactName) !== record.artifactName ||
+        !(record.artifactName === `${match[2]}.xlsx` || record.artifactName.startsWith(`${match[2]}-`) && record.artifactName.endsWith('.xlsx'))) return undefined;
+    return record.process;
+};
+const removeOwnerSidecar = async (artifactDir, match, fileSystem) => {
+    const path = ownerSidecarPath(artifactDir, match[1], match[2]);
+    await fileSystem.rm(`${path}.pending`, { force: true });
+    await fileSystem.rm(path, { force: true });
+};
+const cleanupOwnerMetadata = async (artifactDir, entries, fileSystem) => {
+    for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const candidate = entry.name.endsWith('.pending') ? entry.name.slice(0, -'.pending'.length) : undefined;
+        try {
+            // Publication and this cleanup share the same lock. A visible candidate
+            // cannot still be published by another active critical section.
+            if (candidate && (ARTIFACT_OWNER_PATTERN.test(candidate) || ACTIVE_ARTIFACT_PIN_PATTERN.test(candidate))) {
+                await fileSystem.rm(join(artifactDir, entry.name), { force: true });
+                continue;
+            }
+            const match = ARTIFACT_OWNER_PATTERN.exec(entry.name);
+            if (!match) continue;
+            const pin = `.active-artifact-${match[1]}-${match[2]}.pin`;
+            const names = [`.active-${match[1]}-${match[2]}.part`, pin, `${pin}.pending`];
+            let associated = false;
+            for (const name of names) {
+                try { await fileSystem.lstat(join(artifactDir, name)); associated = true; break; }
+                catch (error) { if (error?.code !== 'ENOENT') throw error; }
+            }
+            // No payload is removed here. Without a part or pin there is no
+            // remaining protection to describe, even after an ended release fault.
+            if (!associated) await fileSystem.rm(join(artifactDir, entry.name), { force: true });
+        } catch {
+            // Retaining unused metadata cannot make another report unsafe. Leave
+            // it for a later sweep; authoritative pins and payloads are checked below.
+            console.error('ARTIFACT_OWNER_CLEANUP_PENDING: Owner metadata cleanup remains pending.');
+        }
+    }
 };
 const lockOwnerPid = (name) => {
     const match = ARTIFACT_LOCK_OWNER_PATTERN.exec(name);
@@ -680,13 +769,16 @@ const defaultScheduleDeferredRelease = (retry, delayMs) => {
 // `fileSystem` place the lock beside their artifact directory instead of on the real disk.
 const acquireArtifactStoreLock = async (artifactDir, fileSystem = defaultFileSystem) => {
     const lockPath = join(artifactDir, '.artifact-store.lock');
-    for (let attempt = 0; attempt < ARTIFACT_LOCK_RETRY_LIMIT; attempt += 1) {
+    const ownIdentity = await getOwnProcessIdentity();
+    const deadline = performance.now() + ARTIFACT_LOCK_RETRY_LIMIT * ARTIFACT_LOCK_RETRY_DELAY_MS;
+    const observeOwner = createArtifactOwnerObserver(artifactDir, deadline, defaultIsProcessAlive, ownIdentity);
+    for (let attempt = 0; attempt < ARTIFACT_LOCK_RETRY_LIMIT && performance.now() < deadline; attempt += 1) {
         const ownerId = `${process.pid}-${randomUUID()}`;
         const candidatePath = join(artifactDir, `.artifact-store-lock-${ownerId}`);
         const candidateOwnerPath = join(candidatePath, ownerId);
         await fileSystem.mkdir(candidatePath, { mode: 0o700 });
         try {
-            await fileSystem.writeFile(candidateOwnerPath, '', { flag: 'wx', mode: 0o600 });
+            await fileSystem.writeFile(candidateOwnerPath, JSON.stringify({ version: 1, process: ownIdentity }), { flag: 'wx', mode: 0o600 });
             await fileSystem.rename(candidatePath, lockPath);
             const ownerPath = join(lockPath, ownerId);
             return async () => {
@@ -699,14 +791,20 @@ const acquireArtifactStoreLock = async (artifactDir, fileSystem = defaultFileSys
             };
         } catch (error) {
             await fileSystem.rm(candidatePath, { recursive: true, force: true });
-            if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes(error?.code)) throw error;
+            if (!['EEXIST', 'ENOTEMPTY', 'EPERM', 'EBUSY'].includes(error?.code)) throw error;
         }
         try {
             const lockMetadata = await fileSystem.stat(lockPath);
-            if (Date.now() - lockMetadata.mtimeMs > ARTIFACT_LOCK_STALE_MS) {
-                const ownerEntries = (await fileSystem.readdir(lockPath, { withFileTypes: true })).filter((entry) => entry.isFile());
-                const ownerPids = ownerEntries.map((entry) => lockOwnerPid(entry.name)).filter((pid) => pid !== null);
-                if (ownerPids.some((ownerPid) => defaultIsProcessAlive(ownerPid) !== false)) {
+            const ownerEntries = await fileSystem.readdir(lockPath, { withFileTypes: true });
+            const ownerStates = await Promise.all(ownerEntries.map(async entry => {
+                const pid = entry.isFile() ? lockOwnerPid(entry.name) : null;
+                if (pid === null) return null;
+                const record = await readOwnerRecord(join(lockPath, entry.name), fileSystem, true);
+                return observeOwner(pid, record === null ? null : record?.process);
+            }));
+            const knownDead = ownerStates.length > 0 && ownerStates.every(state => state === 'dead');
+            if (knownDead || Date.now() - lockMetadata.mtimeMs > ARTIFACT_LOCK_STALE_MS) {
+                if (ownerStates.some(state => state === 'alive' || state === 'unknown')) {
                     await delay(ARTIFACT_LOCK_RETRY_DELAY_MS);
                     continue;
                 }
@@ -716,20 +814,25 @@ const acquireArtifactStoreLock = async (artifactDir, fileSystem = defaultFileSys
                     currentMetadata.ino === lockMetadata.ino &&
                     currentMetadata.mtimeMs === lockMetadata.mtimeMs
                 ) {
-                    const stalePath = join(artifactDir, `.artifact-store-stale-lock-${process.pid}-${randomUUID()}`);
-                    await fileSystem.rename(lockPath, stalePath);
-                    await fileSystem.rm(stalePath, { recursive: true, force: true });
+                    // A successor can appear after stat. Its new marker must survive
+                    // cleanup of the names we inspected and block non-recursive removal.
+                    for (const entry of ownerEntries) await fileSystem.rm(join(lockPath, entry.name), { recursive: entry.isDirectory(), force: true });
+                    try { await fileSystem.rmdir(lockPath); }
+                    catch (error) { if (!['ENOENT', 'ENOTEMPTY', 'EEXIST', 'EPERM', 'EBUSY'].includes(error?.code)) throw error; }
                     continue;
                 }
             }
         } catch (error) {
-            if (error?.code !== 'ENOENT') throw error;
+            if (!['ENOENT', 'EPERM', 'EBUSY'].includes(error?.code)) throw error;
         }
         await delay(ARTIFACT_LOCK_RETRY_DELAY_MS);
     }
     throw new ArtifactStoreError('ARTIFACT_STORE_BUSY', 'Artifact storage is busy; retry the export');
 };
+const ownedLockReleases = createOwnedLockReleaseTracker();
 const withArtifactStoreLock = async (artifactDir, operation, fileSystem = defaultFileSystem) => {
+    const lockPath = join(artifactDir, '.artifact-store.lock');
+    await ownedLockReleases.retryPending(lockPath);
     const release = await acquireArtifactStoreLock(artifactDir, fileSystem);
     let operationError;
     try {
@@ -739,7 +842,7 @@ const withArtifactStoreLock = async (artifactDir, operation, fileSystem = defaul
         throw error;
     } finally {
         try {
-            await release();
+            await ownedLockReleases.release(lockPath, release);
         } catch (releaseError) {
             if (!operationError) throw releaseError;
         }
@@ -750,6 +853,8 @@ const removeArtifactPin = async (pinPath, fileSystem) => {
     for (let attempt = 1; attempt <= ARTIFACT_PIN_REMOVE_RETRY_LIMIT; attempt += 1) {
         try {
             await fileSystem.rm(pinPath, { force: true });
+            const match = ACTIVE_ARTIFACT_PIN_PATTERN.exec(basename(pinPath));
+            if (match) await removeOwnerSidecar(dirname(pinPath), match, fileSystem);
             return;
         } catch (error) {
             if (!TRANSIENT_ARTIFACT_PIN_REMOVE_ERRORS.has(error?.code) || attempt === ARTIFACT_PIN_REMOVE_RETRY_LIMIT) throw error;
@@ -798,6 +903,9 @@ export const releaseArtifactJob = async (
         }
         throw new Error('Cannot release artifact job while active artifact writers or cleanup remain');
     }
+    // A terminal release request survives I/O failure. Ordinary locked maintenance
+    // can finish its exact pins later without replaying the export or its response.
+    usage.deferredRelease = { scheduleDeferredRelease };
     try {
         for (const { artifactDir, fileSystem, pinPaths } of usage.pinGroups.values()) {
             await withArtifactStoreLock(
@@ -812,12 +920,34 @@ export const releaseArtifactJob = async (
         }
         throw error;
     }
-    jobUsage.delete(jobId);
+    if (jobUsage.get(jobId) === usage) jobUsage.delete(jobId);
     return true;
 };
 
+const releaseRequestedArtifactPinsUnlocked = async (artifactDir) => {
+    for (const [jobId, usage] of jobUsage) {
+        if (!usage.deferredRelease || usage.writers > 0 || usage.pendingCleanups > 0) continue;
+        const group = usage.pinGroups.get(artifactDir);
+        if (!group) continue;
+        // The caller holds this directory's mutex. Only a finished job's explicit
+        // release request permits removing its still-live PID's exact pin names.
+        try {
+            for (const pinPath of group.pinPaths) await removeArtifactPin(pinPath, group.fileSystem);
+        } catch {
+            // Ordinary pruning still honors any surviving pin. A pin or sidecar
+            // deletion fault must not reject an unrelated export with room.
+            console.error('ARTIFACT_PIN_RELEASE_PENDING: Requested pin cleanup remains pending.');
+            continue;
+        }
+        if (usage.pinGroups.get(artifactDir) === group) usage.pinGroups.delete(artifactDir);
+        if (usage.pinGroups.size === 0 && usage.writers === 0 && usage.pendingCleanups === 0 && jobUsage.get(jobId) === usage) {
+            jobUsage.delete(jobId);
+        }
+    }
+};
+
 const pruneArtifactsUnlocked = async ({
-    artifactDir = ARTIFACT_DIR,
+    artifactDir = undefined,
     now = Date.now(),
     retentionMs = ARTIFACT_RETENTION_MS,
     maxTotalBytes = ARTIFACT_MAX_TOTAL_BYTES,
@@ -833,18 +963,21 @@ const pruneArtifactsUnlocked = async ({
     await ensurePrivateDirectory(artifactDir, fs, platform);
     let entries;
     try {
+        await releaseRequestedArtifactPinsUnlocked(artifactDir);
         entries = await fs.readdir(artifactDir, { withFileTypes: true });
     } catch (error) {
         return [asError(error)];
     }
 
+    await cleanupOwnerMetadata(artifactDir, entries, fs);
+    const observeOwner = createArtifactOwnerObserver(artifactDir, performance.now() + 2000, isProcessAlive);
     for (const entry of entries) {
         if (!entry.isFile()) continue;
-        const ownerPid = artifactPinOwnerPid(entry.name);
-        if (ownerPid === null) continue;
+        const match = ACTIVE_ARTIFACT_PIN_PATTERN.exec(entry.name);
+        if (!match) continue;
         const pinPath = join(artifactDir, entry.name);
         try {
-            if ((await isProcessAlive(ownerPid)) === false) {
+            if (await observeOwner(Number(match[1]), await readArtifactOwner(artifactDir, match, fs)) === 'dead') {
                 await fs.rm(pinPath, { force: true });
                 continue;
             }
@@ -870,8 +1003,8 @@ const pruneArtifactsUnlocked = async ({
                 const metadata = await fs.stat(path);
                 let removed = false;
                 if (!protectedPaths.has(path) && !activePartPaths.has(path) && now - metadata.mtimeMs > retentionMs) {
-                    const ownerPid = partOwnerPid(entry.name);
-                    if (ownerPid !== null && (await isProcessAlive(ownerPid)) === false) {
+                    const match = ACTIVE_PART_PATTERN.exec(entry.name);
+                    if (match && await observeOwner(Number(match[1]), await readArtifactOwner(artifactDir, match, fs)) === 'dead') {
                         await fs.rm(path, { force: true });
                         removed = true;
                     }
@@ -912,15 +1045,30 @@ const pruneArtifactsUnlocked = async ({
             errors.push(asError(error));
         }
     }
+    await cleanupOwnerMetadata(artifactDir, entries, fs);
     return errors;
 };
 
 export const pruneArtifacts = async (options = {}) => {
-    const artifactDir = options.artifactDir ?? ARTIFACT_DIR;
+    const artifactDir = options.artifactDir ?? requireStorageTarget(options.storageTarget ?? ARTIFACT_STORAGE, 'marketplaceArtifacts');
     const fs = { ...defaultFileSystem, ...(options.fileSystem ?? {}) };
     const platform = options.platform ?? process.platform;
     await ensurePrivateDirectory(artifactDir, fs, platform);
-    return withArtifactStoreLock(artifactDir, () => pruneArtifactsUnlocked(options), fs);
+    return withArtifactStoreLock(artifactDir, () => pruneArtifactsUnlocked({ ...options, artifactDir }), fs);
+};
+
+export const pruneLegacyArtifacts = async (options = {}) => {
+    const artifactDir = options.artifactDir ?? LEGACY_ARTIFACT_DIR;
+    const fs = { ...defaultFileSystem, ...(options.fileSystem ?? {}) };
+    try {
+        // The admission probe and subsequent cleanup must observe the same filesystem adapter.
+        const metadata = await fs.lstat(artifactDir);
+        if (!metadata.isDirectory() || metadata.isSymbolicLink()) return [new Error('Legacy artifact directory is invalid')];
+    } catch (error) {
+        if (error?.code === 'ENOENT') return [];
+        return [asError(error)];
+    }
+    return pruneArtifacts({ ...options, artifactDir });
 };
 
 const artifactTotalBytes = async (artifactDir, fs) => {
@@ -941,6 +1089,7 @@ const artifactCompletedFileCount = async (artifactDir, fs) =>
  *     fileName?: string,
  *     mimeType?: string,
  *     artifactDir?: string,
+ *     storageTarget?: { state: string, path?: string, reason?: string },
  *     maxChunkBytes?: number,
  *     maxFileBytes?: number,
  *     maxJobBytes?: number,
@@ -959,7 +1108,7 @@ export const createArtifactWriter = async (options = {}) => {
         jobId,
         fileName,
         mimeType,
-        artifactDir = ARTIFACT_DIR,
+        artifactDir: configuredArtifactDir,
         maxChunkBytes = ARTIFACT_MAX_CHUNK_BYTES,
         maxFileBytes = ARTIFACT_MAX_FILE_BYTES,
         maxJobBytes = ARTIFACT_MAX_JOB_BYTES,
@@ -972,6 +1121,7 @@ export const createArtifactWriter = async (options = {}) => {
         fileSystem = {},
         platform = process.platform,
     } = options;
+    const artifactDir = configuredArtifactDir ?? requireStorageTarget(options.storageTarget ?? ARTIFACT_STORAGE, 'marketplaceArtifacts');
     if (typeof jobId !== 'string' || jobId.length === 0) throw new Error('Artifact job ID is required');
     if (typeof mimeType !== 'string' || mimeType.length === 0) throw new Error('Artifact MIME type is required');
     validateLimits({ maxChunkBytes, maxFileBytes, maxJobBytes, maxTotalBytes, maxFiles, retentionMs });
@@ -995,8 +1145,14 @@ export const createArtifactWriter = async (options = {}) => {
     const fs = { ...defaultFileSystem, ...fileSystem };
     const identity = randomUUID();
     const partialPath = join(artifactDir, `.active-${process.pid}-${identity}.part`);
-    const artifactPath = join(artifactDir, `${identity}-${name}`);
+    // MSIX adds a package prefix to the real Windows path. Keep that path short
+    // for external workbook viewers; the descriptive name remains in metadata.
+    const artifactPath = join(artifactDir, platform === 'win32' ? `${identity}.xlsx` : `${identity}-${name}`);
     const pinPath = join(artifactDir, `.active-artifact-${process.pid}-${identity}.pin`);
+    const pendingPinPath = `${pinPath}.pending`;
+    const ownerPath = ownerSidecarPath(artifactDir, process.pid, identity);
+    const pendingOwnerPath = `${ownerPath}.pending`;
+    const ownerContents = JSON.stringify({ version: 1, process: await getOwnProcessIdentity(), artifactName: basename(artifactPath) });
     try {
         assertNotAborted();
         await ensurePrivateDirectory(artifactDir, fs, platform);
@@ -1007,6 +1163,9 @@ export const createArtifactWriter = async (options = {}) => {
             assertNotAborted();
             if (pruneErrors.length > 0) throw new Error(`Unable to prune artifact storage: ${pruneErrors[0].message}`);
             assertNotAborted();
+            await fs.writeFile(pendingOwnerPath, ownerContents, { mode: 0o600, flag: 'wx' });
+            await fs.rename(pendingOwnerPath, ownerPath);
+            assertNotAborted();
             await fs.writeFile(partialPath, Buffer.alloc(0), { mode: 0o600, flag: 'wx' });
             assertNotAborted();
             await ensurePrivateFile(partialPath, fs, platform);
@@ -1015,13 +1174,34 @@ export const createArtifactWriter = async (options = {}) => {
         assertNotAborted();
     } catch (error) {
         aborted = true;
+        // Setup can still own a partial file before a writer object exists. Fast
+        // cancellation may already have requested job release, so transfer that
+        // ownership to cleanup before removing the writer reservation.
+        usage.pendingCleanups += 1;
         usage.writers -= 1;
         try {
-            await fs.rm(partialPath, { force: true });
+            // Reuse exact-owner recovery: exhausting a short sharing-violation
+            // batch must not abandon this partial or the job's release request.
+            await pendingSetupCleanups.release(partialPath, async () => {
+                try {
+                    await fs.rm(partialPath, { force: true });
+                    await fs.rm(pendingOwnerPath, { force: true });
+                    await fs.rm(ownerPath, { force: true });
+                }
+                catch (cleanupError) {
+                    // Also runs if a later background attempt reaches a permanent
+                    // failure. The tracker must not hide that safe diagnostic.
+                    if (!TRANSIENT_ARTIFACT_PIN_REMOVE_ERRORS.has(cleanupError?.code)) {
+                        console.error('ARTIFACT_CLEANUP_FAILED: Artifact writer setup cleanup remains pending.');
+                    }
+                    throw cleanupError;
+                }
+                usage.pendingCleanups -= 1;
+                resumeDeferredArtifactRelease(jobId, usage);
+            });
         } catch (cleanupError) {
             throw new AggregateError([asError(error), asError(cleanupError)], 'Artifact writer setup failed and cleanup failed');
         }
-        resumeDeferredArtifactRelease(jobId, usage);
         throw asError(error);
     }
     activePartPaths.add(partialPath);
@@ -1110,16 +1290,29 @@ export const createArtifactWriter = async (options = {}) => {
     const cleanupPaths = () => {
         if (cleanupPromise) return cleanupPromise;
         const attempt = (async () => {
-            await withArtifactStoreLock(artifactDir, async () => {
-                await fs.rm(partialPath, { force: true });
-                activePartPaths.delete(partialPath);
-                await fs.rm(artifactPath, { force: true });
-                payloadMayExist = false;
-                await fs.rm(pinPath, { force: true });
-                pinMayExist = false;
-            }, fs);
-            unregisterPin();
-            finishCleanup();
+            let pathsRemoved = false;
+            try {
+                await withArtifactStoreLock(artifactDir, async () => {
+                    await fs.rm(partialPath, { force: true });
+                    activePartPaths.delete(partialPath);
+                    await fs.rm(artifactPath, { force: true });
+                    payloadMayExist = false;
+                    await fs.rm(pendingPinPath, { force: true });
+                    await fs.rm(pinPath, { force: true });
+                    pinMayExist = false;
+                    await fs.rm(pendingOwnerPath, { force: true });
+                    await fs.rm(ownerPath, { force: true });
+                    pathsRemoved = true;
+                }, fs);
+            } finally {
+                // File cleanup has completed even if releasing the mutex fails.
+                // Its exact-owner tracker retains the lock; retaining this writer's
+                // ledger as well would strand it after that separate lock recovers.
+                if (pathsRemoved) {
+                    unregisterPin();
+                    finishCleanup();
+                }
+            }
         })();
         const observedAttempt = attempt.catch((error) => {
             if (cleanupPromise === observedAttempt) cleanupPromise = undefined;
@@ -1277,7 +1470,8 @@ export const createArtifactWriter = async (options = {}) => {
                         await ensurePrivateFile(artifactPath, fs, platform);
                         assertNotAborted();
                         pinMayExist = true;
-                        await fs.writeFile(pinPath, basename(artifactPath), { mode: 0o600, flag: 'wx' });
+                        await fs.writeFile(pendingPinPath, basename(artifactPath), { mode: 0o600, flag: 'wx' });
+                        await fs.rename(pendingPinPath, pinPath);
                         assertNotAborted();
                         await ensurePrivateFile(pinPath, fs, platform);
                         assertNotAborted();
@@ -1304,7 +1498,12 @@ export const createArtifactWriter = async (options = {}) => {
                         }
                     }, fs);
                     assertNotAborted();
-                    const artifact = { name, path: artifactPath, uri: pathToFileURL(artifactPath).href, mimeType, size: byteCount, sha256 };
+                    // The logical AppData path can exist only in the producer's
+                    // MSIX view. External Excel needs the finalized physical path;
+                    // pins and cleanup still own the original logical path.
+                    const deliveredPath = platform === 'win32' ? await fs.realpath(artifactPath) : artifactPath;
+                    assertNotAborted();
+                    const artifact = { name, path: deliveredPath, uri: pathToFileURL(deliveredPath).href, mimeType, size: byteCount, sha256 };
                     assertNotAborted();
                     registerPin();
                     assertNotAborted();

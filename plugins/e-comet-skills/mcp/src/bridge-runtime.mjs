@@ -10,6 +10,8 @@ import {
     HANDOFF_DRAIN_POLL_MS,
     HANDOFF_MAX_DRAIN_MS,
     HANDOFF_RECONNECT_GRACE_MS,
+    MAX_FRAME_BYTES,
+    MAX_ACTIVE_AUTHORIZATION_SCOPES,
     PEER_HANDSHAKE_TIMEOUT_MS,
     PEER_RECONNECT_BASE_MS,
     PEER_RECONNECT_MAX_MS,
@@ -45,6 +47,9 @@ export const createBridgeRuntime = ({
     peerHandshakeTimeoutMs = PEER_HANDSHAKE_TIMEOUT_MS,
     inboundPeerResolutionTimeoutMs = 1000,
     inboundPeerHandshakeTimeoutMs = 5000,
+    // Constructor seams let receive-window tests exercise overflow without allocating 64 MiB.
+    extensionReceiveWindowBytes = MAX_FRAME_BYTES * 2,
+    extensionReceiveWindowMessages = MAX_ACTIVE_AUTHORIZATION_SCOPES * 8 + 16,
 }) => {
     const acceptedPeerStates = new Set();
     const connectionStates = new Set();
@@ -200,6 +205,7 @@ export const createBridgeRuntime = ({
     const closeConnectionState = (state, { destroySocket = true } = {}) => {
         if (state.closed) return;
         state.closed = true;
+        state.applicationWindowWaiter?.();
         clearInterval(state.heartbeatTimer);
         acceptedPeerStates.delete(state);
         connectionStates.delete(state);
@@ -312,6 +318,8 @@ export const createBridgeRuntime = ({
             heartbeatResumeGraceUntil: 0,
             grantHeartbeatResumeGrace: false,
             processingApplicationMessage: false,
+            inFlightApplicationMessages: 0,
+            inFlightApplicationBytes: 0,
             heartbeatTimer: null,
             closed: false,
         });
@@ -359,6 +367,40 @@ export const createBridgeRuntime = ({
         }, WS_HEARTBEAT_INTERVAL_MS);
         state.heartbeatTimer.unref();
 
+        const dispatchAuthenticatedExtensionMessage = async (message) => {
+            const bytes = Buffer.byteLength(message);
+            if (bytes > extensionReceiveWindowBytes) throw new Error('Extension message exceeds the receive window');
+            // Ozon uses ACKs, while WB Seller streams rely on TCP backpressure.
+            // Bound queued work without disconnecting a valid slower WB stream.
+            // At most this one already-decoded frame waits outside the window.
+            while (!state.closed && (state.inFlightApplicationMessages >= extensionReceiveWindowMessages ||
+                state.inFlightApplicationBytes + bytes > extensionReceiveWindowBytes)) {
+                await new Promise(resolve => { state.applicationWindowWaiter = resolve; });
+            }
+            if (state.closed) return;
+            state.inFlightApplicationMessages += 1;
+            state.inFlightApplicationBytes += bytes;
+            const finish = () => {
+                state.inFlightApplicationMessages -= 1;
+                state.inFlightApplicationBytes -= bytes;
+                const wake = state.applicationWindowWaiter;
+                state.applicationWindowWaiter = undefined;
+                wake?.();
+            };
+            // The protocol and broker synchronously admit each frame and serialize
+            // its owner's private work. Awaiting it here would stall unrelated owners.
+            void Promise.resolve(extensionProtocol.handleMessage(state, message)).then(
+                async (effect) => {
+                    finish();
+                    if (!state.closed && effect?.type === 'handoff_requested') await beginHandoff(effect);
+                },
+                (error) => { finish(); throw error; }
+            ).catch((error) => {
+                log('WebSocket message handling failed:', error.message);
+                closeConnectionState(state);
+            });
+        };
+
         socket.on('data', (chunk) => {
             if (state.path === peerPath) {
                 try {
@@ -401,8 +443,15 @@ export const createBridgeRuntime = ({
                         );
                         nextChunk = Buffer.alloc(0);
                         if (!handled || !message || state.closed) break;
-                        const effect = await extensionProtocol.handleMessage(state, message);
-                        if (effect?.type === 'handoff_requested') await beginHandoff(effect);
+                        if (state.extensionHandshakeComplete) {
+                            await dispatchAuthenticatedExtensionMessage(message);
+                            // Let synchronously completed replies release their receive-window
+                            // accounting before parsing another coalesced frame.
+                            await Promise.resolve();
+                        } else {
+                            const effect = await extensionProtocol.handleMessage(state, message);
+                            if (effect?.type === 'handoff_requested') await beginHandoff(effect);
+                        }
                     } catch (error) {
                         log('WebSocket protocol error:', error.message);
                         closeConnectionState(state);
@@ -555,7 +604,10 @@ export const createBridgeRuntime = ({
                         : PEER_REJECTION_CODES.tokenUnavailable;
                 connections.recordPeerRejection(rejectionCode);
                 const retry = connections.nextPeerReconnectDelay({ baseMs: PEER_RECONNECT_BASE_MS, maxMs: PEER_RECONNECT_MAX_MS });
-                scheduleBridgeStart(retry.delayMs, connectToPrimaryBridge);
+                // The incumbent may exit while pairing access is unavailable.
+                // Retry bind-first: our own listener does not require a peer token.
+                // Deliberate peer-only handoff schedules elsewhere remain intact.
+                scheduleBridgeStart(retry.delayMs);
                 return;
             }
             resolvedPeerToken = tokenResult.token;
@@ -702,6 +754,12 @@ export const createBridgeRuntime = ({
             // peer_status нет, и его отсутствие здесь честнее выдуманного false.
             ...(connections.effectiveOzonPromotionSupportKnown
                 ? { ozonSellerPromotionReportSupported: connections.effectiveOzonPromotionReady === true }
+                : {}),
+            ...(connections.effectiveOzonPromotionPackageSupportKnown
+                ? { ozonSellerPromotionReportsSupported: connections.effectiveOzonPromotionPackageReady === true }
+                : {}),
+            ...(connections.effectiveOzonAnalyticsSupportKnown
+                ? { ozonSellerAnalyticsReportSupported: connections.effectiveOzonAnalyticsReady === true }
                 : {}),
             ...(connections.peerReady && connections.authenticatedPrimaryMetadata
                 ? { peer: connections.authenticatedPrimaryMetadata }

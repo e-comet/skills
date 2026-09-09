@@ -1,7 +1,11 @@
 import { validateAuthorizedJobLimits } from './browser-job.mjs';
 import { assertOzonPromotionPeriodEqual, ozonPromotionArtifactName } from './ozon-promotion-domain.mjs';
+import { parsePromotionPeriods } from './ozon-report-package-domain.mjs';
+import { executeOzonReportPackage } from './ozon-report-package-job.mjs';
+import { SELLER_AUTHORIZATION_SCOPE_MAX_MS } from './config.mjs';
 import { OZON_PROMOTION_OPERATION_MAX_MS } from './request-broker.mjs';
 import { safeOzonPromotionToolError, ToolExecutionError } from './tool-errors.mjs';
+import { StorageUnavailableError } from './storage-layout.mjs';
 
 const XLSX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const SIGNED_EXPIRY_SAFETY_RESERVE_MS = 1000;
@@ -122,7 +126,54 @@ export const executeOzonPromotionJob = async ({
                 throw artifactRejected(new AggregateError([error, cleanupError], 'Ozon artifact cleanup failed'));
             }
         }
-        if (error instanceof ToolExecutionError) throw error;
+        if (error instanceof ToolExecutionError || error instanceof StorageUnavailableError) throw error;
         throw artifactRejected(error);
     }
+};
+
+export const executeOzonPromotionPackageJob = async ({
+    authorization,
+    periods,
+    requestOzonReportPackage,
+    createArtifactWriter,
+    artifactJobId = authorization?.job?.jobId,
+    now = Date.now,
+}) => {
+    try {
+        validateAuthorizedJobLimits(authorization);
+        if (authorization.jobType !== 'ozon_seller_promotion_reports') throw new Error('Wrong Ozon promotion package job type');
+        const requested = parsePromotionPeriods(periods);
+        const signed = parsePromotionPeriods(authorization.job?.periods);
+        if (JSON.stringify(requested) !== JSON.stringify(signed)) throw new Error('Signed Ozon promotion periods do not match');
+        if (typeof requestOzonReportPackage !== 'function' || typeof createArtifactWriter !== 'function') {
+            throw new Error('Ozon promotion package execution dependencies are unavailable');
+        }
+    } catch (error) {
+        throw authorizationRejected(error);
+    }
+    const startedAt = now();
+    const signedDeadline =
+        typeof authorization?.expiresAt === 'number' && Number.isFinite(authorization.expiresAt)
+            ? Math.floor(authorization.expiresAt * 1000 - SIGNED_EXPIRY_SAFETY_RESERVE_MS)
+            : Infinity;
+    const packageDeadline = Math.min(startedAt + SELLER_AUTHORIZATION_SCOPE_MAX_MS, signedDeadline);
+    return executeOzonReportPackage({
+        family: 'promotion',
+        jobType: 'ozon_seller_promotion_reports',
+        items: periods,
+        artifactJobId,
+        packageDeadline,
+        requestOzonReportPackage,
+        createArtifactWriter,
+        artifactName: ({ dateFrom, dateTo }) => ozonPromotionArtifactName(dateFrom, dateTo),
+        normalizeError: (error) => {
+            if (error instanceof StorageUnavailableError) {
+                return { code: error.code, message: error.message, stage: error.stage, retryable: false };
+            }
+            const safe = safeOzonPromotionToolError(error);
+            return { code: safe.code, message: safe.message, stage: safe.stage, retryable: false,
+                ...(safe.code === 'OZON_EXECUTION_INTERRUPTED' && safe.details ? { details: safe.details } : {}) };
+        },
+        now,
+    });
 };

@@ -27,7 +27,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:wb_product_card|wb_search_by_query|wb_check_by_query|wb_recommendations_by_product|wb_seller_reviews|ozon_seller_promotion_report)$",
+        "matcher": "^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:wb_product_card|wb_search_by_query|wb_check_by_query|wb_recommendations_by_product|wb_seller_reviews|ozon_seller_promotion_report|ozon_seller_promotion_reports|ozon_seller_analytics_report)$",
         "hooks": [
           {
             "type": "command",
@@ -38,7 +38,7 @@
         ]
       },
       {
-        "matcher": "^mcp__(?:(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet(?:[-_]local)?__.+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}__(?:info|describe_metrics|list_entities|query_metrics|query_forecast|browser_job|report_issue))$",
+        "matcher": "^mcp__(?:(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet(?:[-_]local)?__(?:local_bridge_status|wb_product_card|wb_search_by_query|wb_check_by_query|wb_recommendations_by_product|wb_seller_reviews|wb_product_images|ozon_seller_promotion_report|ozon_seller_promotion_reports|ozon_seller_analytics_report|info|describe_metrics|list_entities|query_metrics|query_forecast|browser_job|org_balance|query_phrase_frequency|campaign_settings|campaign_clusters_settings|campaign_target_products_settings)|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}__(?:info|describe_metrics|list_entities|query_metrics|query_forecast|browser_job|org_balance|query_phrase_frequency|campaign_settings|campaign_clusters_settings|campaign_target_products_settings))$",
         "hooks": [
           {
             "type": "command",

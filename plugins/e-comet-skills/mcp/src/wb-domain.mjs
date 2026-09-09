@@ -151,26 +151,36 @@ export const imageBaseUrl = (nmId, basket) => {
 const imageRequestSignal = (timeout, shutdownSignal) =>
     shutdownSignal ? AbortSignal.any([AbortSignal.timeout(timeout), shutdownSignal]) : AbortSignal.timeout(timeout);
 
+export class ImageProbeError extends Error {
+    constructor(code, message) { super(message); this.code = code; }
+}
+
 export const imageExists = async (url, timeout, shutdownSignal) => {
-    try {
-        const response = await fetch(url, { method: 'HEAD', signal: imageRequestSignal(timeout, shutdownSignal) });
+    const classify = (response) => {
         if (response.ok) return true;
-        if (response.status !== 403 && response.status !== 405) return false;
-    } catch {
-        // Some CDN edges do not support HEAD; retry with a one-byte GET.
-    }
+        if (response.status === 404 || response.status === 410) return false;
+        throw new ImageProbeError(response.status === 429 ? 'WB_IMAGE_RATE_LIMITED' : 'WB_IMAGE_PROBE_FAILED',
+            response.status === 429 ? 'Wildberries image service limited requests; no further probes were started.'
+                : 'The image service could not confirm whether this image exists.');
+    };
     try {
-        const response = await fetch(url, {
+        shutdownSignal?.throwIfAborted();
+        const response = await fetch(url, { method: 'HEAD', signal: imageRequestSignal(timeout, shutdownSignal) });
+        if (response.status !== 403 && response.status !== 405) return classify(response);
+        // Only observed HEAD incompatibility permits GET, never timeout or throttling.
+        shutdownSignal?.throwIfAborted();
+        const fallback = await fetch(url, {
             headers: { Range: 'bytes=0-0' },
             signal: imageRequestSignal(timeout, shutdownSignal),
         });
         try {
-            return response.ok || response.status === 206;
+            return classify(fallback);
         } finally {
-            await response.body?.cancel?.().catch(() => undefined);
+            await fallback.body?.cancel?.().catch(() => undefined);
         }
-    } catch {
-        return false;
+    } catch (error) {
+        if (error instanceof ImageProbeError) throw error;
+        throw new ImageProbeError('WB_IMAGE_PROBE_FAILED', 'The image probe did not complete; image absence is not established.');
     }
 };
 
@@ -184,19 +194,25 @@ export const discoverImageBasket = async (nmId, maxBasket, size, timeout, probe 
         : firstFutureBasket <= maxBasket
           ? [...allBaskets.filter((basket) => basket >= firstFutureBasket), ...allBaskets.filter((basket) => basket < firstFutureBasket)]
           : allBaskets;
+    let probeFailure;
     for (let index = 0; index < candidates.length; index += IMAGE_CONCURRENCY) {
         const batch = candidates.slice(index, index + IMAGE_CONCURRENCY);
-        const matches = await Promise.all(
+        const matches = await Promise.allSettled(
             batch.map(async (basket) => {
                 const baseUrl = imageBaseUrl(nmId, basket);
                 return (await probe(`${baseUrl}/${size}/1.webp`, timeout)) ? { basket, baseUrl } : null;
             })
         );
-        const match = matches.find(Boolean);
-        if (match) {
-            return match;
-        }
+        const match = matches.find(result => result.status === 'fulfilled' && result.value);
+        if (match?.status === 'fulfilled') return match.value;
+        const limited = matches.find(result => result.status === 'rejected' && result.reason?.code === 'WB_IMAGE_RATE_LIMITED');
+        if (limited?.status === 'rejected') throw limited.reason;
+        const failure = matches.find(result => result.status === 'rejected');
+        if (failure?.status === 'rejected') probeFailure ??= failure.reason;
     }
+    // Other baskets may still contain a confirmed match after an unavailable edge.
+    // If none does, an unverified candidate prevents claiming definitive absence.
+    if (probeFailure) throw probeFailure;
     return null;
 };
 

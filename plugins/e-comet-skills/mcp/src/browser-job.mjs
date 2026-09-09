@@ -28,8 +28,10 @@ import {
     REQUEST_TIMEOUT_MS,
     SEARCH_CONCURRENCY,
 } from './config.mjs';
-import { SELLER_OPERATION_STAGES } from './extension-vocabulary.mjs';
+import { FETCH_ERROR_CODES, SELLER_OPERATION_STAGES } from './extension-vocabulary.mjs';
+import { parseAnalyticsReports } from './ozon-analytics-domain.mjs';
 import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
+import { parsePromotionPeriods } from './ozon-report-package-domain.mjs';
 import { ToolExecutionError } from './tool-errors.mjs';
 import {
     isSuccessfulWbResponse,
@@ -127,6 +129,20 @@ const sellerExportIdentity = (sellerExport) =>
 // параллелизма задание резолвилось как обычный «провал» без признака retryable, и
 // агент не понимал, что достаточно повторить.
 const ABORTING_STAGES = new Set(['authorization', 'extension']);
+const WB_ITEM_ERROR_CODES = Object.freeze([...Object.values(FETCH_ERROR_CODES), 'WB_FETCH_FAILED', 'WB_RATE_LIMITED', 'WB_REQUEST_FAILED']);
+const skippedBuyerErrors = new WeakSet();
+const buyerErrorFields = (error) => ({
+    error: error.message,
+    errorDetails: {
+        code: error instanceof ToolExecutionError && WB_ITEM_ERROR_CODES.includes(error.code) ? error.code : 'WB_REQUEST_FAILED',
+        stage: 'execution',
+        retryable: error instanceof ToolExecutionError ? error.retryable : false,
+    },
+    ...(skippedBuyerErrors.has(error) ? { skipped: true } : {}),
+});
+const buyerResponseErrorFields = (response) => response?.data?.status === 429
+    ? buyerErrorFields(new ToolExecutionError('WB_RATE_LIMITED', 'Wildberries rate limited this job. No additional work was scheduled after this response.', 'execution', false))
+    : {};
 const rethrowAuthorizationError = (error) => {
     if (error instanceof ToolExecutionError && ABORTING_STAGES.has(error.stage)) {
         throw error;
@@ -307,6 +323,32 @@ export const validateAuthorizedJobLimits = (authorization) => {
             return;
         }
 
+        if (authorization.jobType === 'ozon_seller_promotion_reports') {
+            const keys = Object.keys(job);
+            if (
+                keys.length !== 3 ||
+                !keys.every((key) => ['jobId', 'type', 'periods'].includes(key)) ||
+                job.type !== 'ozon-seller-promotion-reports'
+            ) {
+                throw new Error('Invalid Ozon promotion package descriptor');
+            }
+            parsePromotionPeriods(job.periods);
+            return;
+        }
+
+        if (authorization.jobType === 'ozon_seller_analytics_report') {
+            const keys = Object.keys(job);
+            if (
+                keys.length !== 3 ||
+                !keys.every((key) => ['jobId', 'type', 'reports'].includes(key)) ||
+                job.type !== 'ozon-seller-analytics-report'
+            ) {
+                throw new Error('Invalid Ozon analytics descriptor');
+            }
+            parseAnalyticsReports(job.reports, authorization.issuedAt);
+            return;
+        }
+
         throw new Error(`Unsupported browser_job type: ${authorization.jobType}`);
     } catch (error) {
         if (error instanceof ToolExecutionError) throw error;
@@ -415,10 +457,11 @@ const executeSearchJob = async ({ authorizationId, job, requestWbFetch, writer, 
     const fetched = await runWithConcurrency(units, SEARCH_CONCURRENCY, async (unit) => {
         try {
             const response = await requestWbFetch(unit.url, job.timeout ?? REQUEST_TIMEOUT_MS, authorizationId);
-            await writer.append({ jobId: job.jobId, ...unit, response });
+            await writer.append({ jobId: job.jobId, ...unit, response, ...buyerResponseErrorFields(response) });
             return {
                 ...unit,
                 response,
+                ...buyerResponseErrorFields(response),
                 ok: isSuccessfulWbResponse(response) && Array.isArray(response?.data?.body?.products),
             };
         } catch (error) {
@@ -426,9 +469,9 @@ const executeSearchJob = async ({ authorizationId, job, requestWbFetch, writer, 
             await writer.append({
                 jobId: job.jobId,
                 ...unit,
-                error: error.message,
+                ...buyerErrorFields(error),
             });
-            return { ...unit, ok: false, error: error.message };
+            return { ...unit, ok: false, ...buyerErrorFields(error) };
         }
     });
 
@@ -464,6 +507,7 @@ const executeSearchJob = async ({ authorizationId, job, requestWbFetch, writer, 
                     products: selected,
                 };
                 if (!unit.ok) {
+                    Object.assign(page, unit.errorDetails ? { errorDetails: unit.errorDetails } : {}, unit.skipped ? { skipped: true } : {});
                     page.error = unit.error || unit.response?.error || unit.response?.data?.statusText || 'WB search request failed';
                 }
                 if (!unit.ok) globalPositionsReliable = false;
@@ -502,7 +546,7 @@ const executeCheckByQueryJob = async ({ authorizationId, job, requestWbFetch, wr
         await writer.append({ jobId: job.jobId, kind: 'card', product_id: productId, url: job.cardUrl, response: cardResponse });
     } catch (error) {
         rethrowAuthorizationError(error);
-        await writer.append({ jobId: job.jobId, kind: 'card', product_id: productId, url: job.cardUrl, error: error.message });
+        await writer.append({ jobId: job.jobId, kind: 'card', product_id: productId, url: job.cardUrl, ...buyerErrorFields(error) });
         return {
             ok: false,
             status: 'failed',
@@ -514,7 +558,7 @@ const executeCheckByQueryJob = async ({ authorizationId, job, requestWbFetch, wr
                 found: false,
                 pagesChecked: 0,
                 completionReason: 'card_failed',
-                error: error.message,
+                ...buyerErrorFields(error),
             })),
         };
     }
@@ -543,6 +587,7 @@ const executeCheckByQueryJob = async ({ authorizationId, job, requestWbFetch, wr
                 pagesChecked: 0,
                 completionReason: 'card_failed',
                 error,
+                ...buyerResponseErrorFields(cardResponse),
             })),
         };
     }
@@ -559,13 +604,14 @@ const executeCheckByQueryJob = async ({ authorizationId, job, requestWbFetch, wr
                 await writer.append({ jobId: job.jobId, kind: 'search', query, page, url, response });
             } catch (error) {
                 rethrowAuthorizationError(error);
-                await writer.append({ jobId: job.jobId, kind: 'search', query, page, url, error: error.message });
+                if (skippedBuyerErrors.has(error)) searchRequestsMade -= 1;
+                await writer.append({ jobId: job.jobId, kind: 'search', query, page, url, ...buyerErrorFields(error) });
                 return {
                     query,
                     found: false,
                     pagesChecked: page - 1,
                     completionReason: 'request_failed',
-                    error: error.message,
+                    ...buyerErrorFields(error),
                 };
             }
             const body = response?.data?.body;
@@ -588,6 +634,7 @@ const executeCheckByQueryJob = async ({ authorizationId, job, requestWbFetch, wr
                     found: false,
                     pagesChecked: page - 1,
                     completionReason: 'request_failed',
+                    ...buyerResponseErrorFields(response),
                     error: response?.error || response?.data?.statusText || 'WB search request failed',
                 };
             }
@@ -646,16 +693,16 @@ const executeProductCardJob = async ({ authorizationId, job, requestWbFetch, wri
     const fetched = await runWithConcurrency(units, PRODUCT_CARD_CONCURRENCY, async (unit) => {
         try {
             const response = await requestWbFetch(unit.url, job.timeout ?? REQUEST_TIMEOUT_MS, authorizationId);
-            await writer.append({ jobId: job.jobId, ...unit, response });
-            return { ...unit, response, ok: isSuccessfulWbResponse(response) };
+            await writer.append({ jobId: job.jobId, ...unit, response, ...buyerResponseErrorFields(response) });
+            return { ...unit, response, ...buyerResponseErrorFields(response), ok: isSuccessfulWbResponse(response) };
         } catch (error) {
             rethrowAuthorizationError(error);
             await writer.append({
                 jobId: job.jobId,
                 ...unit,
-                error: error.message,
+                ...buyerErrorFields(error),
             });
-            return { ...unit, ok: false, error: error.message };
+            return { ...unit, ok: false, ...buyerErrorFields(error) };
         }
     });
 
@@ -668,11 +715,14 @@ const executeProductCardJob = async ({ authorizationId, job, requestWbFetch, wri
         const content = compactCardBody(cardUnit?.response?.data?.body);
         return {
             ...detail,
+            complete: detail.ok && articleUnits.every((unit) => unit.ok),
             ...content,
             nmId: article.nm,
             content,
             units: articleUnits.map((unit) => ({
                 key: unit.key,
+                ...(unit.errorDetails ? { errorDetails: unit.errorDetails } : {}),
+                ...(unit.skipped ? { skipped: true } : {}),
                 ok: unit.ok,
                 httpStatus: unit.response?.data?.status,
                 error: unit.error || unit.response?.error || unit.response?.data?.statusText,
@@ -682,7 +732,7 @@ const executeProductCardJob = async ({ authorizationId, job, requestWbFetch, wri
     const succeeded = products.filter((product) => product.ok).length;
     return {
         ok: succeeded > 0,
-        status: normalizeStatus(succeeded, products.length),
+        status: succeeded > 0 && products.some((product) => !product.complete) ? 'partial' : normalizeStatus(succeeded, products.length),
         total: products.length,
         succeeded,
         failed: products.length - succeeded,
@@ -698,11 +748,12 @@ const executeRecommendationsJob = async ({ authorizationId, job, requestWbFetch,
         const url = buildDescriptorUrl(job.endpoint, job.params, String(unit.nmId), unit.page);
         try {
             const response = await requestWbFetch(url, job.timeout ?? REQUEST_TIMEOUT_MS, authorizationId);
-            await writer.append({ jobId: job.jobId, ...unit, url, response });
+            await writer.append({ jobId: job.jobId, ...unit, url, response, ...buyerResponseErrorFields(response) });
             return {
                 ...unit,
                 url,
                 response,
+                ...buyerResponseErrorFields(response),
                 ok: isSuccessfulWbResponse(response) && Array.isArray(response?.data?.body?.products),
             };
         } catch (error) {
@@ -711,9 +762,9 @@ const executeRecommendationsJob = async ({ authorizationId, job, requestWbFetch,
                 jobId: job.jobId,
                 ...unit,
                 url,
-                error: error.message,
+                ...buyerErrorFields(error),
             });
-            return { ...unit, url, ok: false, error: error.message };
+            return { ...unit, url, ok: false, ...buyerErrorFields(error) };
         }
     };
 
@@ -773,6 +824,7 @@ const executeRecommendationsJob = async ({ authorizationId, job, requestWbFetch,
                 products: selected,
             };
             if (!unit.ok) {
+                Object.assign(page, unit.errorDetails ? { errorDetails: unit.errorDetails } : {}, unit.skipped ? { skipped: true } : {});
                 page.error = unit.error || unit.response?.error || unit.response?.data?.statusText || 'WB recommendation request failed';
             }
             if (!unit.ok) globalPositionsReliable = false;
@@ -876,7 +928,7 @@ const sellerError = (error, fallbackCode, fallbackMessage, stage = 'execution', 
         return { code: error.code, message: error.message, stage: error.stage, retryable: error.retryable };
     }
     const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/.test(error.code) ? error.code : fallbackCode;
-    return { code, message: fallbackMessage, stage: error?.stage || stage, retryable: error?.retryable === true || retryable };
+    return { code, message: fallbackMessage, stage: error?.stage || stage, retryable: typeof error?.retryable === 'boolean' ? error.retryable : retryable };
 };
 
 // A per-operation timeout is retryable by construction: the poll and download loops already own their
@@ -887,7 +939,9 @@ const sellerError = (error, fallbackCode, fallbackMessage, stage = 'execution', 
 const SELLER_RETRY_ONLY_CODES = new Set(['SELLER_OPERATION_TIMEOUT', 'WB_FETCH_TIMEOUT']);
 
 const abortsSellerPackage = (error) =>
-    SELLER_RETRY_ONLY_CODES.has(error?.code)
+    error?.stage === 'storage' && error?.retryable === false
+        ? true
+        : SELLER_RETRY_ONLY_CODES.has(error?.code)
         ? false
         : error instanceof ToolExecutionError
           ? error.stage === 'authorization' || error.stage === 'extension' || SELLER_ABORT_CODES.has(error.code)
@@ -983,7 +1037,10 @@ export const executeSellerReviewsJob = async ({
                 consecutiveExportFailures = 0;
                 return;
             }
-            if (entry.status !== 'failed' || !systemic) return;
+            if (entry.status !== 'failed' || !systemic) {
+                consecutiveExportFailures = 0;
+                return;
+            }
             consecutiveExportFailures += 1;
             if (consecutiveExportFailures >= maxConsecutiveExportFailures) packageAborted = true;
         };
@@ -1138,26 +1195,51 @@ export const executeSellerReviewsJob = async ({
                 if (attempt > 0 && deadlineExceeded()) break;
                 /** @type {{ appendChunk: (index: number, data: string) => Promise<void>, complete: (completion: { size: number, sha256: string }) => Promise<unknown>, abort: () => Promise<void> } | undefined} */
                 let writer;
+                // Ownership is per attempt: cancelling a later export must never invalidate an
+                // earlier accepted XLSX. A completion arriving after cancellation is fenced;
+                // an already accepted completion survives a later enclosing transport failure.
+                const writerController = new AbortController();
+                let activeHandlers = 0;
+                const withWriterOwnership = async (operation) => {
+                    activeHandlers += 1;
+                    try {
+                        writerController.signal.throwIfAborted();
+                        return await operation();
+                    } finally {
+                        activeHandlers -= 1;
+                    }
+                };
                 try {
                     await pacedRequestSellerOperation(
                         { exportIndex, isAnswered: sellerExport.isAnswered, stage: SELLER_OPERATION_STAGES.download, reportId },
                         {
-                            onStart: async () => {
+                            onStart: () => withWriterOwnership(async () => {
                                 if (writer) throw new Error('Seller artifact stream started more than once');
                                 writer = await createArtifactWriter({
                                     jobId: artifactExecutionId,
                                     fileName: sellerArtifactName(sellerExport),
                                     mimeType: SELLER_XLSX_MIME_TYPE,
+                                    signal: writerController.signal,
                                 });
-                            },
-                            onChunk: async (index, data) => {
+                                if (writerController.signal.aborted) {
+                                    try {
+                                        await writer.abort();
+                                    } catch {
+                                        console.error('ARTIFACT_CLEANUP_FAILED: Deferred WB workbook cleanup failed.');
+                                    }
+                                    writerController.signal.throwIfAborted();
+                                }
+                            }),
+                            onChunk: (index, data) => withWriterOwnership(async () => {
                                 if (!writer) throw new Error('Seller artifact stream chunk arrived before start');
                                 await writer.appendChunk(index, data);
-                            },
-                            onEnd: async ({ size, sha256 }) => {
+                            }),
+                            onEnd: ({ size, sha256 }) => withWriterOwnership(async () => {
                                 if (!writer) throw new Error('Seller artifact stream ended before start');
-                                artifact = await writer.complete({ size, sha256 });
-                            },
+                                const completed = await writer.complete({ size, sha256 });
+                                writerController.signal.throwIfAborted();
+                                artifact = completed;
+                            }),
                         },
                         downloadTimeoutMs
                     );
@@ -1165,6 +1247,18 @@ export const executeSellerReviewsJob = async ({
                     break;
                 } catch (error) {
                     downloadError = error;
+                    if (artifact) break;
+                    writerController.abort(error);
+                    if (activeHandlers > 0) {
+                        // The real writer marks cancellation synchronously and owns cleanup behind
+                        // its write chain. Keep that cleanup caught without holding the public result
+                        // hostage to a filesystem operation. Do not retry while old I/O is outstanding.
+                        if (writer) void writer.abort().catch(() => {
+                            console.error('ARTIFACT_CLEANUP_FAILED: Deferred WB workbook cleanup failed.');
+                        });
+                        packageAborted = true;
+                        break;
+                    }
                     if (writer) {
                         try {
                             await writer.abort();
@@ -1180,7 +1274,8 @@ export const executeSellerReviewsJob = async ({
                             break;
                         }
                     }
-                    if (artifact) break;
+                    // The same completed workbook cannot shrink on another download attempt.
+                    if (error instanceof ToolExecutionError && error.code === 'ARTIFACT_TOO_LARGE') break;
                     if (abortsSellerPackage(error)) {
                         packageAborted = true;
                         break;
@@ -1194,7 +1289,7 @@ export const executeSellerReviewsJob = async ({
                     ...result,
                     status: 'failed',
                     error: sellerError(downloadError, 'ARTIFACT_STORAGE_FAILED', 'The review workbook could not be stored locally.', 'storage', true),
-                });
+                }, { systemic: downloadError?.code !== 'ARTIFACT_TOO_LARGE' });
             }
         }
 
@@ -1215,7 +1310,7 @@ export const executeSellerReviewsJob = async ({
         // retain pins through authorization restoration and terminal response emission.
         if (typeof releaseArtifactJob === 'function' && typeof artifactExecutionId === 'string' && artifactExecutionId.length > 0) {
             try {
-                await releaseArtifactJob(artifactExecutionId);
+                await releaseArtifactJob(artifactExecutionId, { deferWhileActive: true });
             } catch (releaseError) {
                 if (!primaryError) throw releaseError;
             }
@@ -1231,6 +1326,19 @@ export const executeAuthorizedBrowserJob = async ({
     productNmIds,
 }) => {
     validateAuthorizedJobLimits(authorization);
+    const originalFetch = requestWbFetch;
+    let rateLimited = false;
+    requestWbFetch = async (...args) => {
+        if (rateLimited) {
+            const error = new ToolExecutionError('WB_RATE_LIMITED', 'Not requested because Wildberries rate limited this job.', 'execution', false);
+            skippedBuyerErrors.add(error);
+            throw error;
+        }
+        const response = await originalFetch(...args);
+        // Observe before writer I/O; in-flight requests may finish, but no new request is sent.
+        if (response?.data?.status === 429) rateLimited = true;
+        return response;
+    };
     const projection = { productLimitPerScope, productNmIds };
     let result;
     if (authorization.jobType === 'search_by_query') {
@@ -1268,6 +1376,7 @@ export const executeAuthorizedBrowserJob = async ({
     }
     return {
         ...result,
+        ...(rateLimited ? { stopReason: 'rate_limited' } : {}),
         jobType: authorization.jobType,
         jobId: authorization.job.jobId,
         expiresAt: authorization.expiresAt,

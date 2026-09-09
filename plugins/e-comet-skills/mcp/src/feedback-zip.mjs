@@ -1,20 +1,16 @@
-import { constants as zlibConstants, deflateRawSync } from 'node:zlib';
+import { constants as zlibConstants, deflateRaw } from 'node:zlib';
 
-import {
-    FEEDBACK_MAX_ARCHIVE_BYTES,
-    FEEDBACK_MAX_METADATA_BYTES,
-    FEEDBACK_MAX_REPORT_BYTES,
-    FEEDBACK_MAX_TOTAL_ENTRY_BYTES,
-    FEEDBACK_MAX_TRANSCRIPT_BYTES,
-} from './config.mjs';
+import { FEEDBACK_MAX_BYTES } from './config.mjs';
 
 const ZIP_UTF8_FLAG = 0x0800;
+const ZIP_STORE_METHOD = 0;
 const ZIP_DEFLATE_METHOD = 8;
 const ZIP_VERSION = 20;
 const ZIP_VERSION_MADE_BY_UNIX = 0x0314;
 const FIXED_DOS_TIME = 0;
 const FIXED_DOS_DATE = 0x0021;
 const REGULAR_FILE_ATTRIBUTES = 0x81a40000;
+const CRC_CHUNK_BYTES = 64 * 1024;
 const DEFLATE_OPTIONS = Object.freeze({
     level: 6,
     windowBits: 15,
@@ -29,24 +25,57 @@ for (let index = 0; index < CRC32_TABLE.length; index += 1) {
     CRC32_TABLE[index] = value >>> 0;
 }
 
-const crc32 = (bytes) => {
+const yieldToEventLoop = () => new Promise((resolve) => setImmediate(resolve));
+
+const crc32 = async (bytes) => {
     let value = 0xffffffff;
-    for (const byte of bytes) value = CRC32_TABLE[(value ^ byte) & 0xff] ^ (value >>> 8);
+    for (let offset = 0; offset < bytes.length; offset += CRC_CHUNK_BYTES) {
+        const end = Math.min(bytes.length, offset + CRC_CHUNK_BYTES);
+        for (let index = offset; index < end; index += 1) {
+            value = CRC32_TABLE[(value ^ bytes[index]) & 0xff] ^ (value >>> 8);
+        }
+        // WHY: a maximum-sized transcript must not monopolize the MCP transport loop while its CRC is computed.
+        if (end < bytes.length) await yieldToEventLoop();
+    }
     return (value ^ 0xffffffff) >>> 0;
 };
 
-const assertBytes = (value, name, maximum, { allowEmpty = true } = {}) => {
+const deflateRawAsync = (bytes) => new Promise((resolve, reject) => {
+    deflateRaw(bytes, DEFLATE_OPTIONS, (error, result) => {
+        if (error) reject(error);
+        else resolve(result);
+    });
+});
+
+// Narrow read-only seams keep the two independent event-loop guarantees directly testable.
+export const feedbackZipInternals = Object.freeze({
+    crc32,
+    deflateRaw: deflateRawAsync,
+});
+
+const assertBytes = (value, name, { allowEmpty = true } = {}) => {
     if (!Buffer.isBuffer(value)) throw new TypeError(`Feedback ${name} bytes must be a Buffer`);
     if (!allowEmpty && value.length === 0) throw new RangeError(`Feedback ${name} bytes must not be empty`);
-    if (value.length > maximum) throw new RangeError(`Feedback ${name} exceeds the ${maximum}-byte limit`);
 };
 
-const writeLocalHeader = ({ nameBytes, bytes, compressedBytes, crc }) => {
+const entryFramingBytes = (nameBytes) => 30 + nameBytes.length + 46 + nameBytes.length;
+const entryNames = (includeTranscript) => [
+    'report.md',
+    'metadata.json',
+    ...(includeTranscript ? ['transcript.jsonl'] : []),
+];
+
+export const feedbackZipFramingBytes = ({ includeTranscript = false } = {}) =>
+    entryNames(includeTranscript)
+        .map((name) => Buffer.from(name, 'utf8'))
+        .reduce((total, nameBytes) => total + entryFramingBytes(nameBytes), 22);
+
+const writeLocalHeader = ({ nameBytes, bytes, compressedBytes, method, crc }) => {
     const header = Buffer.alloc(30);
     header.writeUInt32LE(0x04034b50, 0);
     header.writeUInt16LE(ZIP_VERSION, 4);
     header.writeUInt16LE(ZIP_UTF8_FLAG, 6);
-    header.writeUInt16LE(ZIP_DEFLATE_METHOD, 8);
+    header.writeUInt16LE(method, 8);
     header.writeUInt16LE(FIXED_DOS_TIME, 10);
     header.writeUInt16LE(FIXED_DOS_DATE, 12);
     header.writeUInt32LE(crc, 14);
@@ -57,13 +86,13 @@ const writeLocalHeader = ({ nameBytes, bytes, compressedBytes, crc }) => {
     return header;
 };
 
-const writeCentralHeader = ({ nameBytes, bytes, compressedBytes, crc, localOffset }) => {
+const writeCentralHeader = ({ nameBytes, bytes, compressedBytes, method, crc, localOffset }) => {
     const header = Buffer.alloc(46);
     header.writeUInt32LE(0x02014b50, 0);
     header.writeUInt16LE(ZIP_VERSION_MADE_BY_UNIX, 4);
     header.writeUInt16LE(ZIP_VERSION, 6);
     header.writeUInt16LE(ZIP_UTF8_FLAG, 8);
-    header.writeUInt16LE(ZIP_DEFLATE_METHOD, 10);
+    header.writeUInt16LE(method, 10);
     header.writeUInt16LE(FIXED_DOS_TIME, 12);
     header.writeUInt16LE(FIXED_DOS_DATE, 14);
     header.writeUInt32LE(crc, 16);
@@ -79,42 +108,49 @@ const writeCentralHeader = ({ nameBytes, bytes, compressedBytes, crc, localOffse
     return header;
 };
 
-/** @param {{ reportBytes?: Buffer, metadataBytes?: Buffer, transcriptBytes?: Buffer }} input */
-export const createFeedbackZip = ({ reportBytes, metadataBytes, transcriptBytes } = {}) => {
-    assertBytes(reportBytes, 'report', FEEDBACK_MAX_REPORT_BYTES, { allowEmpty: false });
-    assertBytes(metadataBytes, 'metadata', FEEDBACK_MAX_METADATA_BYTES, { allowEmpty: false });
-    if (transcriptBytes !== undefined) assertBytes(transcriptBytes, 'transcript', FEEDBACK_MAX_TRANSCRIPT_BYTES);
+/** @param {{ reportBytes?: Buffer, metadataBytes?: Buffer, transcriptBytes?: Buffer }} input @param {{ maxBytes?: number }} options */
+export const createFeedbackZip = async ({ reportBytes, metadataBytes, transcriptBytes } = {}, options = {}) => {
+    const { maxBytes = FEEDBACK_MAX_BYTES } = options;
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new RangeError('Feedback package byte limit must be a positive safe integer');
+    assertBytes(reportBytes, 'report', { allowEmpty: false });
+    assertBytes(metadataBytes, 'metadata', { allowEmpty: false });
+    if (transcriptBytes !== undefined) assertBytes(transcriptBytes, 'transcript');
     const entries = [
         { name: 'report.md', bytes: reportBytes },
         { name: 'metadata.json', bytes: metadataBytes },
         ...(transcriptBytes === undefined ? [] : [{ name: 'transcript.jsonl', bytes: transcriptBytes }]),
     ];
+    const framingBytes = feedbackZipFramingBytes({ includeTranscript: transcriptBytes !== undefined });
     const totalEntryBytes = entries.reduce((total, entry) => total + entry.bytes.length, 0);
-    if (totalEntryBytes > FEEDBACK_MAX_TOTAL_ENTRY_BYTES) {
-        throw new RangeError(`Feedback combined entries exceed the ${FEEDBACK_MAX_TOTAL_ENTRY_BYTES}-byte limit`);
+    if (totalEntryBytes + framingBytes > maxBytes) {
+        throw new RangeError(`Feedback combined entries and ZIP framing exceed the ${maxBytes}-byte package limit`);
     }
 
-    const preparedEntries = entries.map((entry) => ({
-        ...entry,
-        nameBytes: Buffer.from(entry.name, 'utf8'),
-        compressedBytes: deflateRawSync(entry.bytes, DEFLATE_OPTIONS),
-    }));
-    const localBytes = preparedEntries.reduce((total, entry) => total + 30 + entry.nameBytes.length + entry.compressedBytes.length, 0);
-    const centralBytes = preparedEntries.reduce((total, entry) => total + 46 + entry.nameBytes.length, 0);
-    if (localBytes + centralBytes + 22 > FEEDBACK_MAX_ARCHIVE_BYTES) {
-        throw Object.assign(new RangeError(`Feedback archive exceeds the ${FEEDBACK_MAX_ARCHIVE_BYTES}-byte limit`), {
-            code: 'FEEDBACK_ARCHIVE_TOO_LARGE',
+    const preparedEntries = [];
+    for (const entry of entries) {
+        const [deflated, crc] = await Promise.all([
+            feedbackZipInternals.deflateRaw(entry.bytes),
+            feedbackZipInternals.crc32(entry.bytes),
+        ]);
+        // WHY: storing an expanding entry makes source bytes plus framing a hard archive bound,
+        // so fitting complete transcript lines never need to be discarded for compression overhead.
+        const store = deflated.length > entry.bytes.length;
+        preparedEntries.push({
+            ...entry,
+            nameBytes: Buffer.from(entry.name, 'utf8'),
+            compressedBytes: store ? entry.bytes : deflated,
+            method: store ? ZIP_STORE_METHOD : ZIP_DEFLATE_METHOD,
+            crc,
         });
     }
 
     let localOffset = 0;
     const localParts = [];
     const centralParts = [];
-    for (const { bytes, compressedBytes, nameBytes } of preparedEntries) {
-        const crc = crc32(bytes);
-        const localHeader = writeLocalHeader({ nameBytes, bytes, compressedBytes, crc });
+    for (const { bytes, compressedBytes, nameBytes, method, crc } of preparedEntries) {
+        const localHeader = writeLocalHeader({ nameBytes, bytes, compressedBytes, method, crc });
         localParts.push(localHeader, nameBytes, compressedBytes);
-        centralParts.push(writeCentralHeader({ nameBytes, bytes, compressedBytes, crc, localOffset }), nameBytes);
+        centralParts.push(writeCentralHeader({ nameBytes, bytes, compressedBytes, method, crc, localOffset }), nameBytes);
         localOffset += localHeader.length + nameBytes.length + compressedBytes.length;
     }
     const centralDirectory = Buffer.concat(centralParts);

@@ -2,7 +2,9 @@ import {
     EXTENSION_UPDATE_URL,
     OZON_PROMOTION_CAPABILITY,
     OZON_PROMOTION_MIN_EXTENSION_VERSION,
+    isOzonExecutionInterruptionDetails,
 } from './extension-vocabulary.mjs';
+import { StorageUnavailableError } from './storage-layout.mjs';
 
 const SAFE_CODE = /^[A-Z][A-Z0-9_]{2,63}$/;
 const MAX_SAFE_MESSAGE_LENGTH = 500;
@@ -47,6 +49,7 @@ export const OZON_PROMOTION_TERMINAL_CODE_STAGES = Object.freeze({
     PREFLIGHT_FAILED: 'preflight',
     REPORT_AMBIGUOUS: 'preflight',
     CREATE_REJECTED: 'create',
+    CREATE_SERVICE_UNAVAILABLE: 'create',
     CREATE_OUTCOME_UNKNOWN: 'create',
     CREATE_REPORT_AMBIGUOUS: 'create',
     CREATE_NOT_OBSERVABLE: 'create',
@@ -55,7 +58,9 @@ export const OZON_PROMOTION_TERMINAL_CODE_STAGES = Object.freeze({
     REPORT_TERMINAL_FAILURE: 'poll',
     DOWNLOAD_REJECTED: 'download',
     REUSED_REPORT_FORMAT_UNVERIFIED: 'download',
+    OZON_RATE_LIMITED: 'rate_limit',
     ARTIFACT_REJECTED: 'artifact',
+    OZON_EXECUTION_INTERRUPTED: 'execution',
     OPERATION_CANCELLED: 'cancelled',
     OPERATION_DEADLINE_EXCEEDED: 'deadline',
 });
@@ -92,6 +97,8 @@ export const safeOzonPromotionToolError = (value) => {
         typeof value?.message !== 'string' ||
         value.message.length === 0 ||
         value.message.length > MAX_SAFE_MESSAGE_LENGTH
+        || (value?.code === 'OZON_EXECUTION_INTERRUPTED' && value.details !== undefined &&
+            !isOzonExecutionInterruptionDetails(value.code, value.details))
     ) {
         throw new TypeError('Invalid Ozon promotion terminal error.');
     }
@@ -100,6 +107,9 @@ export const safeOzonPromotionToolError = (value) => {
     // приходят как разобранный из JSON обычный объект и instanceof пройти не могут, поэтому чужая
     // сторона сокета не в состоянии дописать собственный текст в контекст модели через это поле.
     if (value instanceof ToolExecutionError && isOzonExtensionOutdatedDetails(value.details)) safe.details = value.details;
+    if (isOzonExecutionInterruptionDetails(value.code, value.details)) {
+        safe.details = { phase: value.details.phase, createOutcome: value.details.createOutcome };
+    }
     return safe;
 };
 
@@ -127,12 +137,25 @@ export const ozonExtensionOutdatedError = (installedExtensionVersion) => {
     return error;
 };
 
+export const ozonRouteUnavailableError = (reason = 'unavailable') =>
+    new ToolExecutionError(
+        'OZON_ROUTE_NOT_READY',
+        (reason === 'disconnected'
+            ? 'The e-Comet extension is not connected to the local bridge. '
+            : reason === 'timeout'
+              ? 'The Ozon report authorization response timed out; this does not establish why the route was unavailable. '
+              : 'The Ozon extension route is unavailable; its cause is not established. ') +
+            `Ensure e-Comet extension ${OZON_PROMOTION_MIN_EXTENSION_VERSION} or newer is enabled in the same browser profile, refresh any authenticated Ozon Seller page under https://seller.ozon.ru/app, then request a new report authorization and retry.`,
+        'route',
+        false
+    );
+
 // Форма ответа фиксирована и на проводе: peer_ozon_promotion_result принимает у toolError ровно
 // ok/code/message/stage/retryable, поэтому лишний ключ отсюда сделал бы кадр невалидным и вторичный
 // процесс ждал бы дедлайна вместо отказа. Диагноз устаревшего расширения добавляет к терминальному
 // ответу сам обработчик инструмента, а не этот сериализатор.
 export const toolFailure = (error, fallback = {}) => {
-    if (error instanceof ToolExecutionError) {
+    if (error instanceof ToolExecutionError || error instanceof StorageUnavailableError) {
         return {
             ok: false,
             code: error.code,

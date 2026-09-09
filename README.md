@@ -49,15 +49,29 @@
 <summary>Claude Desktop (Cowork)</summary>
 
 1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Capabilities`, включите `Allow network egress` и выберите `All domains` в `Domain allowlist`.
-2. Оставаясь в окне настроек, откройте слева `Plugins` → `Add` → `Add marketplace` → `Add from repository`.
-3. Укажите `https://github.com/e-comet/skills`, нажмите `Use`, установите `Sync automatically` и нажмите `Sync`.
-4. Нажмите `+` на карточке `e-Comet MCP Tools`. В окне-подтверждении нажмите `Continue`.
-5. Нажмите на ⚙️ на карточке `e-Comet MCP Tools`. В разделе `Connectors` у `e-comet` нажмите `Install`. Нажмите `Add`. Нажмите `Connect` и введите почту.
+2. В приложении Claude выберите `Chat and Cowork`, затем слева откройте `Customize` → `Plugins`.
+3. Справа нажмите `Add` → `Add marketplace` → `Add from a repository`.
+4. В поле `URL` укажите `https://github.com/e-comet/skills`, убедитесь что стоит галочка `Sync automatically` и нажмите `Sync`.
+5. Перейдите в `Discover`, найдите `e-Comet MCP Tools` и нажмите `Add` (или `+` на карточке). Если появится подтверждение запуска локального MCP, нажмите `Continue`.
+6. Перейдите в `Yours`, откройте карточку `e-Comet MCP Tools` → `Connectors` и подключите `e-comet`, авторизовавшись по почте.
+7. Начните новую задачу в режиме `Cowork`.
+
+Добавление marketplace и установка плагина — разные шаги. Если репозиторий уже добавлен, переходите к `Discover`; установка проверяется в `Yours` выбранного режима.
 
 </details>
 
 <details>
 <summary>Claude Code</summary>
+
+В приложении Claude:
+
+1. Выберите `Code`, затем слева откройте `Customize` → `Plugins`.
+2. Нажмите `Add` → `Add marketplace` → `Add from a repository`. Укажите `https://github.com/e-comet/skills` в поле `URL` и нажмите `Sync`.
+3. В `Discover` найдите `e-Comet MCP Tools` и нажмите `Add` (или `+` на карточке). Подтвердите установку.
+4. Проверьте плагин в `Yours`. В его карточке откройте `Connectors` и подключите `e-comet`, авторизовавшись по почте.
+5. Начните новую задачу в `Code`.
+
+Через терминал с установленным Claude Code CLI:
 
 ```bash
 claude plugin marketplace add https://github.com/e-comet/skills
@@ -173,8 +187,12 @@ codex plugin add e-comet-skills@e-comet-skills
 <details>
 <summary>Claude Desktop (Cowork)</summary>
 
-1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Plugins` → `Browse` → `Personal` → `...` у `e-comet-skills` → `Check for updates`.
-2. Снова зайдите в `Settings` → `Plugins` → `e-Comet MCP Tools` → `Update`. Если `Update` неактивна и `Last updated` совпадает с последней датой в [CHANGELOG](CHANGELOG.md) — значит у вас уже установлена последняя версия.
+1. Выберите `Chat and Cowork` → `Customize` → `Plugins` → `Yours`.
+2. Откройте саму карточку `e-Comet MCP Tools`. Справа вверху нажмите `⋮` → `Check for updates`.
+3. Дождитесь окончания проверки. Если обновление найдено, на этой же странице станет доступна кнопка `Update` — нажмите её и дождитесь завершения.
+4. Начните новую задачу в `Cowork`.
+
+`Check for updates` находится внутри карточки плагина; меню `⋮` в общем списке может содержать только `Disable` и `Remove`. Неактивная кнопка `Update` до проверки и дата `updated … ago` сами по себе не подтверждают, что установлена последняя версия.
 
 </details>
 
@@ -183,12 +201,20 @@ codex plugin add e-comet-skills@e-comet-skills
 <details>
 <summary>Claude Code</summary>
 
+В приложении Claude:
+
+1. Выберите `Code` → `Customize` → `Plugins` → `Yours` и откройте карточку `e-Comet MCP Tools`.
+2. Внутри карточки нажмите `⋮` → `Check for updates`, дождитесь проверки, затем нажмите `Update`, если обновление найдено.
+3. После обновления начните новую задачу в `Code`.
+
+Если в вашей версии интерфейса нет `Check for updates` или `Update` остаётся неактивной при наличии обновления, выполните в терминале с установленным Claude Code CLI:
+
 ```bash
 claude plugin marketplace update e-comet-skills
 claude plugin update e-comet-skills@e-comet-skills
 ```
 
-Выполните `/reload-plugins` или перезапустите Claude Code, затем начните новую задачу.
+После команд в терминале выполните `/reload-plugins` в открытой CLI-сессии или перезапустите Claude Code. Для вкладки `Code` в приложении Claude перезапустите приложение и начните новую задачу.
 
 </details>
 

@@ -10,7 +10,10 @@ export const MESSAGE_TYPES = Object.freeze({
     browserJobAuthorize: 'browser_job_authorize',
     browserJobAuthorizationRelease: 'browser_job_authorization_release',
     ozonPromotionOperation: 'ozon_seller_promotion_report_operation',
+    ozonPromotionPackageOperation: 'ozon_seller_promotion_reports_operation',
     ozonPromotionStreamAck: 'ozon_seller_promotion_report_stream_ack',
+    ozonAnalyticsOperation: 'ozon_seller_analytics_report_operation',
+    ozonAnalyticsStreamAck: 'ozon_seller_analytics_report_stream_ack',
     // расширение -> local MCP
     helloAck: 'hello_ack',
     wbFetchResult: 'wb_fetch_result',
@@ -19,10 +22,15 @@ export const MESSAGE_TYPES = Object.freeze({
     wbFetchStreamEnd: 'wb_fetch_stream_end',
     browserJobAuthorizeResult: 'browser_job_authorize_result',
     browserJobAuthorizationReleaseResult: 'browser_job_authorization_release_result',
+    ozonReportPhase: 'ozon_seller_report_phase',
     ozonPromotionStreamStart: 'ozon_seller_promotion_report_stream_start',
     ozonPromotionStreamChunk: 'ozon_seller_promotion_report_stream_chunk',
     ozonPromotionStreamEnd: 'ozon_seller_promotion_report_stream_end',
     ozonPromotionResult: 'ozon_seller_promotion_report_result',
+    ozonAnalyticsStreamStart: 'ozon_seller_analytics_report_stream_start',
+    ozonAnalyticsStreamChunk: 'ozon_seller_analytics_report_stream_chunk',
+    ozonAnalyticsStreamEnd: 'ozon_seller_analytics_report_stream_end',
+    ozonAnalyticsResult: 'ozon_seller_analytics_report_result',
     error: 'error',
     // в обе стороны (heartbeat)
     ping: 'ping',
@@ -55,6 +63,12 @@ export const peerStatusMessage = ({
     ...(connections.extensionOzonPromotionReady === undefined
         ? {}
         : { ozonSellerPromotionReportSupported: connections.extensionOzonPromotionReady === true }),
+    ...(connections.extensionOzonPromotionPackageReady === undefined
+        ? {}
+        : { ozonSellerPromotionReportsSupported: connections.extensionOzonPromotionPackageReady === true }),
+    ...(connections.extensionOzonAnalyticsReady === undefined
+        ? {}
+        : { ozonSellerAnalyticsReportSupported: connections.extensionOzonAnalyticsReady === true }),
     ...(connections.extensionLastConnectedAtMs === null ? {} : { extensionLastConnectedAtMs: connections.extensionLastConnectedAtMs }),
     ...(connections.extensionLastDisconnectedAtMs === null ? {} : { extensionLastDisconnectedAtMs: connections.extensionLastDisconnectedAtMs }),
     // Вторичный процесс сам расширение не видит, поэтому без этого поля конкуренция
@@ -90,10 +104,12 @@ export const EXTENSION_TO_CLIENT_MESSAGE_TYPES = Object.freeze([
 ]);
 
 export const OZON_PROMOTION_CAPABILITY = 'ozon_seller_promotion_report@1';
-// Первая сборка расширения, которая объявляет OZON_PROMOTION_CAPABILITY в hello_ack и умеет
-// исполнять типизированную операцию отчёта Ozon. Всё, что старше, отвергает подписанное задание
-// как неизвестное ещё на авторизации, поэтому пользователю нужно обновление, а не открытая страница.
-export const OZON_PROMOTION_MIN_EXTENSION_VERSION = '1.5.5';
+export const OZON_PROMOTION_PACKAGE_CAPABILITY = 'ozon_seller_promotion_reports@1';
+export const OZON_ANALYTICS_CAPABILITY = 'ozon_seller_analytics_report@1';
+// Supported floor for the released singular @1 contract, not the first build that advertised it.
+// Package tools require 1.5.7 separately; raising their floor must not change singular guidance
+// or its public error-details schema. Runtime admission checks the advertised capability.
+export const OZON_PROMOTION_MIN_EXTENSION_VERSION = '1.5.6';
 // Единственный поддерживаемый канал обновления расширения.
 export const EXTENSION_UPDATE_URL = 'https://chromewebstore.google.com/detail/e-comet/apeallgchpgibifmbgefkhifidihmodh';
 export const OZON_PROMOTION_CLIENT_MESSAGE_TYPES = Object.freeze([
@@ -106,6 +122,36 @@ export const OZON_PROMOTION_SERVER_MESSAGE_TYPES = Object.freeze([
     MESSAGE_TYPES.ozonPromotionStreamEnd,
     MESSAGE_TYPES.ozonPromotionResult,
 ]);
+export const OZON_ANALYTICS_CLIENT_MESSAGE_TYPES = Object.freeze([
+    MESSAGE_TYPES.ozonAnalyticsOperation,
+    MESSAGE_TYPES.ozonAnalyticsStreamAck,
+]);
+export const OZON_ANALYTICS_SERVER_MESSAGE_TYPES = Object.freeze([
+    MESSAGE_TYPES.ozonAnalyticsStreamStart,
+    MESSAGE_TYPES.ozonAnalyticsStreamChunk,
+    MESSAGE_TYPES.ozonAnalyticsStreamEnd,
+    MESSAGE_TYPES.ozonAnalyticsResult,
+]);
+export const OZON_ANALYTICS_TERMINAL_CODE_STAGES = Object.freeze({
+    OZON_AUTHORIZATION_REJECTED: 'authorization',
+    OZON_ADMISSION_CAPACITY_EXHAUSTED: 'extension',
+    OZON_ROUTE_NOT_READY: 'route',
+    OZON_ANALYTICS_CAPABILITY_UNAVAILABLE: 'context',
+    OZON_CONTEXT_CHANGED: 'context',
+    PREFLIGHT_FAILED: 'preflight',
+    CREATE_REJECTED: 'create',
+    CREATE_SERVICE_UNAVAILABLE: 'create',
+    CREATE_OUTCOME_UNKNOWN: 'create',
+    POLL_FAILED: 'poll',
+    POLL_EXHAUSTED: 'poll',
+    REPORT_TERMINAL_FAILURE: 'poll',
+    DOWNLOAD_REJECTED: 'download',
+    OZON_RATE_LIMITED: 'rate_limit',
+    ARTIFACT_REJECTED: 'artifact',
+    OZON_EXECUTION_INTERRUPTED: 'execution',
+    OPERATION_CANCELLED: 'cancelled',
+    OPERATION_DEADLINE_EXCEEDED: 'deadline',
+});
 export const EXTENSION_CAPABILITIES = Object.freeze(['wb_fetch', 'browser_job', 'seller_reviews']);
 
 // Стадия операции продавца внутри payload'а `wb_fetch`. Расширение решает по ней,
@@ -150,3 +196,17 @@ export const RETRYABLE_FETCH_ERROR_CODES = Object.freeze([
 ]);
 
 export const UNCLASSIFIED_FETCH_ERROR_CODE = 'WB_FETCH_FAILED';
+
+// Numeric Ozon evidence is deliberately narrower than free-form diagnostic details.
+export const isOzonAnalyticsTerminalDetails = (code, value) => code === 'REPORT_TERMINAL_FAILURE' &&
+    value !== null && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).length === 1 && Object.hasOwn(value, 'marketplaceErrorCode') &&
+    Number.isSafeInteger(value.marketplaceErrorCode) && value.marketplaceErrorCode >= -2147483648 &&
+    value.marketplaceErrorCode <= 2147483647;
+
+export const isOzonExecutionInterruptionDetails = (code, value) => code === 'OZON_EXECUTION_INTERRUPTED' &&
+    value !== null && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).length === 2 && Object.hasOwn(value, 'phase') && Object.hasOwn(value, 'createOutcome') &&
+    ((['pre_create', 'create_dispatched'].includes(value.phase) && value.createOutcome === 'not_started') ||
+        (value.phase === 'create_settled' && value.createOutcome === 'confirmed') ||
+        (['polling', 'downloading', 'streaming'].includes(value.phase) && ['not_started', 'confirmed'].includes(value.createOutcome)));

@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "e-comet": {
+      "type": "http",
+      "url": "https://mcp.e-comet.io/mcp"
+    },
+    "e-comet-local": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["mcp/src/server.mjs"],
+      "cwd": ".",
+      "tool_timeout_sec": 7200,
+      "tools": {
+        "prepare_e_comet_feedback": {"approval_mode": "approve"},
+        "submit_e_comet_feedback": {"approval_mode": "approve"}
+      }
+    }
+  }
+}

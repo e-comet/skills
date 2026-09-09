@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmod, mkdir, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { feedbackDiagnostics } from '../mcp/src/feedback-diagnostics.mjs';
 
 const MAX_HOOK_EVENT_BYTES = 1024 * 1024;
 const MAX_SESSION_ID_BYTES = 512;
@@ -22,7 +23,7 @@ const LOCK_RELEASE_RETRY_LIMIT = 20;
 const TRANSIENT_WINDOWS_LOCK_ERRORS = new Set(['EPERM', 'EBUSY']);
 const REMOTE_BROWSER_JOB_TOOL = /^mcp__.+__browser_job$/;
 const LOCAL_BROWSER_TOOL =
-    /^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:wb_product_card|wb_search_by_query|wb_check_by_query|wb_recommendations_by_product|wb_seller_reviews|ozon_seller_promotion_report)$/;
+    /^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:wb_product_card|wb_search_by_query|wb_check_by_query|wb_recommendations_by_product|wb_seller_reviews|ozon_seller_promotion_report|ozon_seller_promotion_reports|ozon_seller_analytics_report)$/;
 const LOCAL_TOOL_BY_BROWSER_JOB_TYPE = Object.freeze({
     product_card: 'wb_product_card',
     search_by_query: 'wb_search_by_query',
@@ -30,6 +31,8 @@ const LOCAL_TOOL_BY_BROWSER_JOB_TYPE = Object.freeze({
     recommendations_by_product: 'wb_recommendations_by_product',
     seller_reviews: 'wb_seller_reviews',
     ozon_seller_promotion_report: 'ozon_seller_promotion_report',
+    ozon_seller_promotion_reports: 'ozon_seller_promotion_reports',
+    ozon_seller_analytics_report: 'ozon_seller_analytics_report',
 });
 const SIGNED_LOCAL_TOOLS = new Set(Object.values(LOCAL_TOOL_BY_BROWSER_JOB_TYPE));
 
@@ -342,8 +345,11 @@ const cleanupStore = async (storeDirectory, nowMs, fileNowMs) => {
             try {
                 const entry = parseStoredEntry(await readFile(path, 'utf8'));
                 remove = !isEntryFresh(entry, nowMs);
-            } catch {
-                remove = true;
+            } catch (error) {
+                // Failed I/O cannot revoke another session's authorization. Unknown
+                // records still occupy capacity; only verified invalid data is removed.
+                if (error?.code === 'ENOENT') continue;
+                remove = error instanceof HandoffError;
             }
             if (remove) await removeFile(path);
             else pendingCount += 1;
@@ -566,6 +572,21 @@ const preToolUseOutput = (updatedInput) =>
         },
     });
 
+const handoffRecovery = (code) => {
+    // Refusals before claim consumption must not manufacture a second pending authorization.
+    if (code === 'HANDOFF_MODEL_AUTHORIZATION') return 'Remove triggerUrl and trigger_url from the model-authored arguments and retry the same local tool. The hook must inject authorization; do not request a new browser_job for this argument correction.';
+    if (code === 'HANDOFF_INVALID_INPUT') return 'Correct the local tool arguments and retry the same local tool; do not request another authorization just to repair arguments.';
+    if (code === 'HANDOFF_DATA_DIR_UNAVAILABLE') return 'The host did not provide plugin storage. Check the installed plugin and host hook integration; requesting another browser_job cannot fix missing host storage.';
+    if (code === 'HANDOFF_INVALID_SESSION' || code === 'HANDOFF_INVALID_EVENT' || code === 'HANDOFF_INVALID_TOOL') return 'The host hook context is invalid. Check the supported plugin/host integration and report this failure if it persists; do not obtain repeated authorizations.';
+    if (code === 'HANDOFF_CAPACITY') return 'The local handoff store is at capacity. Let pending handoffs finish before starting more; do not create additional authorizations in a loop.';
+    if (['HANDOFF_MISSING', 'HANDOFF_EXPIRED', 'HANDOFF_TOOL_MISMATCH', 'HANDOFF_INVALID_ENTRY', 'HANDOFF_INVALID_TOKEN', 'HANDOFF_CONFLICT'].includes(code)) return 'No usable matching authorization remains. Call browser_job once for the intended local tool, then retry without model-authored authorization fields.';
+    return 'The local authorization handoff failed. Check the host integration and local storage access; if it persists, report the failure. Do not request repeated browser_job authorizations without resolving the observed problem.';
+};
+const handoffStorageRecovery = (details) => {
+    if (['ENOSPC', 'EDQUOT'].includes(details?.systemCode)) return 'Local storage reports exhausted space or quota. Free space or resolve the quota before retrying; another browser_job will not fix this.';
+    if (['EACCES', 'EPERM', 'EROFS'].includes(details?.systemCode)) return 'Local storage reports denied access or a read-only filesystem. Check access to plugin storage before retrying; another browser_job will not fix this.';
+    return null;
+};
 const deniedPreToolUseOutput = (error) =>
     JSON.stringify({
         hookSpecificOutput: {
@@ -573,13 +594,15 @@ const deniedPreToolUseOutput = (error) =>
             permissionDecision: 'deny',
             permissionDecisionReason:
                 `${error.code}: e-Comet could not safely hand off the browser authorization. ` +
-                'Call browser_job once, then retry.',
+                (handoffStorageRecovery(error.details) ?? handoffRecovery(error.code)) + (error.details ? ` Diagnostics: ${JSON.stringify(error.details)}` : ''),
         },
     });
 
-const safeHookError = (error) => {
+const safeHookError = (error, operation = 'handoff_authorize') => {
     if (error instanceof HandoffError) return error;
-    return new HandoffError('HANDOFF_STORAGE_ERROR', 'The local browser authorization handoff failed.');
+    const safe = new HandoffError('HANDOFF_STORAGE_ERROR', 'The local browser authorization handoff failed.');
+    safe.details = feedbackDiagnostics(error, operation);
+    return safe;
 };
 
 const browserJobTargetTool = (event) => {
@@ -623,7 +646,7 @@ export const processHookEvent = async (event, { env = process.env, nowMs = Date.
             return { exitCode: 0, stdout: '', stderr: '' };
         } catch (error) {
             const safeError = safeHookError(error);
-            return { exitCode: 2, stdout: '', stderr: `${safeError.code}: ${safeError.message}` };
+            return { exitCode: 2, stdout: '', stderr: `${safeError.code}: ${safeError.message}${safeError.details ? ` Diagnostics: ${JSON.stringify(safeError.details)}` : ''}` };
         }
     }
 
@@ -657,7 +680,7 @@ export const processHookEvent = async (event, { env = process.env, nowMs = Date.
                 stderr: '',
             };
         } catch (error) {
-            const safeError = safeHookError(error);
+            const safeError = safeHookError(error, 'claim_consume');
             return { exitCode: 0, stdout: deniedPreToolUseOutput(safeError), stderr: '' };
         }
     }
@@ -689,7 +712,7 @@ const main = async () => {
         result = await processHookEvent(await readStdin());
     } catch (error) {
         const safeError = safeHookError(error);
-        result = { exitCode: 2, stdout: '', stderr: `${safeError.code}: ${safeError.message}` };
+        result = { exitCode: 2, stdout: '', stderr: `${safeError.code}: ${safeError.message}${safeError.details ? ` Diagnostics: ${JSON.stringify(safeError.details)}` : ''}` };
     }
     if (result.stdout) process.stdout.write(`${result.stdout}\n`);
     if (result.stderr) process.stderr.write(`${result.stderr}\n`);
