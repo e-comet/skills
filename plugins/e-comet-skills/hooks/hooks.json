@@ -14,13 +14,37 @@
         ]
       },
       {
-        "matcher": "^mcp__(?:(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__prepare_e_comet_feedback|(?:e[-_]comet|e_comet_stage|https_mcp_stage_int_e_comet_io_mcp|plugin_e-comet-skills_e-comet|remote-devices__plugin_e-comet-skills_e-comet|2da262fd-fd1f-4636-90cb-75b02fd1f1f1)__report_issue)$",
+        "matcher": "^mcp__(?:(?:(?:plugin_e-comet-skills_)?e[-_]comet[-_]local|remote-devices__plugin_e-comet-skills_(?:e_comet-local|e-comet_local|e_comet_local))__prepare_e_comet_feedback|(?:e[-_]comet|e_comet_stage|https_mcp_(?:stage_int_)?e[-_]comet_io_mcp|plugin_e-comet-skills_e-comet|remote-devices__plugin_e-comet-skills_e-comet|2da262fd-fd1f-4636-90cb-75b02fd1f1f1)__report_issue)$",
         "hooks": [
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/feedback-handoff.mjs\"",
             "timeout": 10,
             "statusMessage": "Securing e-Comet feedback authorization"
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__remote-devices__plugin_e-comet-skills_e-comet-local__(?:prepare_e_comet_feedback|submit_e_comet_feedback)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/feedback-handoff.mjs\"",
+            "timeout": 150,
+            "statusMessage": "Processing e-Comet cloud feedback"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "^mcp__remote-devices__plugin_e-comet-skills_e-comet-local__prepare_e_comet_feedback$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/feedback-handoff.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Checking e-Comet preparation failure"
           }
         ]
       }
@@ -49,13 +73,24 @@
         ]
       },
       {
-        "matcher": "^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:prepare_e_comet_feedback|submit_e_comet_feedback)$",
+        "matcher": "^mcp__(?:(?:plugin_e-comet-skills_)?e[-_]comet[-_]local|remote-devices__plugin_e-comet-skills_(?:e_comet-local|e-comet_local|e_comet_local))__(?:prepare_e_comet_feedback|submit_e_comet_feedback)$",
         "hooks": [
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/feedback-handoff.mjs\"",
             "timeout": 10,
             "statusMessage": "Restoring e-Comet feedback authorization"
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__remote-devices__plugin_e-comet-skills_e-comet-local__(?:prepare_e_comet_feedback|submit_e_comet_feedback)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/feedback-handoff.mjs\"",
+            "timeout": 150,
+            "statusMessage": "Processing e-Comet cloud feedback"
           }
         ]
       }

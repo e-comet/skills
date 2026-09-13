@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { isOzonPackageNotStarted } from './ozon-report-package-result.mjs';
+import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
 
 import {
     AUTHORIZATION_RELEASE_TIMEOUT_MS,
@@ -949,7 +950,7 @@ export class RequestBroker {
             authorizationScope.jobType !== expectedJobType ||
             !Array.isArray(items) ||
             items.length < 1 ||
-            items.length > 50 ||
+            items.length > MAX_OZON_REPORT_PACKAGE_ITEMS ||
             !exactOzonPackageItemsEqual(family, items, signedItems) ||
             !Number.isSafeInteger(packageRequest?.deadlineAt) ||
             packageRequest.deadlineAt <= 0

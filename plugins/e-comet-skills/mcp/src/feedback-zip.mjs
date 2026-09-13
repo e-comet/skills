@@ -65,6 +65,137 @@ const entryNames = (includeTranscript) => [
     ...(includeTranscript ? ['transcript.jsonl'] : []),
 ];
 
+/** The fixed entry list, in order, that `createFeedbackZip` frames for this transcript choice. */
+export const feedbackZipEntryLayout = ({ includeTranscript = false } = {}) => entryNames(includeTranscript);
+
+const ZIP_END_SIGNATURE = 0x06054b50;
+const ZIP_CENTRAL_SIGNATURE = 0x02014b50;
+const ZIP_LOCAL_SIGNATURE = 0x04034b50;
+const ZIP_END_BYTES = 22;
+const ZIP_CENTRAL_HEADER_BYTES = 46;
+const ZIP_LOCAL_HEADER_BYTES = 30;
+const MAX_FEEDBACK_ZIP_ENTRIES = 3;
+const malformedZip = (cause = undefined) => new RangeError(
+    'Feedback archive is not a well-formed feedback ZIP package',
+    cause === undefined ? undefined : { cause },
+);
+
+const readCentralEntry = (bytes, offset, endOffset, decoder) => {
+    if (offset + ZIP_CENTRAL_HEADER_BYTES > endOffset || bytes.readUInt32LE(offset) !== ZIP_CENTRAL_SIGNATURE) throw malformedZip();
+    const nameOffset = offset + ZIP_CENTRAL_HEADER_BYTES;
+    const nameLength = bytes.readUInt16LE(offset + 28);
+    const entry = {
+        flags: bytes.readUInt16LE(offset + 8),
+        method: bytes.readUInt16LE(offset + 10),
+        crc: bytes.readUInt32LE(offset + 16),
+        compressedSize: bytes.readUInt32LE(offset + 20),
+        uncompressedSize: bytes.readUInt32LE(offset + 24),
+        localOffset: bytes.readUInt32LE(offset + 42),
+        nameBytes: bytes.subarray(nameOffset, nameOffset + nameLength),
+        nextOffset: nameOffset + nameLength,
+    };
+    if (
+        nameLength === 0 ||
+        entry.nextOffset > endOffset ||
+        // The writer emits no extra field, entry comment, disk number or internal attributes, and
+        // exactly the UTF-8 flag: a data descriptor or any other flag is not an archive it wrote.
+        bytes.readUInt16LE(offset + 30) !== 0 ||
+        bytes.readUInt16LE(offset + 32) !== 0 ||
+        bytes.readUInt16LE(offset + 34) !== 0 ||
+        bytes.readUInt16LE(offset + 36) !== 0 ||
+        entry.flags !== ZIP_UTF8_FLAG ||
+        ![ZIP_STORE_METHOD, ZIP_DEFLATE_METHOD].includes(entry.method) ||
+        (entry.method === ZIP_STORE_METHOD && entry.compressedSize !== entry.uncompressedSize)
+    ) {
+        throw malformedZip();
+    }
+    try {
+        entry.name = decoder.decode(entry.nameBytes);
+    } catch (error) {
+        throw malformedZip(error);
+    }
+    return entry;
+};
+
+/**
+ * Walks the stored entries from the first byte, in central-directory order, and requires each local
+ * header to agree with its central record and to abut the next one. Nothing outside the entries, the
+ * central directory and the end record may exist, so an archive cannot smuggle a differently named
+ * local entry or slack bytes past the listing the caller checks.
+ */
+const assertLocalEntriesMatch = (bytes, entries, centralOffset) => {
+    let cursor = 0;
+    for (const entry of entries) {
+        const nameLength = entry.nameBytes.length;
+        const dataOffset = cursor + ZIP_LOCAL_HEADER_BYTES + nameLength;
+        if (
+            entry.localOffset !== cursor ||
+            dataOffset + entry.compressedSize > centralOffset ||
+            bytes.readUInt32LE(cursor) !== ZIP_LOCAL_SIGNATURE ||
+            bytes.readUInt16LE(cursor + 6) !== entry.flags ||
+            bytes.readUInt16LE(cursor + 8) !== entry.method ||
+            bytes.readUInt32LE(cursor + 14) !== entry.crc ||
+            bytes.readUInt32LE(cursor + 18) !== entry.compressedSize ||
+            bytes.readUInt32LE(cursor + 22) !== entry.uncompressedSize ||
+            bytes.readUInt16LE(cursor + 26) !== nameLength ||
+            bytes.readUInt16LE(cursor + 28) !== 0 ||
+            !bytes.subarray(cursor + ZIP_LOCAL_HEADER_BYTES, dataOffset).equals(entry.nameBytes)
+        ) {
+            throw malformedZip();
+        }
+        cursor = dataOffset + entry.compressedSize;
+    }
+    if (cursor !== centralOffset) throw malformedZip();
+};
+
+/**
+ * Validates that `bytes` is framed exactly as `createFeedbackZip` frames a feedback archive and lists
+ * the entry names it declares. The end record, the central directory and every local header are read;
+ * no entry body is inflated, so the check stays cheap on the cloud upload path. Entry contents are
+ * therefore not inspected beyond the sizes and CRC-32 the two headers agree on.
+ * @param {Buffer} bytes @returns {string[]}
+ */
+export const feedbackZipEntryNames = (bytes) => {
+    if (!Buffer.isBuffer(bytes) || bytes.length < ZIP_END_BYTES) throw malformedZip();
+    const endOffset = bytes.length - ZIP_END_BYTES;
+    const totalEntries = bytes.readUInt16LE(endOffset + 10);
+    const centralSize = bytes.readUInt32LE(endOffset + 12);
+    const centralOffset = bytes.readUInt32LE(endOffset + 16);
+    if (
+        bytes.readUInt32LE(endOffset) !== ZIP_END_SIGNATURE ||
+        bytes.readUInt16LE(endOffset + 4) !== 0 ||
+        bytes.readUInt16LE(endOffset + 6) !== 0 ||
+        bytes.readUInt16LE(endOffset + 8) !== totalEntries ||
+        bytes.readUInt16LE(endOffset + 20) !== 0 ||
+        totalEntries < 1 ||
+        totalEntries > MAX_FEEDBACK_ZIP_ENTRIES ||
+        centralOffset + centralSize !== endOffset
+    ) {
+        throw malformedZip();
+    }
+    // ignoreBOM keeps a leading U+FEFF in the decoded name: stripping it would let three invisible
+    // bytes into the stored entry name while the listing check saw a clean one.
+    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+    const entries = [];
+    let offset = centralOffset;
+    for (let index = 0; index < totalEntries; index += 1) {
+        const entry = readCentralEntry(bytes, offset, endOffset, decoder);
+        entries.push(entry);
+        offset = entry.nextOffset;
+    }
+    if (offset !== endOffset) throw malformedZip();
+    const names = entries.map((entry) => entry.name);
+    // Only the two listings this writer produces are a feedback archive; the caller still decides
+    // which of them the delivered transcript consent allows.
+    const declaresFeedbackLayout = [false, true].some((includeTranscript) => {
+        const expected = entryNames(includeTranscript);
+        return names.length === expected.length && names.every((name, index) => name === expected[index]);
+    });
+    if (!declaresFeedbackLayout) throw malformedZip();
+    assertLocalEntriesMatch(bytes, entries, centralOffset);
+    return names;
+};
+
 export const feedbackZipFramingBytes = ({ includeTranscript = false } = {}) =>
     entryNames(includeTranscript)
         .map((name) => Buffer.from(name, 'utf8'))

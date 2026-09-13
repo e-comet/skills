@@ -873,8 +873,6 @@ const SELLER_ABORT_CODES = new Set([
     'ENTITY_NOT_AVAILABLE',
     'BROWSER_JOB_REAUTHORIZATION_REQUIRED',
     'JOB_ARTIFACT_QUOTA_EXCEEDED',
-    'ARTIFACT_FILE_QUOTA_EXCEEDED',
-    'ARTIFACT_TOTAL_QUOTA_EXCEEDED',
     // The cabinet itself refused us. Every remaining export would be refused the same way under the
     // same seller token, so the package stops instead of proving it once per export. Deliberately not
     // routed through AUTHORIZATION_FETCH_ERROR_CODES: stage `authorization` would abort too, but it
@@ -964,8 +962,8 @@ export const executeSellerReviewsJob = async ({
     authorization,
     requestSellerOperation,
     createArtifactWriter,
-    artifactJobId = undefined,
-    releaseArtifactJob = undefined,
+    // One byte counter per call, shared by every writer of this export (spec §4.2).
+    jobBudget = { bytes: 0 },
     // Keep the same cadence as the current WB feedbacks-front report polling saga.
     pollIntervalMs = 3000,
     minSellerOperationIntervalMs = MIN_SELLER_OPERATION_AGENT_INTERVAL_MS,
@@ -1002,7 +1000,6 @@ export const executeSellerReviewsJob = async ({
         },
     });
     const jobId = authorization?.job?.jobId;
-    const artifactExecutionId = artifactJobId ?? jobId;
     let lastSellerOperationSentAt;
     // The poll cadence only ever covered poll-to-poll. Create-to-first-poll, poll-to-download and
     // export-to-export had no pacing at all, which is what let a package burst at the cabinet.
@@ -1017,305 +1014,290 @@ export const executeSellerReviewsJob = async ({
         lastSellerOperationSentAt = now();
         return requestSellerOperation(...args);
     };
-    let primaryError;
-    try {
-        validateAuthorizedJobLimits(authorization);
-        if (authorization.jobType !== 'seller_reviews') throw new Error('Seller review executor requires a seller_reviews authorization');
-        if (typeof requestSellerOperation !== 'function' || typeof createArtifactWriter !== 'function') {
-            throw new Error('Seller review execution dependencies are unavailable');
+    validateAuthorizedJobLimits(authorization);
+    if (authorization.jobType !== 'seller_reviews') throw new Error('Seller review executor requires a seller_reviews authorization');
+    if (typeof requestSellerOperation !== 'function' || typeof createArtifactWriter !== 'function') {
+        throw new Error('Seller review execution dependencies are unavailable');
+    }
+    const physicalExports = normalizeSellerExports(authorization.job.exports);
+    const exports = [];
+    let packageAborted = false;
+    let consecutiveExportFailures = 0;
+    // Every export result goes through here so the package can notice that it is failing the same
+    // way over and over: a create that keeps failing costs one request per export, and without a
+    // counter the run proves that once for every remaining export.
+    const recordExport = (entry, { systemic = true } = {}) => {
+        exports.push(entry);
+        if (entry.status === 'complete') {
+            consecutiveExportFailures = 0;
+            return;
         }
-        const physicalExports = normalizeSellerExports(authorization.job.exports);
-        const exports = [];
-        let packageAborted = false;
-        let consecutiveExportFailures = 0;
-        // Every export result goes through here so the package can notice that it is failing the same
-        // way over and over: a create that keeps failing costs one request per export, and without a
-        // counter the run proves that once for every remaining export.
-        const recordExport = (entry, { systemic = true } = {}) => {
-            exports.push(entry);
-            if (entry.status === 'complete') {
-                consecutiveExportFailures = 0;
-                return;
-            }
-            if (entry.status !== 'failed' || !systemic) {
-                consecutiveExportFailures = 0;
-                return;
-            }
-            consecutiveExportFailures += 1;
-            if (consecutiveExportFailures >= maxConsecutiveExportFailures) packageAborted = true;
+        if (entry.status !== 'failed' || !systemic) {
+            consecutiveExportFailures = 0;
+            return;
+        }
+        consecutiveExportFailures += 1;
+        if (consecutiveExportFailures >= maxConsecutiveExportFailures) packageAborted = true;
+    };
+    for (let exportIndex = 0; exportIndex < physicalExports.length; exportIndex += 1) {
+        const sellerExport = physicalExports[exportIndex];
+        const result = {
+            ...(sellerExport.product_id === undefined ? {} : { product_id: sellerExport.product_id }),
+            isAnswered: sellerExport.isAnswered,
+            ...(sellerExport.dateFrom === undefined ? {} : { dateFrom: sellerExport.dateFrom }),
+            ...(sellerExport.dateTo === undefined ? {} : { dateTo: sellerExport.dateTo }),
+            ...(sellerExport.ratings === undefined ? {} : { ratings: [...sellerExport.ratings] }),
+            ...(sellerExport.content === undefined ? {} : { content: sellerExport.content }),
         };
-        for (let exportIndex = 0; exportIndex < physicalExports.length; exportIndex += 1) {
-            const sellerExport = physicalExports[exportIndex];
-            const result = {
-                ...(sellerExport.product_id === undefined ? {} : { product_id: sellerExport.product_id }),
-                isAnswered: sellerExport.isAnswered,
-                ...(sellerExport.dateFrom === undefined ? {} : { dateFrom: sellerExport.dateFrom }),
-                ...(sellerExport.dateTo === undefined ? {} : { dateTo: sellerExport.dateTo }),
-                ...(sellerExport.ratings === undefined ? {} : { ratings: [...sellerExport.ratings] }),
-                ...(sellerExport.content === undefined ? {} : { content: sellerExport.content }),
-            };
-            if (!packageAborted && deadlineExceeded()) {
-                packageAborted = true;
-                recordExport(deadlineFailure(result));
-                continue;
-            }
-            if (packageAborted) {
-                recordExport({ ...result, status: 'skipped' });
-                continue;
-            }
+        if (!packageAborted && deadlineExceeded()) {
+            packageAborted = true;
+            recordExport(deadlineFailure(result));
+            continue;
+        }
+        if (packageAborted) {
+            recordExport({ ...result, status: 'skipped' });
+            continue;
+        }
 
-            let reportId;
+        let reportId;
+        try {
+            const createResponse = await pacedRequestSellerOperation({
+                exportIndex,
+                isAnswered: sellerExport.isAnswered,
+                stage: SELLER_OPERATION_STAGES.create,
+            });
+            reportId = reportIdFromCreate(createResponse);
+            if (typeof reportId !== 'string' || reportId.length === 0) {
+                throw new ToolExecutionError(
+                    'REPORT_CREATE_OUTCOME_UNKNOWN',
+                    'Wildberries did not confirm creation of the review report.',
+                    'execution',
+                    false
+                );
+            }
+        } catch (error) {
+            const normalized = sellerError(
+                error,
+                'REPORT_FAILED',
+                'Wildberries could not create the review report.'
+            );
+            recordExport({ ...result, status: 'failed', error: normalized });
+            packageAborted = packageAborted || abortsSellerPackage(error);
+            continue;
+        }
+
+        let reportReady = false;
+        let pollFailure;
+        let pollBreakerTripped = false;
+        // Only a status Wildberries actually returned is its verdict. Deciding that from the error
+        // code instead would have caught the create stage's REPORT_FAILED fallback, which means the
+        // opposite there — that the failure could not be classified at all.
+        let reportVerdict = false;
+        let consecutivePollFailures = 0;
+        for (let poll = 0; poll < maxPollsPerReport; poll += 1) {
             try {
-                const createResponse = await pacedRequestSellerOperation({
+                const pollResponse = await pacedRequestSellerOperation({
                     exportIndex,
                     isAnswered: sellerExport.isAnswered,
-                    stage: SELLER_OPERATION_STAGES.create,
+                    stage: SELLER_OPERATION_STAGES.poll,
+                    reportId,
                 });
-                reportId = reportIdFromCreate(createResponse);
-                if (typeof reportId !== 'string' || reportId.length === 0) {
-                    throw new ToolExecutionError(
-                        'REPORT_CREATE_OUTCOME_UNKNOWN',
-                        'Wildberries did not confirm creation of the review report.',
+                // Reset on the response itself, not on a usable status: the request succeeded, so
+                // whatever the line below makes of it is a fresh failure rather than a repeat.
+                consecutivePollFailures = 0;
+                const status = reportStatusFromPoll(pollResponse, reportId);
+                if (status === 'complete') {
+                    reportReady = true;
+                    break;
+                }
+                if (status === 'stopped' || status === 'error') {
+                    reportVerdict = true;
+                    pollFailure = new ToolExecutionError(
+                        status === 'stopped' ? 'REPORT_STOPPED' : 'REPORT_FAILED',
+                        status === 'stopped' ? 'Wildberries stopped the review report.' : 'Wildberries failed the review report.',
                         'execution',
                         false
                     );
+                    break;
                 }
             } catch (error) {
-                const normalized = sellerError(
-                    error,
-                    'REPORT_FAILED',
-                    'Wildberries could not create the review report.'
-                );
-                recordExport({ ...result, status: 'failed', error: normalized });
-                packageAborted = packageAborted || abortsSellerPackage(error);
-                continue;
-            }
-
-            let reportReady = false;
-            let pollFailure;
-            let pollBreakerTripped = false;
-            // Only a status Wildberries actually returned is its verdict. Deciding that from the error
-            // code instead would have caught the create stage's REPORT_FAILED fallback, which means the
-            // opposite there — that the failure could not be classified at all.
-            let reportVerdict = false;
-            let consecutivePollFailures = 0;
-            for (let poll = 0; poll < maxPollsPerReport; poll += 1) {
-                try {
-                    const pollResponse = await pacedRequestSellerOperation({
-                        exportIndex,
-                        isAnswered: sellerExport.isAnswered,
-                        stage: SELLER_OPERATION_STAGES.poll,
-                        reportId,
-                    });
-                    // Reset on the response itself, not on a usable status: the request succeeded, so
-                    // whatever the line below makes of it is a fresh failure rather than a repeat.
-                    consecutivePollFailures = 0;
-                    const status = reportStatusFromPoll(pollResponse, reportId);
-                    if (status === 'complete') {
-                        reportReady = true;
-                        break;
-                    }
-                    if (status === 'stopped' || status === 'error') {
-                        reportVerdict = true;
-                        pollFailure = new ToolExecutionError(
-                            status === 'stopped' ? 'REPORT_STOPPED' : 'REPORT_FAILED',
-                            status === 'stopped' ? 'Wildberries stopped the review report.' : 'Wildberries failed the review report.',
-                            'execution',
-                            false
-                        );
-                        break;
-                    }
-                } catch (error) {
-                    if (abortsSellerPackage(error)) {
-                        pollFailure = error;
-                        packageAborted = true;
-                        break;
-                    }
+                if (abortsSellerPackage(error)) {
                     pollFailure = error;
-                    consecutivePollFailures += 1;
-                    // Repeated failures are not "not ready yet": a successful poll returning inProgress
-                    // resets the counter, so reaching the threshold means the endpoint is answering
-                    // badly and the rest of the budget would be spent for nothing. Only a retryable
-                    // cause leaves the remaining exports alive.
-                    if (consecutivePollFailures >= maxConsecutivePollFailures) {
-                        pollBreakerTripped = true;
-                        // Slowness is not refusal. A cabinet that keeps timing out may still finish the
-                        // next report, so the export gives up while the package goes on; only a failure
-                        // that says the cabinet will answer the same way for everyone stops the run.
-                        if (error?.retryable !== true && !SELLER_RETRY_ONLY_CODES.has(error?.code)) {
-                            packageAborted = true;
-                        }
-                        break;
-                    }
-                }
-                if (poll + 1 >= maxPollsPerReport) break;
-                // Give up polling in time to still download whatever is already complete rather than
-                // letting the scope expiry cancel the operation mid-poll.
-                if (now() + pollIntervalMs >= jobDeadline) break;
-                await delayFn(pollIntervalMs);
-            }
-            if (!reportReady) {
-                // A tripped breaker carries the real cause: reporting it as a timeout would tell the
-                // agent to wait longer for a report that was never being refused for time reasons. An
-                // opaque failure has no cause to carry, so it must at least not claim to be a
-                // retryable timeout while the package it just stopped stays stopped.
-                const error = pollBreakerTripped
-                    ? pollFailure instanceof ToolExecutionError
-                        ? pollFailure
-                        : new ToolExecutionError(
-                              'REPORT_POLL_FAILED',
-                              'Wildberries stopped answering polls for this review report.',
-                              'execution',
-                              false
-                          )
-                    : pollFailure instanceof ToolExecutionError && abortsSellerPackage(pollFailure)
-                      ? pollFailure
-                      : pollFailure instanceof ToolExecutionError && ['REPORT_STOPPED', 'REPORT_FAILED'].includes(pollFailure.code)
-                        ? pollFailure
-                        : new ToolExecutionError('REPORT_TIMEOUT', 'Wildberries did not complete the review report in time.', 'execution', true);
-                recordExport(
-                    { ...result, status: 'failed', error: sellerError(error, 'REPORT_TIMEOUT', 'Wildberries did not complete the review report in time.') },
-                    { systemic: !reportVerdict }
-                );
-                continue;
-            }
-
-            // Polling can burn the whole budget on its own, so the report being ready is not proof there
-            // is still time to fetch it. Crossing here would surface as an authorization failure.
-            if (deadlineExceeded()) {
-                packageAborted = true;
-                recordExport(deadlineFailure(result));
-                continue;
-            }
-
-            let artifact;
-            let downloadError;
-            for (let attempt = 0; attempt < maxDownloadAttempts; attempt += 1) {
-                // The reserve covers every attempt, but a first attempt that ran long can still eat it.
-                if (attempt > 0 && deadlineExceeded()) break;
-                /** @type {{ appendChunk: (index: number, data: string) => Promise<void>, complete: (completion: { size: number, sha256: string }) => Promise<unknown>, abort: () => Promise<void> } | undefined} */
-                let writer;
-                // Ownership is per attempt: cancelling a later export must never invalidate an
-                // earlier accepted XLSX. A completion arriving after cancellation is fenced;
-                // an already accepted completion survives a later enclosing transport failure.
-                const writerController = new AbortController();
-                let activeHandlers = 0;
-                const withWriterOwnership = async (operation) => {
-                    activeHandlers += 1;
-                    try {
-                        writerController.signal.throwIfAborted();
-                        return await operation();
-                    } finally {
-                        activeHandlers -= 1;
-                    }
-                };
-                try {
-                    await pacedRequestSellerOperation(
-                        { exportIndex, isAnswered: sellerExport.isAnswered, stage: SELLER_OPERATION_STAGES.download, reportId },
-                        {
-                            onStart: () => withWriterOwnership(async () => {
-                                if (writer) throw new Error('Seller artifact stream started more than once');
-                                writer = await createArtifactWriter({
-                                    jobId: artifactExecutionId,
-                                    fileName: sellerArtifactName(sellerExport),
-                                    mimeType: SELLER_XLSX_MIME_TYPE,
-                                    signal: writerController.signal,
-                                });
-                                if (writerController.signal.aborted) {
-                                    try {
-                                        await writer.abort();
-                                    } catch {
-                                        console.error('ARTIFACT_CLEANUP_FAILED: Deferred WB workbook cleanup failed.');
-                                    }
-                                    writerController.signal.throwIfAborted();
-                                }
-                            }),
-                            onChunk: (index, data) => withWriterOwnership(async () => {
-                                if (!writer) throw new Error('Seller artifact stream chunk arrived before start');
-                                await writer.appendChunk(index, data);
-                            }),
-                            onEnd: ({ size, sha256 }) => withWriterOwnership(async () => {
-                                if (!writer) throw new Error('Seller artifact stream ended before start');
-                                const completed = await writer.complete({ size, sha256 });
-                                writerController.signal.throwIfAborted();
-                                artifact = completed;
-                            }),
-                        },
-                        downloadTimeoutMs
-                    );
-                    if (!artifact) throw new Error('Seller artifact stream completed without publishing an artifact');
+                    packageAborted = true;
                     break;
-                } catch (error) {
-                    downloadError = error;
-                    if (artifact) break;
-                    writerController.abort(error);
-                    if (activeHandlers > 0) {
-                        // The real writer marks cancellation synchronously and owns cleanup behind
-                        // its write chain. Keep that cleanup caught without holding the public result
-                        // hostage to a filesystem operation. Do not retry while old I/O is outstanding.
-                        if (writer) void writer.abort().catch(() => {
-                            console.error('ARTIFACT_CLEANUP_FAILED: Deferred WB workbook cleanup failed.');
-                        });
+                }
+                pollFailure = error;
+                consecutivePollFailures += 1;
+                // Repeated failures are not "not ready yet": a successful poll returning inProgress
+                // resets the counter, so reaching the threshold means the endpoint is answering
+                // badly and the rest of the budget would be spent for nothing. Only a retryable
+                // cause leaves the remaining exports alive.
+                if (consecutivePollFailures >= maxConsecutivePollFailures) {
+                    pollBreakerTripped = true;
+                    // Slowness is not refusal. A cabinet that keeps timing out may still finish the
+                    // next report, so the export gives up while the package goes on; only a failure
+                    // that says the cabinet will answer the same way for everyone stops the run.
+                    if (error?.retryable !== true && !SELLER_RETRY_ONLY_CODES.has(error?.code)) {
                         packageAborted = true;
-                        break;
                     }
-                    if (writer) {
-                        try {
-                            await writer.abort();
-                        } catch (cleanupError) {
-                            downloadError = new ToolExecutionError(
-                                'ARTIFACT_CLEANUP_FAILED',
-                                'The partial review workbook could not be removed safely.',
-                                'storage',
-                                false,
-                                { cause: new AggregateError([error, cleanupError], 'Download and artifact cleanup both failed') }
-                            );
-                            packageAborted = true;
-                            break;
-                        }
-                    }
-                    // The same completed workbook cannot shrink on another download attempt.
-                    if (error instanceof ToolExecutionError && error.code === 'ARTIFACT_TOO_LARGE') break;
-                    if (abortsSellerPackage(error)) {
-                        packageAborted = true;
-                        break;
-                    }
+                    break;
                 }
             }
-            if (artifact) {
-                recordExport({ ...result, status: 'complete', artifact });
-            } else {
-                recordExport({
-                    ...result,
-                    status: 'failed',
-                    error: sellerError(downloadError, 'ARTIFACT_STORAGE_FAILED', 'The review workbook could not be stored locally.', 'storage', true),
-                }, { systemic: downloadError?.code !== 'ARTIFACT_TOO_LARGE' });
-            }
+            if (poll + 1 >= maxPollsPerReport) break;
+            // Give up polling in time to still download whatever is already complete rather than
+            // letting the scope expiry cancel the operation mid-poll.
+            if (now() + pollIntervalMs >= jobDeadline) break;
+            await delayFn(pollIntervalMs);
+        }
+        if (!reportReady) {
+            // A tripped breaker carries the real cause: reporting it as a timeout would tell the
+            // agent to wait longer for a report that was never being refused for time reasons. An
+            // opaque failure has no cause to carry, so it must at least not claim to be a
+            // retryable timeout while the package it just stopped stays stopped.
+            const error = pollBreakerTripped
+                ? pollFailure instanceof ToolExecutionError
+                    ? pollFailure
+                    : new ToolExecutionError(
+                          'REPORT_POLL_FAILED',
+                          'Wildberries stopped answering polls for this review report.',
+                          'execution',
+                          false
+                      )
+                : pollFailure instanceof ToolExecutionError && abortsSellerPackage(pollFailure)
+                  ? pollFailure
+                  : pollFailure instanceof ToolExecutionError && ['REPORT_STOPPED', 'REPORT_FAILED'].includes(pollFailure.code)
+                    ? pollFailure
+                    : new ToolExecutionError('REPORT_TIMEOUT', 'Wildberries did not complete the review report in time.', 'execution', true);
+            recordExport(
+                { ...result, status: 'failed', error: sellerError(error, 'REPORT_TIMEOUT', 'Wildberries did not complete the review report in time.') },
+                { systemic: !reportVerdict }
+            );
+            continue;
         }
 
-        const succeeded = exports.filter((item) => item.status === 'complete').length;
-        return {
-            ok: succeeded > 0,
-            status: succeeded === exports.length ? 'complete' : succeeded > 0 ? 'partial' : 'failed',
-            jobType: 'seller_reviews',
-            jobId,
-            ...(authorization.job.org ? { org: authorization.job.org } : {}),
-            exports,
-        };
-    } catch (error) {
-        primaryError = error;
-        throw error;
-    } finally {
-        // Direct executor callers may still own cleanup. The MCP dispatcher omits this callback because it must
-        // retain pins through authorization restoration and terminal response emission.
-        if (typeof releaseArtifactJob === 'function' && typeof artifactExecutionId === 'string' && artifactExecutionId.length > 0) {
+        // Polling can burn the whole budget on its own, so the report being ready is not proof there
+        // is still time to fetch it. Crossing here would surface as an authorization failure.
+        if (deadlineExceeded()) {
+            packageAborted = true;
+            recordExport(deadlineFailure(result));
+            continue;
+        }
+
+        let artifact;
+        let downloadError;
+        for (let attempt = 0; attempt < maxDownloadAttempts; attempt += 1) {
+            // The reserve covers every attempt, but a first attempt that ran long can still eat it.
+            if (attempt > 0 && deadlineExceeded()) break;
+            /** @type {{ appendChunk: (index: number, data: string) => Promise<void>, complete: (completion: { size: number, sha256: string }) => Promise<unknown>, abort: () => Promise<void> } | undefined} */
+            let writer;
+            // Ownership is per attempt: cancelling a later export must never invalidate an
+            // earlier accepted XLSX. A completion arriving after cancellation is fenced;
+            // an already accepted completion survives a later enclosing transport failure.
+            const writerController = new AbortController();
+            let activeHandlers = 0;
+            const withWriterOwnership = async (operation) => {
+                activeHandlers += 1;
+                try {
+                    writerController.signal.throwIfAborted();
+                    return await operation();
+                } finally {
+                    activeHandlers -= 1;
+                }
+            };
             try {
-                await releaseArtifactJob(artifactExecutionId, { deferWhileActive: true });
-            } catch (releaseError) {
-                if (!primaryError) throw releaseError;
+                await pacedRequestSellerOperation(
+                    { exportIndex, isAnswered: sellerExport.isAnswered, stage: SELLER_OPERATION_STAGES.download, reportId },
+                    {
+                        onStart: () => withWriterOwnership(async () => {
+                            if (writer) throw new Error('Seller artifact stream started more than once');
+                            writer = await createArtifactWriter({
+                                fileName: sellerArtifactName(sellerExport),
+                                mimeType: SELLER_XLSX_MIME_TYPE,
+                                signal: writerController.signal,
+                                jobBudget,
+                            });
+                            if (writerController.signal.aborted) {
+                                try {
+                                    await writer.abort();
+                                } catch {
+                                    console.error('ARTIFACT_CLEANUP_FAILED: Deferred WB workbook cleanup failed.');
+                                }
+                                writerController.signal.throwIfAborted();
+                            }
+                        }),
+                        onChunk: (index, data) => withWriterOwnership(async () => {
+                            if (!writer) throw new Error('Seller artifact stream chunk arrived before start');
+                            await writer.appendChunk(index, data);
+                        }),
+                        onEnd: ({ size, sha256 }) => withWriterOwnership(async () => {
+                            if (!writer) throw new Error('Seller artifact stream ended before start');
+                            const completed = await writer.complete({ size, sha256 });
+                            writerController.signal.throwIfAborted();
+                            artifact = completed;
+                        }),
+                    },
+                    downloadTimeoutMs
+                );
+                if (!artifact) throw new Error('Seller artifact stream completed without publishing an artifact');
+                break;
+            } catch (error) {
+                downloadError = error;
+                if (artifact) break;
+                writerController.abort(error);
+                if (activeHandlers > 0) {
+                    // The real writer marks cancellation synchronously and owns cleanup behind
+                    // its write chain. Keep that cleanup caught without holding the public result
+                    // hostage to a filesystem operation. Do not retry while old I/O is outstanding.
+                    if (writer) void writer.abort().catch(() => {
+                        console.error('ARTIFACT_CLEANUP_FAILED: Deferred WB workbook cleanup failed.');
+                    });
+                    packageAborted = true;
+                    break;
+                }
+                if (writer) {
+                    try {
+                        await writer.abort();
+                    } catch (cleanupError) {
+                        downloadError = new ToolExecutionError(
+                            'ARTIFACT_CLEANUP_FAILED',
+                            'The partial review workbook could not be removed safely.',
+                            'storage',
+                            false,
+                            { cause: new AggregateError([error, cleanupError], 'Download and artifact cleanup both failed') }
+                        );
+                        packageAborted = true;
+                        break;
+                    }
+                }
+                // The same completed workbook cannot shrink on another download attempt.
+                if (error instanceof ToolExecutionError && error.code === 'ARTIFACT_TOO_LARGE') break;
+                if (abortsSellerPackage(error)) {
+                    packageAborted = true;
+                    break;
+                }
             }
+        }
+        if (artifact) {
+            recordExport({ ...result, status: 'complete', artifact });
+        } else {
+            recordExport({
+                ...result,
+                status: 'failed',
+                error: sellerError(downloadError, 'ARTIFACT_STORAGE_FAILED', 'The review workbook could not be stored locally.', 'storage', true),
+            }, { systemic: downloadError?.code !== 'ARTIFACT_TOO_LARGE' });
         }
     }
+
+    const succeeded = exports.filter((item) => item.status === 'complete').length;
+    return {
+        ok: succeeded > 0,
+        status: succeeded === exports.length ? 'complete' : succeeded > 0 ? 'partial' : 'failed',
+        jobType: 'seller_reviews',
+        jobId,
+        ...(authorization.job.org ? { org: authorization.job.org } : {}),
+        exports,
+    };
+
 };
 
 export const executeAuthorizedBrowserJob = async ({

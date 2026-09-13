@@ -3,7 +3,7 @@
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 
-import { pruneLegacyArtifacts } from './artifact-store.mjs';
+import { pruneArtifacts } from './artifact-store.mjs';
 import { createBridgeRuntime } from './bridge-runtime.mjs';
 import {
     BRIDGE_GENERATION,
@@ -25,7 +25,7 @@ import {
 import { ConnectionState } from './connection-state.mjs';
 import { deriveBridgeDiagnostics } from './bridge-diagnostics.mjs';
 import { createExtensionProtocol } from './extension-protocol.mjs';
-import { maintainFeedbackArtifacts, startFeedbackArtifactMaintenance } from './feedback-artifact-store.mjs';
+import { maintainFeedbackArtifacts } from './feedback-artifact-store.mjs';
 import { localMessage, MESSAGE_TYPES } from './extension-vocabulary.mjs';
 import { HandoffState } from './handoff-state.mjs';
 import { createMcpMessageHandler } from './mcp-dispatcher.mjs';
@@ -34,7 +34,7 @@ import { loadOrCreatePeerToken, loadPeerToken } from './peer-auth.mjs';
 import { createPeerTokenSource } from './peer-token-source.mjs';
 import { createPeerProtocol } from './peer-protocol.mjs';
 import { RequestBroker } from './request-broker.mjs';
-import { pruneLegacyResults } from './result-store.mjs';
+import { pruneResults } from './result-store.mjs';
 import { createOzonPromotionRoute } from './server-routing.mjs';
 import { attachStdioTransport } from './stdio-transport.mjs';
 import { ToolExecutionError } from './tool-errors.mjs';
@@ -281,15 +281,13 @@ const handleMcpMessage = createMcpMessageHandler({
     log,
 });
 
-let feedbackMaintenance;
-let feedbackMaintenanceStart;
+let storageSweepStart;
 let shuttingDown = false;
 let detachStdio = () => undefined;
 const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    if (feedbackMaintenanceStart !== undefined) clearImmediate(feedbackMaintenanceStart);
-    feedbackMaintenance?.stop();
+    if (storageSweepStart !== undefined) clearImmediate(storageSweepStart);
     shutdownController.abort();
     detachStdio();
     runtime.close();
@@ -304,23 +302,22 @@ const shutdown = () => {
 };
 detachStdio = attachStdioTransport({ handleMessage: handleMcpMessage, sendError: mcpError, onClose: shutdown });
 runtime.start();
-// Artifact reconciliation is independent of MCP readiness. Schedule it only after STDIO and the bridge runtime
-// are live so a busy or delayed feedback filesystem can never extend the host's cold-start handshake.
-feedbackMaintenanceStart = setImmediate(() => {
-    feedbackMaintenanceStart = undefined;
+// One sweep of expired local files after STDIO and the bridge are live, so a slow filesystem can never
+// extend the host's cold-start handshake; later sweeps follow each writer.
+// Every root is swept on its own: one unavailable root (StorageUnavailableError) never skips the
+// others. Paths and raw storage errors are intentionally excluded from diagnostics.
+// Per-file failures are already reported by sweepExpired; this catches enclosing root failures.
+const sweepLocalStorage = async (sweeps) => {
+    const outcomes = await Promise.allSettled(sweeps.map((sweep) => sweep()));
+    if (outcomes.some((outcome) => outcome.status === 'rejected')) log('local storage cleanup failed');
+};
+const CURRENT_STORAGE_SWEEPS = [() => maintainFeedbackArtifacts(), () => pruneArtifacts(), () => pruneResults()];
+storageSweepStart = setImmediate(() => {
+    storageSweepStart = undefined;
     if (shuttingDown) return;
-    try {
-        feedbackMaintenance = startFeedbackArtifactMaintenance({
-            maintain: async () => {
-                await maintainFeedbackArtifacts();
-                await pruneLegacyArtifacts();
-                await pruneLegacyResults();
-            },
-            // Paths and raw storage errors are intentionally excluded from diagnostics.
-            onError: () => log('feedback artifact maintenance failed'),
-        });
-    } catch {
-        log('feedback artifact maintenance failed');
-    }
+    // One pass per process start, plus the writer-driven sweeps of prepare and retire: an unsent
+    // archive therefore lives at most until the next start. See the accepted residuals in
+    // docs/local-agent-architecture.md#accepted-residuals for why no maintenance timer exists.
+    void sweepLocalStorage(CURRENT_STORAGE_SWEEPS);
 });
-feedbackMaintenanceStart.unref?.();
+storageSweepStart.unref?.();

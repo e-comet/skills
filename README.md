@@ -85,8 +85,9 @@ claude plugin install e-comet-skills@e-comet-skills
 
 1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Configuration` и включите `Allow network access`.
 2. Откройте `Plugins`, нажмите `+` → `Add marketplace`. Укажите `https://github.com/e-comet/skills` в поле `Source` и нажмите `Add marketplace`.
-3. Там же, в `Plugins`, в разделе `Personal` нажмите `e-Comet MCP Tools` и в разделе `Hooks` выберите `Trust all`.
-4. Убедитесь, что оба MCP-сервера, `E-comet` и `E-comet-local`, готовы к работе (справа ⚙️), иначе нажмите `Install` / `Connect` и введите почту.
+3. Если в приложении ещё нет проектов, создайте проект.
+4. В `Plugins`, в разделе `Personal` нажмите `e-Comet MCP Tools` и в разделе `Hooks` выберите `Trust all`.
+5. Убедитесь, что оба MCP-сервера, `E-comet` и `E-comet-local`, готовы к работе (справа ⚙️), иначе нажмите `Install` / `Connect` и введите почту.
 
 </details>
 

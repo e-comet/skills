@@ -1,4 +1,5 @@
 import { ARTIFACT_MAX_FILE_BYTES, EXTENSION_PROTOCOL_VERSION, MAX_BROWSER_JOB_TEXT_LENGTH } from './config.mjs';
+import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
 import {
     AUTHORIZATION_FETCH_ERROR_CODES,
     EXTENSION_TO_CLIENT_MESSAGE_TYPES,
@@ -49,7 +50,7 @@ const isValidBase64Chunk = (value) => {
 export const isValidOzonReportPhase = (value) =>
     isRecord(value) && hasOnlyKeys(value, ['family', 'frameId', 'itemIndex', 'phase']) &&
     ['promotion', 'analytics'].includes(value.family) && isBoundedString(value.frameId, 128) &&
-    isNonNegativeSafeInteger(value.itemIndex) && value.itemIndex < 50 &&
+    isNonNegativeSafeInteger(value.itemIndex) && value.itemIndex < MAX_OZON_REPORT_PACKAGE_ITEMS &&
     ['pre_create', 'create_dispatched', 'create_settled', 'polling', 'downloading', 'streaming'].includes(value.phase);
 
 export const isValidSellerOperation = (value) => {
@@ -103,7 +104,7 @@ export const isValidOzonReportPackageRequest = (value) => {
         value.deadlineAt <= 0 ||
         !Array.isArray(value.items) ||
         value.items.length < 1 ||
-        value.items.length > 50 ||
+        value.items.length > MAX_OZON_REPORT_PACKAGE_ITEMS ||
         (value.family !== 'promotion' && value.family !== 'analytics')
     ) {
         return false;

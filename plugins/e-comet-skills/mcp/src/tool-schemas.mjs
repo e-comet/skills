@@ -12,6 +12,7 @@ import {
 } from './config.mjs';
 import { PEER_REJECTION_CODES } from './connection-state.mjs';
 import { FEEDBACK_DIAGNOSTIC_OPERATIONS, FEEDBACK_DIAGNOSTIC_ERROR_TYPES, FEEDBACK_DIAGNOSTIC_SYSTEM_CODES, FEEDBACK_DIAGNOSTIC_MODULES, FEEDBACK_DIAGNOSTIC_REASONS } from './feedback-diagnostics.mjs';
+import { feedbackCloudTransportSchema, feedbackHostAdapterMarkerSchema } from './feedback-host-adapter.mjs';
 import {
     EXTENSION_UPDATE_URL,
     FETCH_ERROR_CODES,
@@ -740,7 +741,7 @@ const liveInputSchema = (limitName, scope) =>
         ...(limitName ? projectionProperties(limitName, scope) : {}),
     });
 
-const feedbackArtifactId = { type: 'string', pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' };
+export const feedbackArtifactIdSchema = { type: 'string', pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' };
 const feedbackSha256 = { type: 'string', pattern: '^[a-f0-9]{64}$' };
 const feedbackClaim = { type: 'string', pattern: '^[A-Za-z0-9_-]{43}$' };
 const feedbackSession = { type: 'string', pattern: '^[a-f0-9]{64}$' };
@@ -750,7 +751,7 @@ const hookOnlyFeedbackField = (description) => ({
         `${description.description} Injected by the trusted Claude or Codex host hook immediately before this local tool call; ` +
         'model-authored arguments must omit it and every snake_case alias.',
 });
-// Preserve authored report text: the STDIO message and trusted prepare binding enforce
+// Preserve authored report text: the STDIO message limit and trusted prepare hook enforce
 // MAX_MCP_MESSAGE_BYTES before rendering. The archive budget also includes the transcript;
 // it is not a replacement per-field allowance for model-authored summary/details.
 const feedbackPrepareSchema = object(
@@ -760,25 +761,31 @@ const feedbackPrepareSchema = object(
         details: { type: 'string', minLength: 1 },
         includeTranscript: boolean,
         transcriptPath: hookOnlyFeedbackField({ type: 'string', minLength: 1, maxLength: 4096, description: 'Trusted local transcript path.' }),
-        feedbackClaim: hookOnlyFeedbackField({ ...feedbackClaim, description: 'One-use local feedback handoff claim.' }),
+        feedbackClaim: hookOnlyFeedbackField({ ...feedbackClaim, description: 'Local feedback handoff signature injected by the trusted host hook.' }),
         feedbackSession: hookOnlyFeedbackField({ ...feedbackSession, description: 'Bound host-session digest for the feedback claim.' }),
+        feedbackAdapter: hookOnlyFeedbackField({ ...feedbackHostAdapterMarkerSchema, description: 'Host feedback result adapter marker.' }),
     },
     ['kind', 'summary', 'details', 'includeTranscript']
 );
 const feedbackSubmitSchema = object(
     {
-        artifactId: feedbackArtifactId,
+        artifactId: feedbackArtifactIdSchema,
         uploadUrl: hookOnlyFeedbackField({ type: 'string', minLength: 1, maxLength: 8192, description: 'Signed HTTPS upload URL.' }),
         requiredHeaders: hookOnlyFeedbackField({ type: 'object', properties: {}, additionalProperties: { type: 'string', maxLength: 8192 }, description: 'Signed required request headers.' }),
         objectKey: hookOnlyFeedbackField({ type: 'string', minLength: 1, maxLength: 1024, description: 'Storage object key.' }),
         expiresAt: hookOnlyFeedbackField({ type: 'integer', minimum: 1, description: 'Upload grant expiry timestamp.' }),
         expectedSize: hookOnlyFeedbackField({ type: 'integer', minimum: 1, maximum: FEEDBACK_MAX_BYTES, description: 'Expected archive size in bytes.' }),
         expectedSha256: hookOnlyFeedbackField({ ...feedbackSha256, description: 'Expected archive SHA-256.' }),
-        feedbackClaim: hookOnlyFeedbackField({ ...feedbackClaim, description: 'One-use local feedback handoff claim.' }),
+        feedbackClaim: hookOnlyFeedbackField({ ...feedbackClaim, description: 'Local feedback handoff signature injected by the trusted host hook.' }),
         feedbackSession: hookOnlyFeedbackField({ ...feedbackSession, description: 'Bound host-session digest for the feedback claim.' }),
+        feedbackCloud: hookOnlyFeedbackField({ ...feedbackCloudTransportSchema, description: 'Cloud transport injected by the trusted cloud hook: grant-bound archive bytes for device-side upload.' }),
     },
     ['artifactId']
 );
+// Every feedback error message is bounded the same way. Hook-authored messages import this bound instead
+// of restating it, so a published result can never fall out of the schema it is validated against.
+export const FEEDBACK_MESSAGE_MAX_LENGTH = 500;
+const feedbackMessage = { type: 'string', minLength: 1, maxLength: FEEDBACK_MESSAGE_MAX_LENGTH };
 export const feedbackDiagnosticsSchema = object({
     operation: { type: 'string', enum: FEEDBACK_DIAGNOSTIC_OPERATIONS },
     errorType: { type: 'string', enum: FEEDBACK_DIAGNOSTIC_ERROR_TYPES },
@@ -789,24 +796,26 @@ export const feedbackDiagnosticsSchema = object({
 }, ['operation']);
 const feedbackErrorObject = (properties, required) => object({ ...properties, details: feedbackDiagnosticsSchema }, required);
 const feedbackErrorSchema = objectUnion(
-    feedbackErrorObject({ code: { const: 'FEEDBACK_SUBMISSION_FAILED' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'submit' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'handoff' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'ARTIFACT_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'artifact' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'UPLOAD_GRANT_INVALID' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'grant' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'UPLOAD_REJECTED' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'UPLOAD_UNCERTAIN' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable'])
+    feedbackErrorObject({ code: { const: 'FEEDBACK_SUBMISSION_FAILED' }, message: feedbackMessage, stage: { const: 'submit' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE' }, message: feedbackMessage, stage: { const: 'handoff' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'ARTIFACT_UNAVAILABLE' }, message: feedbackMessage, stage: { const: 'artifact' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'UPLOAD_GRANT_INVALID' }, message: feedbackMessage, stage: { const: 'grant' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'UPLOAD_REJECTED' }, message: feedbackMessage, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'UPLOAD_UNCERTAIN' }, message: feedbackMessage, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'UPLOAD_DESTINATION_REFUSED' }, message: feedbackMessage, stage: { const: 'grant' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_ARCHIVE_MISMATCH' }, message: feedbackMessage, stage: { const: 'artifact' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable'])
 );
 const feedbackPreparationErrorSchema = objectUnion(
-    feedbackErrorObject({ code: { const: 'FEEDBACK_INPUT_INVALID' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'prepare' }, retryable: { const: false }, recommendedAction: { const: 'RETRY_WITH_VALID_REPORT' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'handoff' }, retryable: { const: false }, recommendedAction: { const: 'CHECK_FEEDBACK_HOOKS' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_CLAIM_INVALID' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'handoff' }, retryable: { const: false }, recommendedAction: { const: 'RESTART_FEEDBACK_FLOW' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
-    feedbackErrorObject({ code: { const: 'TRANSCRIPT_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'transcript' }, retryable: { const: true }, recommendedAction: { const: 'RETRY_FEEDBACK_ONCE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_ARCHIVE_FAILED' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'archive' }, retryable: { const: true }, recommendedAction: { const: 'RETRY_FEEDBACK_ONCE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_STORAGE_UNAVAILABLE' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'storage' }, retryable: { const: true }, recommendedAction: { const: 'CHECK_LOCAL_STORAGE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_PREPARATION_FAILED' }, message: { type: 'string', minLength: 1, maxLength: 500 }, stage: { const: 'prepare' }, retryable: { const: true }, recommendedAction: { const: 'RETRY_FEEDBACK_ONCE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction'])
+    feedbackErrorObject({ code: { const: 'FEEDBACK_INPUT_INVALID' }, message: feedbackMessage, stage: { const: 'prepare' }, retryable: { const: false }, recommendedAction: { const: 'RETRY_WITH_VALID_REPORT' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE' }, message: feedbackMessage, stage: { const: 'handoff' }, retryable: { const: false }, recommendedAction: { const: 'CHECK_FEEDBACK_HOOKS' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_CLAIM_INVALID' }, message: feedbackMessage, stage: { const: 'handoff' }, retryable: { const: false }, recommendedAction: { const: 'RESTART_FEEDBACK_FLOW' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
+    feedbackErrorObject({ code: { const: 'TRANSCRIPT_UNAVAILABLE' }, message: feedbackMessage, stage: { const: 'transcript' }, retryable: { const: true }, recommendedAction: { const: 'RETRY_FEEDBACK_ONCE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_ARCHIVE_FAILED' }, message: feedbackMessage, stage: { const: 'archive' }, retryable: { const: true }, recommendedAction: { const: 'RETRY_FEEDBACK_ONCE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_STORAGE_UNAVAILABLE' }, message: feedbackMessage, stage: { const: 'storage' }, retryable: { const: true }, recommendedAction: { const: 'CHECK_LOCAL_STORAGE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
+    feedbackErrorObject({ code: { const: 'FEEDBACK_PREPARATION_FAILED' }, message: feedbackMessage, stage: { const: 'prepare' }, retryable: { const: true }, recommendedAction: { const: 'RETRY_FEEDBACK_ONCE' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction'])
 );
 const feedbackPrepareSuccessSchema = object(
-    { ok: { const: true }, status: { const: 'prepared' }, artifactId: feedbackArtifactId, kind: { type: 'string', enum: FEEDBACK_KINDS }, sizeBytes: positiveInteger, sha256: feedbackSha256, transcriptIncluded: boolean, summary: { type: 'string', minLength: 1, maxLength: 512 } },
+    { ok: { const: true }, status: { const: 'prepared' }, artifactId: feedbackArtifactIdSchema, kind: { type: 'string', enum: FEEDBACK_KINDS }, sizeBytes: positiveInteger, sha256: feedbackSha256, transcriptIncluded: boolean, summary: { type: 'string', minLength: 1, maxLength: 512 } },
     ['ok', 'status', 'artifactId', 'kind', 'sizeBytes', 'sha256', 'transcriptIncluded', 'summary']
 );
 const feedbackPrepareFailureSchema = object(
@@ -814,12 +823,38 @@ const feedbackPrepareFailureSchema = object(
     ['ok', 'status', 'error']
 );
 const feedbackSubmitSuccessSchema = object(
-    { ok: { const: true }, status: { const: 'uploaded' }, artifactId: feedbackArtifactId, transcriptIncluded: boolean },
+    { ok: { const: true }, status: { const: 'uploaded' }, artifactId: feedbackArtifactIdSchema, transcriptIncluded: boolean },
     ['ok', 'status', 'artifactId', 'transcriptIncluded']
 );
 const feedbackSubmitFailureSchema = object(
-    { ok: { const: false }, status: { type: 'string', enum: ['failed', 'rejected', 'uncertain'] }, artifactId: feedbackArtifactId, error: feedbackErrorSchema },
+    { ok: { const: false }, status: { type: 'string', enum: ['failed', 'rejected', 'uncertain'] }, artifactId: feedbackArtifactIdSchema, error: feedbackErrorSchema },
     ['ok', 'status', 'error']
+);
+const feedbackCloudNotStartedSchema = object({
+    ok: { const: false }, status: { const: 'not_started' }, artifactId: feedbackArtifactIdSchema,
+    // insufficient_execution_budget is no longer produced: no hook uploads, so neither runs a budget
+    // check. It stays accepted so attempt and operation records the previous build wrote remain
+    // readable for the rest of their 24-hour retention.
+    reason: { type: 'string', enum: ['insufficient_execution_budget', 'FEEDBACK_GRANT_REFRESH_REQUIRED'] },
+    error: feedbackErrorObject({ code: { type: 'string', enum: ['insufficient_execution_budget', 'FEEDBACK_GRANT_REFRESH_REQUIRED', 'FEEDBACK_GRANT_MISSING', 'FEEDBACK_SUBMISSION_FAILED'] },
+        message: feedbackMessage, stage: { const: 'handoff' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+}, ['ok', 'status', 'artifactId', 'error']);
+const feedbackPrepareHostUnavailableSchema = object(
+    {
+        ok: { const: false },
+        status: { const: 'host_result_unavailable' },
+        adapter: object({
+            ...feedbackHostAdapterMarkerSchema.properties,
+            targetTool: { const: 'prepare_e_comet_feedback' },
+        }, ['version', 'operationId', 'nonce', 'targetTool']),
+        error: object({
+            code: { const: 'FEEDBACK_HOST_RESULT_UNAVAILABLE' },
+            message: feedbackMessage,
+            stage: { const: 'handoff' },
+            retryable: { const: false },
+        }, ['code', 'message', 'stage', 'retryable']),
+    },
+    ['ok', 'status', 'adapter', 'error']
 );
 
 export const toolInputSchemas = {
@@ -896,8 +931,8 @@ export const toolOutputSchemas = {
     wb_check_by_query: objectUnion(...liveAggregateSchemas(checkSuccessSchema), toolErrorSchema),
     wb_recommendations_by_product: objectUnion(...liveAggregateSchemas(recommendationsSuccessSchema), toolErrorSchema),
     wb_seller_reviews: objectUnion(sellerReviewsSuccessSchema, toolErrorSchema),
-    prepare_e_comet_feedback: objectUnion(feedbackPrepareSuccessSchema, feedbackPrepareFailureSchema),
-    submit_e_comet_feedback: objectUnion(feedbackSubmitSuccessSchema, feedbackSubmitFailureSchema),
+    prepare_e_comet_feedback: objectUnion(feedbackPrepareSuccessSchema, feedbackPrepareFailureSchema, feedbackPrepareHostUnavailableSchema),
+    submit_e_comet_feedback: objectUnion(feedbackSubmitSuccessSchema, feedbackSubmitFailureSchema, feedbackCloudNotStartedSchema),
     wb_product_images: objectUnion(...liveAggregateSchemas(imagesSuccessSchema), toolErrorSchema),
     ozon_seller_promotion_report: objectUnion(ozonPromotionSuccessSchema, ozonPromotionFailureSchema, ozonPromotionPreflightFailureSchema),
     ozon_seller_promotion_reports: packageResultSchema(

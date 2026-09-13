@@ -1,6 +1,8 @@
 import { posix, win32 } from 'node:path';
 import { resolveLocalStateDir } from './state-paths.mjs';
 
+// Mixed-release quota eviction is an accepted residual; keep these paths and direct overrides stable.
+// See docs/local-agent-architecture.md#accepted-residuals.
 const OUTPUT_SUBTREE = 'local-mcp-output-v2';
 const UNEXPANDED_BRACED_PATH = /\$\{[^}]+\}/;
 const UNEXPANDED_COMPONENT = /^(?:\$[A-Za-z_][A-Za-z0-9_]*|%[^%]+%)$/;

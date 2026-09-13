@@ -29,7 +29,7 @@ connected extension's version and family-specific Ozon capability verdicts; thes
 are informational and never replace the typed tool's own capability gate. Peer-token storage affects pairing only;
 `peerRejection.code` identifies the observed pairing failure. Storage-dependent calls return the typed
 `LOCAL_STORAGE_UNAVAILABLE` outcome when no valid host plugin-data root or explicit store override exists.
-The peer token and normal feedback-claim rendezvous remain in shared profile state, outside host-specific
+The peer token and the feedback hook secret remain in shared profile state, outside host-specific
 plugin-data output, so concurrently running supported hosts can coordinate the same local lifecycle.
 
 The canonical source and tests live under `e-comet-local-mcp/` in the private skills repository. This plugin contains a
@@ -97,13 +97,13 @@ skipped item.
 unanswered physical reports, and preserves successful work when another export fails. It returns compact status metadata plus
 one private local `resource_link` for each successful XLSX workbook. Workbook bytes and base64 never enter tool content or model
 context; opening or summarizing a workbook is a separate explicit action. Artifacts are retained locally for 24 hours. Each
-workbook is limited to 100 MiB and each job to 500 MiB; the shared artifact store is limited to 512 MiB and 1000 files, with
-oldest completed artifacts evicted first.
+workbook is limited to 100 MiB and each job to 500 MiB; a completed workbook is never evicted by another export and is
+removed only once its retention has elapsed.
 
 Ozon tools likewise return the original XLSX workbooks as private `resource_link` entries rooted in the launching
 host's plugin data. The plugin does not add a workbook reader or converter; the originating agent may use its normal
-file and spreadsheet capabilities when the user asks to inspect a workbook. Legacy platform-data stores are read,
-retired, or cleaned only by bounded maintenance; new payloads never fall back there.
+file and spreadsheet capabilities when the user asks to inspect a workbook. Files of older releases are left where
+they are; new payloads never fall back there.
 
 `ozon_seller_promotion_report` needs an extension build that announces the Ozon promotion capability. An older
 build cannot run the report at all, so the tool answers with an explicit outdated-extension diagnosis naming the

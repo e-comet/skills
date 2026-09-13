@@ -39,7 +39,7 @@ export const executeOzonPromotionJob = async ({
     dateTo,
     requestOzonPromotionReport,
     createArtifactWriter,
-    artifactJobId = authorization?.job?.jobId,
+    jobBudget = { bytes: 0 },
     now = Date.now,
 }) => {
     try {
@@ -78,10 +78,10 @@ export const executeOzonPromotionJob = async ({
                 onStart: async (_metadata, signal) => {
                     if (stream.writer) throw artifactRejected(new Error('Ozon artifact stream started more than once'));
                     stream.writer = await createArtifactWriter({
-                        jobId: artifactJobId,
                         fileName: ozonPromotionArtifactName(dateFrom, dateTo),
                         mimeType: XLSX_MIME_TYPE,
                         validateXlsx: true,
+                        jobBudget,
                         ...(signal === undefined ? {} : { signal }),
                     });
                 },
@@ -136,7 +136,7 @@ export const executeOzonPromotionPackageJob = async ({
     periods,
     requestOzonReportPackage,
     createArtifactWriter,
-    artifactJobId = authorization?.job?.jobId,
+    jobBudget = { bytes: 0 },
     now = Date.now,
 }) => {
     try {
@@ -161,10 +161,10 @@ export const executeOzonPromotionPackageJob = async ({
         family: 'promotion',
         jobType: 'ozon_seller_promotion_reports',
         items: periods,
-        artifactJobId,
         packageDeadline,
         requestOzonReportPackage,
         createArtifactWriter,
+        jobBudget,
         artifactName: ({ dateFrom, dateTo }) => ozonPromotionArtifactName(dateFrom, dateTo),
         normalizeError: (error) => {
             if (error instanceof StorageUnavailableError) {
@@ -174,6 +174,5 @@ export const executeOzonPromotionPackageJob = async ({
             return { code: safe.code, message: safe.message, stage: safe.stage, retryable: false,
                 ...(safe.code === 'OZON_EXECUTION_INTERRUPTED' && safe.details ? { details: safe.details } : {}) };
         },
-        now,
     });
 };

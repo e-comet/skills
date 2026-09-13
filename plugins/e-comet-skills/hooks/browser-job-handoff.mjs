@@ -1,26 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { feedbackDiagnostics } from '../mcp/src/feedback-diagnostics.mjs';
+import { sweepExpired } from '../mcp/src/file-retention.mjs';
+import { retryTransientFileOperation } from './transient-file-operation.mjs';
 
 const MAX_HOOK_EVENT_BYTES = 1024 * 1024;
 const MAX_SESSION_ID_BYTES = 512;
 const MAX_TRIGGER_URL_BYTES = 131072;
-const MAX_PENDING_ENTRIES = 128;
 const HANDOFF_TTL_MS = 90_000;
 const CLOCK_SKEW_MS = 5_000;
 const STORE_DIRECTORY = 'browser-job-handoff-v1';
-const PENDING_FILE_PATTERN = /^[a-f0-9]{64}\.json$/;
-const CLAIM_FILE_PREFIX = '.claim-';
-const LOCK_CANDIDATE_PATTERN = /^\.claim-lock-\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const STAGE_FILE_PREFIX = '.stage-';
-const COLLISION_FILE_PREFIX = '.collision-';
-const LOCK_FILE_SUFFIX = '.lock';
-const LOCK_RETRY_DELAY_MS = 5;
-const LOCK_RETRY_LIMIT = 200;
-const LOCK_RELEASE_RETRY_LIMIT = 20;
-const TRANSIENT_WINDOWS_LOCK_ERRORS = new Set(['EPERM', 'EBUSY']);
+const CLAIM_MARKER_SUFFIX = '.claimed';
 const REMOTE_BROWSER_JOB_TOOL = /^mcp__.+__browser_job$/;
 const LOCAL_BROWSER_TOOL =
     /^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:wb_product_card|wb_search_by_query|wb_check_by_query|wb_recommendations_by_product|wb_seller_reviews|ozon_seller_promotion_report|ozon_seller_promotion_reports|ozon_seller_analytics_report)$/;
@@ -35,6 +27,17 @@ const LOCAL_TOOL_BY_BROWSER_JOB_TYPE = Object.freeze({
     ozon_seller_analytics_report: 'ozon_seller_analytics_report',
 });
 const SIGNED_LOCAL_TOOLS = new Set(Object.values(LOCAL_TOOL_BY_BROWSER_JOB_TYPE));
+const SESSION_HASH_SOURCE = '[a-f0-9]{64}';
+const UUID_SOURCE = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const SIGNED_TOOLS_SOURCE = [...SIGNED_LOCAL_TOOLS].join('|');
+// Everything this hook may ever create in its root directory: one pending authorization, the marker that
+// consumes it exactly once, and the temporary name an authorization is published from. Housekeeping
+// recognizes nothing else, so a foreign file in the same directory is never touched — including every
+// leftover of the previous build (`<hash>.json`, `.claim-*`, `.stage-*`, `.collision-*`, `<hash>.lock`),
+// which is neither read nor removed.
+const OWN_STATE_FILE = new RegExp(
+    `^${SESSION_HASH_SOURCE}-(?:${SIGNED_TOOLS_SOURCE})-${UUID_SOURCE}\\.json(?:\\.claimed|\\.tmp-${UUID_SOURCE})?$`
+);
 
 class HandoffError extends Error {
     constructor(code, message) {
@@ -88,11 +91,8 @@ const resolveStoreDirectory = (env) => {
     return join(resolve(pluginData), STORE_DIRECTORY);
 };
 
-const pendingPathForSession = (storeDirectory, sessionId) => join(storeDirectory, `${hashSessionId(sessionId)}.json`);
-const lockPathForSession = (storeDirectory, sessionId) => join(storeDirectory, `${hashSessionId(sessionId)}${LOCK_FILE_SUFFIX}`);
-const stageFilePrefixForSession = (sessionId) => `${STAGE_FILE_PREFIX}${hashSessionId(sessionId)}-`;
-const collisionPathForSession = (storeDirectory, sessionId) =>
-    join(storeDirectory, `${COLLISION_FILE_PREFIX}${hashSessionId(sessionId)}`);
+const entryFilePattern = (sessionId, targetTool) =>
+    new RegExp(`^${hashSessionId(sessionId)}-${targetTool}-${UUID_SOURCE}\\.json$`);
 
 const parseStoredEntry = (text, { requireTarget = false } = {}) => {
     let entry;
@@ -122,23 +122,6 @@ const parseStoredEntry = (text, { requireTarget = false } = {}) => {
 const isEntryFresh = (entry, nowMs) =>
     entry.createdAtMs <= nowMs + CLOCK_SKEW_MS && nowMs - entry.createdAtMs <= HANDOFF_TTL_MS;
 
-export const removeFile = async (
-    path,
-    { retryLimit = LOCK_RELEASE_RETRY_LIMIT, waitForRetry = wait, operations = {} } = {}
-) => {
-    const unlinkFile = operations.unlink ?? unlink;
-    for (let attempt = 0; attempt < retryLimit; attempt += 1) {
-        try {
-            await unlinkFile(path);
-            return;
-        } catch (error) {
-            if (error?.code === 'ENOENT') return;
-            if (!TRANSIENT_WINDOWS_LOCK_ERRORS.has(error?.code) || attempt === retryLimit - 1) throw error;
-            await waitForRetry(LOCK_RETRY_DELAY_MS);
-        }
-    }
-};
-
 const ensurePrivateStoreDirectory = async (dataDirectory) => {
     await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
     if (process.platform !== 'win32') {
@@ -146,243 +129,25 @@ const ensurePrivateStoreDirectory = async (dataDirectory) => {
     }
 };
 
-const wait = (delayMs) => new Promise((resolveWait) => setTimeout(resolveWait, delayMs));
+// Age is the whole housekeeping rule. The window is the authorization lifetime plus the clock skew a
+// staging process may have against a claiming one, so a file this hook still considers claimable is
+// never removed. A removal that cannot happen now is retried by the next ordinary run: the shared
+// sweep never rejects and prints at most one STORAGE_CLEANUP_PENDING line to stderr on failure.
+const sweepStore = (dataDirectory, fileNowMs) =>
+    sweepExpired({
+        directory: dataDirectory,
+        ownName: (name) => OWN_STATE_FILE.test(name),
+        retentionMs: HANDOFF_TTL_MS + CLOCK_SKEW_MS,
+        now: fileNowMs,
+    });
 
-export const releaseOwnedSessionLock = async ({
-    lockPath,
-    ownerPath,
-    retryLimit = LOCK_RELEASE_RETRY_LIMIT,
-    waitForRetry = wait,
-    operations = {},
-}) => {
-    const unlinkOwner = operations.unlink ?? unlink;
-    const removeLockDirectory = operations.rmdir ?? rmdir;
-    const readLockDirectory = operations.readdir ?? readdir;
-    for (let attempt = 0; attempt < retryLimit; attempt += 1) {
-        try {
-            await unlinkOwner(ownerPath);
-            break;
-        } catch (error) {
-            if (error?.code === 'ENOENT') break;
-            if (!TRANSIENT_WINDOWS_LOCK_ERRORS.has(error?.code) || attempt === retryLimit - 1) throw error;
-            await waitForRetry(LOCK_RETRY_DELAY_MS);
-        }
-    }
-    for (let attempt = 0; attempt < retryLimit; attempt += 1) {
-        try {
-            await removeLockDirectory(lockPath);
-            return;
-        } catch (error) {
-            if (['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error?.code)) return;
-            if (!TRANSIENT_WINDOWS_LOCK_ERRORS.has(error?.code)) throw error;
-            try {
-                if ((await readLockDirectory(lockPath)).length > 0) return;
-            } catch (readError) {
-                if (readError?.code === 'ENOENT') return;
-                if (!TRANSIENT_WINDOWS_LOCK_ERRORS.has(readError?.code)) throw readError;
-            }
-            if (attempt === retryLimit - 1) throw error;
-            await waitForRetry(LOCK_RETRY_DELAY_MS);
-        }
-    }
-};
-
-const acquireSessionLock = async (storeDirectory, sessionId, fileNow) => {
-    const lockPath = lockPathForSession(storeDirectory, sessionId);
-    for (let attempt = 0; attempt < LOCK_RETRY_LIMIT; attempt += 1) {
-        const ownerId = `${process.pid}-${randomUUID()}`;
-        const candidatePath = join(storeDirectory, `${CLAIM_FILE_PREFIX}lock-${ownerId}`);
-        const candidateOwnerPath = join(candidatePath, ownerId);
-        await mkdir(candidatePath, { mode: 0o700 });
-        try {
-            await writeFile(candidateOwnerPath, '', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-            await rename(candidatePath, lockPath);
-            const ownerPath = join(lockPath, ownerId);
-            return () => releaseOwnedSessionLock({ lockPath, ownerPath });
-        } catch (error) {
-            await rm(candidatePath, { recursive: true, force: true });
-            if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes(error?.code)) throw error;
-        }
-
-        try {
-            const lockStat = await stat(lockPath);
-            if (fileNow() - lockStat.mtimeMs > HANDOFF_TTL_MS) {
-                const stalePath = join(storeDirectory, `${CLAIM_FILE_PREFIX}stale-lock-${process.pid}-${randomUUID()}`);
-                try {
-                    const currentLockStat = await stat(lockPath);
-                    if (
-                        currentLockStat.dev !== lockStat.dev ||
-                        currentLockStat.ino !== lockStat.ino ||
-                        currentLockStat.mtimeMs !== lockStat.mtimeMs
-                    ) {
-                        continue;
-                    }
-                    await rename(lockPath, stalePath);
-                    await rm(stalePath, { recursive: true, force: true });
-                } catch (error) {
-                    if (error?.code !== 'ENOENT') throw error;
-                }
-                continue;
-            }
-        } catch (error) {
-            if (error?.code !== 'ENOENT') throw error;
-        }
-        await wait(LOCK_RETRY_DELAY_MS);
-    }
-    throw new HandoffError('HANDOFF_BUSY', 'Another browser authorization handoff is still in progress.');
-};
-
-export const withSessionLock = async (storeDirectory, sessionId, fileNow, operation, acquireLock = acquireSessionLock) => {
-    const releaseLock = await acquireLock(storeDirectory, sessionId, fileNow);
-    let operationFailed = false;
+const removeQuietly = async (path) => {
     try {
-        return await operation();
-    } catch (error) {
-        operationFailed = true;
-        throw error;
-    } finally {
-        try {
-            await releaseLock();
-        } catch (error) {
-            if (!operationFailed) throw error;
-        }
+        await retryTransientFileOperation(() => rm(path, { force: true }));
+        return true;
+    } catch {
+        return false;
     }
-};
-
-const hasActiveStage = async (storeDirectory, sessionId) => {
-    const stageFilePrefix = stageFilePrefixForSession(sessionId);
-    const entries = await readdir(storeDirectory, { withFileTypes: true });
-    return entries.some((entry) => entry.isFile() && entry.name.startsWith(stageFilePrefix));
-};
-
-const readCollision = async (storeDirectory, sessionId) => {
-    try {
-        const entry = JSON.parse(await readFile(collisionPathForSession(storeDirectory, sessionId), 'utf8'));
-        if (
-            entry?.version === 1 &&
-            typeof entry.generationId === 'string' &&
-            entry.generationId &&
-            ['open', 'closed'].includes(entry.status)
-        ) {
-            return entry;
-        }
-        return { version: 1, generationId: null, status: 'open' };
-    } catch (error) {
-        if (error?.code === 'ENOENT') return null;
-        if (error instanceof SyntaxError) return { version: 1, generationId: null, status: 'open' };
-        throw error;
-    }
-};
-
-const hasCollision = async (storeDirectory, sessionId) => (await readCollision(storeDirectory, sessionId)) !== null;
-
-const recordCollision = async (storeDirectory, sessionId) => {
-    try {
-        await writeFile(
-            collisionPathForSession(storeDirectory, sessionId),
-            JSON.stringify({ version: 1, generationId: randomUUID(), status: 'open' }),
-            {
-                encoding: 'utf8',
-                flag: 'wx',
-                mode: 0o600,
-            }
-        );
-    } catch (error) {
-        if (error?.code !== 'EEXIST') throw error;
-    }
-};
-
-const closeCollision = async (storeDirectory, sessionId) => {
-    const collision = await readCollision(storeDirectory, sessionId);
-    if (!collision) return;
-    await writeFile(
-        collisionPathForSession(storeDirectory, sessionId),
-        JSON.stringify({
-            version: 1,
-            generationId: collision.generationId || randomUUID(),
-            status: 'closed',
-        }),
-        { encoding: 'utf8', mode: 0o600 }
-    );
-};
-
-const cleanupStore = async (storeDirectory, nowMs, fileNowMs) => {
-    let entries;
-    try {
-        entries = await readdir(storeDirectory, { withFileTypes: true });
-    } catch (error) {
-        if (error?.code === 'ENOENT') return 0;
-        throw error;
-    }
-
-    let pendingCount = 0;
-    for (const directoryEntry of entries) {
-        if (directoryEntry.isDirectory() && LOCK_CANDIDATE_PATTERN.test(directoryEntry.name)) {
-            const candidatePath = join(storeDirectory, directoryEntry.name);
-            try {
-                const candidateStat = await stat(candidatePath);
-                if (fileNowMs - candidateStat.mtimeMs > HANDOFF_TTL_MS) {
-                    const currentStat = await stat(candidatePath);
-                    if (
-                        currentStat.dev === candidateStat.dev &&
-                        currentStat.ino === candidateStat.ino &&
-                        currentStat.mtimeMs === candidateStat.mtimeMs
-                    ) {
-                        const stalePath = join(storeDirectory, `.claim-stale-lock-${process.pid}-${randomUUID()}`);
-                        await rename(candidatePath, stalePath);
-                        await rm(stalePath, { recursive: true, force: true });
-                    }
-                }
-            } catch (error) {
-                if (error?.code !== 'ENOENT') throw error;
-            }
-            continue;
-        }
-        if (!directoryEntry.isFile()) continue;
-        const path = join(storeDirectory, directoryEntry.name);
-        if (PENDING_FILE_PATTERN.test(directoryEntry.name)) {
-            let remove = false;
-            try {
-                const entry = parseStoredEntry(await readFile(path, 'utf8'));
-                remove = !isEntryFresh(entry, nowMs);
-            } catch (error) {
-                // Failed I/O cannot revoke another session's authorization. Unknown
-                // records still occupy capacity; only verified invalid data is removed.
-                if (error?.code === 'ENOENT') continue;
-                remove = error instanceof HandoffError;
-            }
-            if (remove) await removeFile(path);
-            else pendingCount += 1;
-            continue;
-        }
-        if (directoryEntry.name.startsWith(CLAIM_FILE_PREFIX)) {
-            try {
-                const fileStat = await stat(path);
-                if (fileNowMs - fileStat.mtimeMs > HANDOFF_TTL_MS) await removeFile(path);
-            } catch (error) {
-                if (error?.code !== 'ENOENT') throw error;
-            }
-            continue;
-        }
-        if (directoryEntry.name.startsWith(STAGE_FILE_PREFIX)) {
-            try {
-                const fileStat = await stat(path);
-                if (fileNowMs - fileStat.mtimeMs > HANDOFF_TTL_MS) await removeFile(path);
-            } catch (error) {
-                if (error?.code !== 'ENOENT') throw error;
-            }
-            continue;
-        }
-        if (directoryEntry.name.startsWith(COLLISION_FILE_PREFIX)) {
-            try {
-                const fileStat = await stat(path);
-                if (fileNowMs - fileStat.mtimeMs > HANDOFF_TTL_MS) await removeFile(path);
-            } catch (error) {
-                if (error?.code !== 'ENOENT') throw error;
-            }
-        }
-    }
-    return pendingCount;
 };
 
 export const stageTriggerUrl = async ({
@@ -397,73 +162,18 @@ export const stageTriggerUrl = async ({
     validateTriggerUrl(triggerUrl);
     validateTargetTool(targetTool);
     await ensurePrivateStoreDirectory(dataDirectory);
-    const stagePath = join(dataDirectory, `${stageFilePrefixForSession(sessionId)}${process.pid}-${randomUUID()}`);
-    const observedCollision = await readCollision(dataDirectory, sessionId);
-    await writeFile(
-        stagePath,
-        JSON.stringify({
-            version: 1,
-            collisionGenerationId: observedCollision?.generationId ?? null,
-            collisionStatus: observedCollision?.status ?? null,
-        }),
-        { encoding: 'utf8', flag: 'wx', mode: 0o600 }
-    );
+    await sweepStore(dataDirectory, fileNow());
+    const entryPath = join(dataDirectory, `${hashSessionId(sessionId)}-${targetTool}-${randomUUID()}.json`);
+    const temporaryPath = `${entryPath}.tmp-${randomUUID()}`;
+    const payload = JSON.stringify({ version: 1, createdAtMs: nowMs, triggerUrl, targetTool });
+    await writeFile(temporaryPath, payload, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
     try {
-        await withSessionLock(dataDirectory, sessionId, fileNow, async () => {
-            const pendingCount = await cleanupStore(dataDirectory, nowMs, fileNow());
-            if (pendingCount >= MAX_PENDING_ENTRIES) {
-                throw new HandoffError('HANDOFF_CAPACITY', 'Too many browser authorizations are waiting locally.');
-            }
-
-            const pendingPath = pendingPathForSession(dataDirectory, sessionId);
-            const collision = await readCollision(dataDirectory, sessionId);
-            if (collision) {
-                const stageEntry = JSON.parse(await readFile(stagePath, 'utf8'));
-                const startsNewGeneration =
-                    collision.status === 'closed' &&
-                    collision.generationId !== null &&
-                    stageEntry.collisionGenerationId === collision.generationId &&
-                    stageEntry.collisionStatus === 'closed';
-                if (startsNewGeneration) {
-                    await removeFile(collisionPathForSession(dataDirectory, sessionId));
-                } else {
-                    await removeFile(pendingPath);
-                    throw new HandoffError(
-                        'HANDOFF_CONFLICT',
-                        'Another browser authorization was already waiting in this conversation.'
-                    );
-                }
-            }
-            const payload = JSON.stringify({
-                version: 1,
-                createdAtMs: nowMs,
-                triggerUrl,
-                targetTool,
-            });
-            try {
-                await writeFile(pendingPath, payload, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-            } catch (error) {
-                if (error?.code !== 'EEXIST') throw error;
-                await removeFile(pendingPath);
-                await recordCollision(dataDirectory, sessionId);
-                throw new HandoffError(
-                    'HANDOFF_CONFLICT',
-                    'Another browser authorization was already waiting in this conversation.'
-                );
-            }
-        });
-    } finally {
-        await removeFile(stagePath);
-        try {
-            await withSessionLock(dataDirectory, sessionId, fileNow, async () => {
-                await cleanupStore(dataDirectory, nowMs, fileNow());
-                if (!(await hasActiveStage(dataDirectory, sessionId))) {
-                    await closeCollision(dataDirectory, sessionId);
-                }
-            });
-        } catch {
-            // The owned stage is already gone; remaining cleanup is recoverable housekeeping.
-        }
+        // Publication is a rename of a name only this call owns: a reader never sees a partial file.
+        await retryTransientFileOperation(() => rename(temporaryPath, entryPath));
+    } catch (error) {
+        // The temporary file belongs to this call alone; if it cannot go now, it ages out.
+        await removeQuietly(temporaryPath);
+        throw error;
     }
 };
 
@@ -477,45 +187,93 @@ export const claimTriggerUrl = async ({
     validateSessionId(sessionId);
     validateTargetTool(targetTool);
     await ensurePrivateStoreDirectory(dataDirectory);
-    return withSessionLock(dataDirectory, sessionId, fileNow, async () => {
-        await cleanupStore(dataDirectory, nowMs, fileNow());
-        if ((await hasActiveStage(dataDirectory, sessionId)) || (await hasCollision(dataDirectory, sessionId))) {
-            throw new HandoffError(
-                'HANDOFF_MISSING',
-                'No unambiguous browser authorization is waiting for this conversation.'
-            );
-        }
-
-        const pendingPath = pendingPathForSession(dataDirectory, sessionId);
-        const claimPath = join(dataDirectory, `${CLAIM_FILE_PREFIX}${process.pid}-${randomUUID()}`);
+    const fileNowMs = fileNow();
+    await sweepStore(dataDirectory, fileNowMs);
+    const entries = await readdir(dataDirectory, { withFileTypes: true });
+    const present = new Set(entries.map((entry) => entry.name));
+    const pattern = entryFilePattern(sessionId, targetTool);
+    const candidates = [];
+    for (const entry of entries) {
+        const { name } = entry;
+        // Only a regular file can be an authorization: a directory or symlink of that name is never
+        // read, aged or removed here, so it can neither wedge the store nor smuggle foreign bytes in.
+        if (!entry.isFile() || !pattern.test(name) || present.has(`${name}${CLAIM_MARKER_SUFFIX}`)) continue;
+        let metadata;
         try {
-            await rename(pendingPath, claimPath);
+            metadata = await stat(join(dataDirectory, name));
         } catch (error) {
-            if (error?.code === 'ENOENT') {
-                throw new HandoffError(
-                    'HANDOFF_MISSING',
-                    'No browser authorization is waiting for this conversation.'
-                );
-            }
+            if (error?.code === 'ENOENT') continue;
             throw error;
         }
-
-        try {
-            const entry = parseStoredEntry(await readFile(claimPath, 'utf8'), { requireTarget: true });
-            if (!isEntryFresh(entry, nowMs)) {
-                throw new HandoffError('HANDOFF_EXPIRED', 'The pending browser authorization expired.');
+        // The file clock decides visibility and tolerates skew; the entry timestamp decides expiry.
+        if (fileNowMs - metadata.mtimeMs > HANDOFF_TTL_MS + CLOCK_SKEW_MS) continue;
+        candidates.push(name);
+    }
+    if (candidates.length === 0) {
+        throw new HandoffError('HANDOFF_MISSING', 'No browser authorization is waiting for this conversation.');
+    }
+    if (candidates.length > 1) {
+        // Authorizations are sequential, so two waiting ones cannot both be the intended job. Neither is
+        // consumed into this call, and both are invalidated: an abandoned earlier authorization must not
+        // block the conversation for the rest of its lifetime, and the recovery text below has to be
+        // true when it asks for exactly one fresh browser_job.
+        for (const name of candidates) {
+            const path = join(dataDirectory, name);
+            if (await removeQuietly(path)) continue;
+            // Retain the ordinary consumption marker while the authorization cannot be deleted.
+            // If neither removal nor invalidation works, surface storage failure before advising a refresh.
+            try {
+                await writeFile(`${path}${CLAIM_MARKER_SUFFIX}`, '', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+            } catch (error) {
+                if (error?.code !== 'EEXIST') throw error;
             }
-            if (entry.targetTool !== targetTool) {
-                throw new HandoffError(
-                    'HANDOFF_TOOL_MISMATCH',
-                    'The pending browser authorization does not match this local tool.'
-                );
-            }
-            return entry.triggerUrl;
-        } finally {
-            await removeFile(claimPath);
         }
-    });
+        throw new HandoffError(
+            'HANDOFF_MISSING',
+            'Several browser authorizations were waiting for this conversation; all of them were invalidated.'
+        );
+    }
+
+    const entryPath = join(dataDirectory, candidates[0]);
+    const markerPath = `${entryPath}${CLAIM_MARKER_SUFFIX}`;
+    try {
+        // Exclusive creation is the one-use primitive: exactly one caller can ever pass this line for
+        // this authorization, on every filesystem the plugin ships on.
+        await writeFile(markerPath, '', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    } catch (error) {
+        if (error?.code !== 'EEXIST') throw error;
+        throw new HandoffError(
+            'HANDOFF_MISSING',
+            'No unambiguous browser authorization is waiting for this conversation.'
+        );
+    }
+
+    try {
+        let text;
+        try {
+            text = await readFile(entryPath, 'utf8');
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+            throw new HandoffError(
+                'HANDOFF_MISSING',
+                'No browser authorization is waiting for this conversation.'
+            );
+        }
+        const entry = parseStoredEntry(text, { requireTarget: true });
+        if (!isEntryFresh(entry, nowMs)) {
+            throw new HandoffError('HANDOFF_EXPIRED', 'The pending browser authorization expired.');
+        }
+        if (entry.targetTool !== targetTool) {
+            throw new HandoffError(
+                'HANDOFF_TOOL_MISMATCH',
+                'The pending browser authorization does not match this local tool.'
+            );
+        }
+        return entry.triggerUrl;
+    } finally {
+        // The authorization goes first: while it exists, its marker must stay to keep it consumed.
+        if (await removeQuietly(entryPath)) await removeQuietly(markerPath);
+    }
 };
 
 const collectTriggerUrlCandidates = (toolResponse) => {
@@ -578,8 +336,7 @@ const handoffRecovery = (code) => {
     if (code === 'HANDOFF_INVALID_INPUT') return 'Correct the local tool arguments and retry the same local tool; do not request another authorization just to repair arguments.';
     if (code === 'HANDOFF_DATA_DIR_UNAVAILABLE') return 'The host did not provide plugin storage. Check the installed plugin and host hook integration; requesting another browser_job cannot fix missing host storage.';
     if (code === 'HANDOFF_INVALID_SESSION' || code === 'HANDOFF_INVALID_EVENT' || code === 'HANDOFF_INVALID_TOOL') return 'The host hook context is invalid. Check the supported plugin/host integration and report this failure if it persists; do not obtain repeated authorizations.';
-    if (code === 'HANDOFF_CAPACITY') return 'The local handoff store is at capacity. Let pending handoffs finish before starting more; do not create additional authorizations in a loop.';
-    if (['HANDOFF_MISSING', 'HANDOFF_EXPIRED', 'HANDOFF_TOOL_MISMATCH', 'HANDOFF_INVALID_ENTRY', 'HANDOFF_INVALID_TOKEN', 'HANDOFF_CONFLICT'].includes(code)) return 'No usable matching authorization remains. Call browser_job once for the intended local tool, then retry without model-authored authorization fields.';
+    if (['HANDOFF_MISSING', 'HANDOFF_EXPIRED', 'HANDOFF_TOOL_MISMATCH', 'HANDOFF_INVALID_ENTRY', 'HANDOFF_INVALID_TOKEN'].includes(code)) return 'No usable matching authorization remains. Call browser_job once for the intended local tool, then retry without model-authored authorization fields.';
     return 'The local authorization handoff failed. Check the host integration and local storage access; if it persists, report the failure. Do not request repeated browser_job authorizations without resolving the observed problem.';
 };
 const handoffStorageRecovery = (details) => {
@@ -593,7 +350,7 @@ const deniedPreToolUseOutput = (error) =>
             hookEventName: 'PreToolUse',
             permissionDecision: 'deny',
             permissionDecisionReason:
-                `${error.code}: e-Comet could not safely hand off the browser authorization. ` +
+                `${error.code}: e-Comet could not safely hand off the browser authorization. ${error.message} ` +
                 (handoffStorageRecovery(error.details) ?? handoffRecovery(error.code)) + (error.details ? ` Diagnostics: ${JSON.stringify(error.details)}` : ''),
         },
     });

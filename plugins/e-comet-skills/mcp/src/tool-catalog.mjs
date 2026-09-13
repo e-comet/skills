@@ -86,13 +86,22 @@ const feedbackReportAuthoringGuidance =
 const feedbackFailureGuidance =
     'Explain feedback failures using only the fixed safe error message and supplied closed error.details.operation, reason, systemCode, and httpStatus evidence. Do not echo raw error messages from other sources. ' +
     'An optional error.details.source module and line identify public-code investigation context, not a user filesystem path or proof of root cause. Unknown internal errors remain unknown: never guess an invalid grant, missing artifact, or secondary bridge failure. ' +
-    'For a trusted-hook denial, explain its fixed safe cause and next action without overriding consent, changing the history choice, or changing hook trust. ';
+    'For a trusted-hook denial, explain its fixed safe cause and next action without overriding consent, changing the history choice, or changing hook trust. ' +
+    'A status:"not_started" result confirms this call did not upload, even when its generic error code is FEEDBACK_SUBMISSION_FAILED. Follow its current reason and safe next action; do not describe that call as possibly sent or let an older refusal replace it. Preserve any separately known uncertainty from other attempts. ';
 
 const feedbackRemotePrerequisiteGuidance =
     'Before preparation, ensure remote e-Comet report_issue is available in the current session. If it is deferred, perform one targeted tool search for report_issue; do not treat the two local feedback tools as a complete sending capability. If the remote tool is unavailable, stop before preparation and explain that sending requires the remote e-Comet connector. Check its status through the host when possible; ask the user to Connect/sign in only if it is observed disconnected. An unavailable tool alone does not prove a disconnected connector. Preserve the issue and chosen history option. ';
 
 const feedbackGrantMissingGuidance =
     'FEEDBACK_GRANT_MISSING is a denial by a running hook, not evidence that hooks are disabled or untrusted. This submit attempt was blocked before upload. If no earlier upload was attempted, say «Отчёт не отправлен: не получено разрешение на загрузку.»; never say it might already have been received merely because this denial occurred. Check the observed sequence. If report_issue was skipped, no earlier upload is uncertain, and consent is still valid, obtain its grant once and continue with the same prepared artifact and history choice; do not make the user repeat consent or recreate the archive. If the remote tool is unavailable, report that prerequisite and inspect connector status. If report_issue was already called, inspect its result and handoff evidence; missing grant state alone does not authorize repeating it. Preserve any genuinely uncertain earlier upload outcome. ';
+
+// The service issues five report_issue authorizations per hour for a user, each valid for about
+// fifteen minutes. Cloud hooks can retain a grant after a known no-request failure; native hooks
+// consume it before dispatch. Recovery must follow the observed outcome instead of assuming retention.
+const feedbackAuthorizationBudgetGuidance =
+    'Call remote report_issue at most once per prepared artifact. Call it again only when a submit result or hook denial explicitly states that the authorization expired or that a fresh one is required: the code FEEDBACK_GRANT_REFRESH_REQUIRED, or a message naming report_issue as the next step. ' +
+    'Retry the same artifactId only when the current hook result explicitly confirms that no upload request started, that the authorization was kept, and that submitting it again is the next step. For other failures follow the observed result and its recovery guidance; never retry a rejected, uncertain, or terminally refused upload automatically. ' +
+    'The service allows five authorizations per hour for a user. If report_issue returns a rate-limit error, the prepared report stays valid for 24 hours: tell the user «Лимит отправки отчётов исчерпан, попробуйте позже.», do not prepare the report again, do not send the prepared archive, and do not retry report_issue automatically. ';
 
 const feedbackExecutionWorkflow =
     'After preparation, call remote report_issue exactly once and immediately with {kind: prepared.kind, size_bytes: prepared.sizeBytes}; then immediately call submit_e_comet_feedback with {artifactId: prepared.artifactId} only. ' +
@@ -103,9 +112,9 @@ const feedbackExecutionWorkflow =
     'CHECK_FEEDBACK_HOOKS: inspect the available host/plugin hook configuration and supplied failure evidence; ask the user to enable or trust a hook only when that missing prerequisite is observed, and never change trust on their behalf. RESTART_FEEDBACK_FLOW: explain only the supplied handoff evidence and ask to start a fresh flow; do not infer invalidity or expiry from the action alone. RETRY_WITH_VALID_REPORT: correct only identified invalid report fields while preserving the chosen history option. RETRY_FEEDBACK_ONCE: offer one retry, never loop. CHECK_LOCAL_STORAGE: ask the user to check local storage access without exposing paths. These actions never waive consent or permit a silent change of history choice. ' +
     feedbackGrantMissingGuidance +
     'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE means the local tool did not receive the trusted handoff; its cause is not established by that code. Use the supplied diagnostics and observed host configuration. In Claude Code, /hooks inspects configured hooks; do not invent a Cowork hook-trust switch or direct the user to change permissions without evidence. ' +
-    'The prepared report.md resource link is temporary. Do not rely on or reread it during this flow. ' +
+    'When native preparation supplies a report.md resource link, it is temporary; do not rely on or reread it during this flow. Bridged cloud preparation supplies metadata without a report resource link. ' +
     'After a result with status:"uploaded", tell the user only that the report was sent to e-Comet. For a Russian-language user say «Отчёт отправлен в e-Comet.»; when useful, use «Отчёт отправлен в e-Comet с историей текущей сессии.» or «Отчёт отправлен в e-Comet без истории текущей сессии.» according to transcriptIncluded. Transcript truncation diagnostics belong only inside the bug report; do not mention them in user-facing confirmations. Give no additional caveat or implementation detail. ' +
-    'If submit returns UPLOAD_UNCERTAIN or FEEDBACK_SUBMISSION_FAILED, never automatically retry submit or restart the full flow; say «Не удалось подтвердить отправку. Отчёт мог быть получен, поэтому я не буду отправлять его повторно автоматически.». This reports the uncertainty; then ask the user what to do. ';
+    'If submit returns UPLOAD_UNCERTAIN or FEEDBACK_SUBMISSION_FAILED without status:"not_started", never automatically retry submit or restart the full flow; say «Не удалось подтвердить отправку. Отчёт мог быть получен, поэтому я не буду отправлять его повторно автоматически.». This reports the uncertainty; then ask the user what to do. ';
 
 export const serverInstructions =
     'Для живых данных Wildberries сначала выберите локальный типизированный инструмент по намерению пользователя: ' +
@@ -226,7 +235,7 @@ export const tools = [
             'Put every requested product, period, answer state, rating filter, and media filter into that single exports array. Omit product_id to export all products in the selected organization. Omitted ratings mean all ratings; content:"media" selects reviews with photo or video, while omitted content means any content. Omitted dates mean all time; otherwise provide both inclusive dates. Omitted isAnswered produces separate answered and unanswered workbooks. ' +
             'Omit org to use the organization active in the seller portal. Include exactly one signed org id or exact name only when the user explicitly selects another organization. ' +
             'If ENTITY_SELECTION_REQUIRED specifically reports an unresolved restoration record from an older extension, ask which company the user wants, then obtain a new authorization with that explicit org; do not guess or silently choose one. ' +
-            'Use at most 50 logical exports and 100 physical reports after expanding all. Each XLSX is limited to 100 MiB, the job to 500 MiB, and artifacts are retained for 24 hours. The shared artifact store is limited to 512 MiB and 1000 files; oldest completed artifacts are evicted first. ' +
+            'Use at most 50 logical exports and 100 physical reports after expanding all. Each XLSX is limited to 100 MiB, the job to 500 MiB, and artifacts are retained for 24 hours; a completed workbook is never evicted by another export. ' +
             'Return every successful resource link (resource_link) and explicitly summarize complete, failed, and skipped exports when status is partial. Do not infer product ownership from an empty workbook. ' +
             reportDeliveryGuidance +
             'ARTIFACT_TOO_LARGE means this workbook exceeded the supported file size; downloading the same file again cannot fix it. Offer a narrower explicitly selected export while retaining completed workbooks. ' +
@@ -244,9 +253,10 @@ export const tools = [
             feedbackReportAuthoringGuidance +
             'Use exactly one remote report_issue kind: bug, wrong_data, missing_capability, or unclear_contract; pass that same kind unchanged to report_issue. ' +
             'Use includeTranscript:false only for send without the history of the current session and includeTranscript:true only for send with the bounded current-session history supplied by the trusted host hook. ' +
-            'Never author transcriptPath, transcript_path, feedbackClaim, feedback_claim, feedbackSession, or feedback_session. The required order is prepare_e_comet_feedback, remote report_issue, then submit_e_comet_feedback. ' +
+            'Never author transcriptPath, transcript_path, feedbackClaim, feedback_claim, feedbackSession, feedback_session, feedbackAdapter, or feedback_adapter. The required order is prepare_e_comet_feedback, remote report_issue, then submit_e_comet_feedback. ' +
+            feedbackAuthorizationBudgetGuidance +
             feedbackExecutionWorkflow +
-            'This returns compact metadata and one private report.md resource link; ZIP and history bytes never enter model content.',
+            'This returns compact metadata. Native preparation also returns one private report.md resource link; bridged cloud preparation does not expose a report resource link. ZIP and history bytes never enter model content.',
         inputSchema: toolInputSchemas.prepare_e_comet_feedback,
         outputSchema: toolOutputSchemas.prepare_e_comet_feedback,
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -256,10 +266,12 @@ export const tools = [
         description:
             'Upload the prepared e-Comet feedback archive only after remote report_issue returns the trusted upload grant. ' +
             feedbackGrantMissingGuidance +
-            'The host hook injects uploadUrl, requiredHeaders, objectKey, expiresAt, expectedSize, expectedSha256, feedbackClaim, and feedbackSession. Model-authored arguments must omit every transport/claim field and snake_case alias; provide only the prepared artifactId. ' +
+            'The host hook injects uploadUrl, requiredHeaders, objectKey, expiresAt, expectedSize and expectedSha256. On the native route it also injects feedbackClaim and feedbackSession; on the bridged cloud route it injects feedbackCloud instead of them. Model-authored arguments must omit every transport/claim field and snake_case alias; provide only the prepared artifactId. ' +
+            'UPLOAD_DESTINATION_REFUSED and FEEDBACK_ARCHIVE_MISMATCH are terminal and never retryable: the archive was refused before or instead of any upload, and the same grant cannot succeed. Report the observed safe error and stop; do not retry this call, do not ask remote report_issue for another grant, and do not prepare the report again. ' +
+            feedbackAuthorizationBudgetGuidance +
             feedbackFailureGuidance +
             'After a result with status:"uploaded", tell the user only that the report was sent to e-Comet. For a Russian-language user say «Отчёт отправлен в e-Comet.»; when useful, use «Отчёт отправлен в e-Comet с историей текущей сессии.» or «Отчёт отправлен в e-Comet без истории текущей сессии.» according to transcriptIncluded. Transcript truncation diagnostics belong only inside the bug report; do not mention them in user-facing confirmations. Give no additional caveat or implementation detail. ' +
-            'If submit returns UPLOAD_UNCERTAIN or FEEDBACK_SUBMISSION_FAILED, never automatically retry submit or restart the full flow; say «Не удалось подтвердить отправку. Отчёт мог быть получен, поэтому я не буду отправлять его повторно автоматически.». This reports the uncertainty; then ask the user what to do. ' +
+            'If submit returns UPLOAD_UNCERTAIN or FEEDBACK_SUBMISSION_FAILED without status:"not_started", never automatically retry submit or restart the full flow; say «Не удалось подтвердить отправку. Отчёт мог быть получен, поэтому я не буду отправлять его повторно автоматически.». This reports the uncertainty; then ask the user what to do. ' +
             'This one-shot upload returns no resource, archive bytes, object key, URL, query, or headers.',
         inputSchema: toolInputSchemas.submit_e_comet_feedback,
         outputSchema: toolOutputSchemas.submit_e_comet_feedback,

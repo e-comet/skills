@@ -11,11 +11,12 @@ import {
     MAX_IMAGE_BASKET,
     SUPPORTED_MCP_PROTOCOL_VERSIONS,
 } from './config.mjs';
-import { createArtifactWriter, releaseArtifactJob } from './artifact-store.mjs';
-import { prepareECometFeedback, submitECometFeedback } from './feedback-tools.mjs';
+import { createArtifactWriter } from './artifact-store.mjs';
+import { prepareECometFeedback, submitECometCloudFeedback, submitECometFeedback } from './feedback-tools.mjs';
 import { FeedbackPreparationError, feedbackPreparationFailure, feedbackSubmissionFailure } from './feedback-errors.mjs';
+import { feedbackHostResultUnavailable, hasFeedbackCloudTransport, hasFeedbackHostAdapterMarker, isValidFeedbackCloudSubmitInput, isValidFeedbackHostAdapterInput } from './feedback-host-adapter.mjs';
 import { feedbackDiagnostics, safeFeedbackProperty, withFeedbackOperation } from './feedback-diagnostics.mjs';
-import { feedbackDiagnosticsSchema, validateSchemaValue } from './tool-schemas.mjs';
+import { feedbackArtifactIdSchema, feedbackDiagnosticsSchema, validateSchemaValue } from './tool-schemas.mjs';
 import { executeAuthorizedBrowserJob, executeSellerReviewsJob, extractBrowserJobToken, validateAuthorizedJobLimits } from './browser-job.mjs';
 import { mcpError, mcpResult, resourceLinkResult, textResult } from './mcp-protocol.mjs';
 import { createJobWriter } from './result-store.mjs';
@@ -179,9 +180,7 @@ export const createMcpMessageHandler = ({
     artifactStorageTarget = ARTIFACT_STORAGE,
     reportOutputDirectory = undefined,
     createSellerArtifactWriter = createArtifactWriter,
-    releaseSellerArtifactJob = releaseArtifactJob,
     createOzonArtifactWriter = createArtifactWriter,
-    releaseOzonArtifactJob = releaseArtifactJob,
     renderOzonResult = resourceLinkResult,
     sendError = mcpError,
     sendResult = mcpResult,
@@ -189,6 +188,7 @@ export const createMcpMessageHandler = ({
     probeImageExists = imageExists,
     prepareFeedback = prepareECometFeedback,
     submitFeedback = submitECometFeedback,
+    submitCloudFeedback = submitECometCloudFeedback,
     shutdownSignal,
     log = (..._args) => undefined,
     now = Date.now,
@@ -366,6 +366,14 @@ export const createMcpMessageHandler = ({
     };
 
     const handleFeedbackPrepare = async (id, args = {}) => {
+        if (hasFeedbackHostAdapterMarker(args)) {
+            if (!validateToolArguments('prepare_e_comet_feedback', args) || !isValidFeedbackHostAdapterInput('prepare_e_comet_feedback', args)) {
+                sendResult(id, textResult(feedbackPrepareFailure(new FeedbackPreparationError('FEEDBACK_INPUT_INVALID')), true));
+                return;
+            }
+            sendResult(id, textResult(feedbackHostResultUnavailable('prepare_e_comet_feedback', args.feedbackAdapter)));
+            return;
+        }
         if (!validateToolArguments('prepare_e_comet_feedback', args)) {
             sendResult(id, textResult(feedbackPrepareFailure(new FeedbackPreparationError('FEEDBACK_INPUT_INVALID')), true));
             return;
@@ -382,29 +390,56 @@ export const createMcpMessageHandler = ({
         }
     };
 
-    const handleFeedbackSubmit = async (id, args = {}) => {
-        if (!validateToolArguments('submit_e_comet_feedback', args)) {
-            sendResult(
-                id,
-                textResult(
-                    { ok: false, status: 'failed', error: { code: 'UPLOAD_GRANT_INVALID', message: 'The feedback upload grant is invalid or has expired.', stage: 'grant', retryable: false, details: feedbackDiagnostics(undefined, 'input_validation') } },
-                    true
-                )
-            );
-            return;
-        }
+    // Every submit route refuses malformed input the same way, before any grant, artifact or upload work.
+    // The authored artifactId is carried through when it is usable: a caller holding an upload attempt for
+    // that artifact — the cloud hook, or a newer plugin talking to an older one — can only attribute the
+    // refusal to its own call when the refusal names the artifact.
+    const invalidSubmitGrantResult = (args) => textResult(
+        {
+            ok: false,
+            status: 'failed',
+            ...(validateSchemaValue(safeFeedbackProperty(args, 'artifactId'), feedbackArtifactIdSchema) ? { artifactId: args.artifactId } : {}),
+            error: { code: 'UPLOAD_GRANT_INVALID', message: 'The feedback upload grant is invalid or has expired.', stage: 'grant', retryable: false, details: feedbackDiagnostics(undefined, 'input_validation') },
+        },
+        !hasFeedbackCloudTransport(args)
+    );
+
+    // One result-and-log tail for both submit routes: a reported failure is logged from its own
+    // diagnostics, a thrown one is projected into the same failure shape first.
+    const completeFeedbackSubmit = async (id, args, submit) => {
         try {
-            const submitted = await submitFeedback(args);
+            const submitted = await submit(args);
             if (!submitted.ok) {
                 const details = safeFeedbackProperty(safeFeedbackProperty(submitted, 'error'), 'details');
                 if (validateSchemaValue(details, feedbackDiagnosticsSchema)) console.error('[McpDispatcher] Feedback submission failed:', JSON.stringify(details));
             }
-            sendResult(id, textResult(submitted, !submitted.ok));
+            // Cowork routes isError to PostToolUseFailure without the structured result. Cloud
+            // outcomes must reach PostToolUse to record the receipt or release a no-request refusal.
+            // Domain failures remain ok:false; native consumers keep ordinary MCP error semantics.
+            sendResult(id, textResult(submitted, !submitted.ok && !hasFeedbackCloudTransport(args)));
         } catch (error) {
             const failure = feedbackSubmissionFailure(error, args.artifactId);
             console.error('[McpDispatcher] Feedback submission failed:', JSON.stringify(failure.error));
-            sendResult(id, textResult(failure, true));
+            sendResult(id, textResult(failure, !hasFeedbackCloudTransport(args)));
         }
+    };
+
+    const handleFeedbackSubmit = async (id, args = {}) => {
+        if (hasFeedbackCloudTransport(args)) {
+            // Input carrying a second transport marker identifies no route: refuse it here rather than
+            // hand a mixed input to the cloud submitter.
+            if (!validateToolArguments('submit_e_comet_feedback', args) || !isValidFeedbackCloudSubmitInput(args)) {
+                sendResult(id, invalidSubmitGrantResult(args));
+                return;
+            }
+            await completeFeedbackSubmit(id, args, submitCloudFeedback);
+            return;
+        }
+        if (!validateToolArguments('submit_e_comet_feedback', args)) {
+            sendResult(id, invalidSubmitGrantResult(args));
+            return;
+        }
+        await completeFeedbackSubmit(id, args, submitFeedback);
     };
 
     const handleProductImages = async (id, args = {}) => {
@@ -592,7 +627,8 @@ export const createMcpMessageHandler = ({
         let terminalResult;
         let sellerResult;
         let sellerArtifacts = [];
-        const artifactJobId = randomUUID();
+        // One byte counter per call: every writer of this export shares it (spec §4.2).
+        const jobBudget = { bytes: 0 };
         try {
             requireStorageTarget(artifactStorageTarget, 'marketplace-artifacts');
             if (!(await waitForExtensionReady())) {
@@ -622,7 +658,7 @@ export const createMcpMessageHandler = ({
                 authorization,
                 requestSellerOperation: authorizationLease.requestSellerOperation,
                 createArtifactWriter: createSellerArtifactWriter,
-                artifactJobId,
+                jobBudget,
             });
             sellerArtifacts = sellerResult.exports.flatMap((item) =>
                 item.status === 'complete' && 'artifact' in item ? [item.artifact] : []
@@ -665,18 +701,7 @@ export const createMcpMessageHandler = ({
                 terminalResult = textResult(failure, true);
             }
         }
-        try {
-            sendResult(id, await deliverReportResult(terminalResult, sellerArtifacts, reportOutputDirectory));
-        } finally {
-            try {
-                // Cancellation may publish a partial response while another writer
-                // still owns cleanup. Register this response owner's release now;
-                // the store completes it when the final writer/cleanup leaves.
-                await releaseSellerArtifactJob(artifactJobId, { deferWhileActive: true });
-            } catch (error) {
-                log('failed to release seller artifact pins after terminal response:', error?.message);
-            }
-        }
+        sendResult(id, await deliverReportResult(terminalResult, sellerArtifacts, reportOutputDirectory));
     };
 
     // Диагноз строится только по статусу, который явно сообщил про возможность. Статус без этого
@@ -698,7 +723,8 @@ export const createMcpMessageHandler = ({
         const toolName = 'ozon_seller_promotion_report';
         const dateFrom = args?.dateFrom;
         const dateTo = args?.dateTo;
-        const artifactJobId = randomUUID();
+        // One byte counter per call: every writer of this export shares it (spec §4.2).
+        const jobBudget = { bytes: 0 };
         let authorizationLease;
         let terminalResult;
         let reportArtifacts = [];
@@ -788,7 +814,7 @@ export const createMcpMessageHandler = ({
                 dateTo,
                 requestOzonPromotionReport: authorizationLease.requestOzonPromotionReport,
                 createArtifactWriter: createOzonArtifactWriter,
-                artifactJobId,
+                jobBudget,
                 now,
             });
             reportArtifacts = [getOzonPromotionArtifactResource(result)];
@@ -804,15 +830,7 @@ export const createMcpMessageHandler = ({
             authorizationLease = undefined;
             releaseAuthorizationInBackground(currentLease, 'after Ozon promotion report completion');
         }
-        try {
-            sendResult(id, await deliverReportResult(terminalResult, reportArtifacts, reportOutputDirectory));
-        } finally {
-            try {
-                await releaseOzonArtifactJob(artifactJobId, { deferWhileActive: true });
-            } catch (error) {
-                log('failed to release Ozon promotion artifact pins after terminal response:', error?.message);
-            }
-        }
+        sendResult(id, await deliverReportResult(terminalResult, reportArtifacts, reportOutputDirectory));
     };
 
     // Keep package admission/result shaping distinct from the released singular contract:
@@ -823,7 +841,8 @@ export const createMcpMessageHandler = ({
     const handleOzonReportPackage = async (id, toolName, family, args = {}) => {
         const itemProperty = family === 'promotion' ? 'periods' : 'reports';
         const items = args?.[itemProperty];
-        const artifactJobId = randomUUID();
+        // One byte counter per call: every writer of this export shares it (spec §4.2).
+        const jobBudget = { bytes: 0 };
         let authorizationLease;
         let terminalResult;
         let reportArtifacts = [];
@@ -915,7 +934,7 @@ export const createMcpMessageHandler = ({
                 authorization: authorizationLease.authorization,
                 requestOzonReportPackage: authorizationLease.requestOzonReportPackage,
                 createArtifactWriter: createOzonArtifactWriter,
-                artifactJobId,
+                jobBudget,
                 now,
             };
             const result =
@@ -937,15 +956,7 @@ export const createMcpMessageHandler = ({
             authorizationLease = undefined;
             releaseAuthorizationInBackground(currentLease, `after Ozon ${family} report package completion`);
         }
-        try {
-            sendResult(id, await deliverReportResult(terminalResult, reportArtifacts, reportOutputDirectory));
-        } finally {
-            try {
-                await releaseOzonArtifactJob(artifactJobId, { deferWhileActive: true });
-            } catch (error) {
-                log(`failed to release Ozon ${family} package artifact pins after terminal response:`, error?.message);
-            }
-        }
+        sendResult(id, await deliverReportResult(terminalResult, reportArtifacts, reportOutputDirectory));
     };
 
     // `needsBridge` declares which operational tools depend on the bridge, so the wake-up is applied once at

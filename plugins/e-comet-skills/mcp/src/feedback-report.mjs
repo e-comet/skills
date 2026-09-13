@@ -6,9 +6,16 @@ const FEEDBACK_KIND_SET = new Set(FEEDBACK_KINDS);
 const PEER_REJECTION_CODE_SET = new Set(Object.values(PEER_REJECTION_CODES));
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 
+/**
+ * The canonical line-ending fold every feedback report goes through before redaction. The trusted
+ * hooks import it so a projection they measure cannot drift from the text the archive will hold:
+ * measuring lone-CR text unfolded collapses a whole report into one header line.
+ */
+export const foldFeedbackLineEndings = (value) => value.replace(/\r\n?/g, '\n');
+
 const normalizeText = (value) => {
     if (typeof value !== 'string') throw new FeedbackPreparationError('FEEDBACK_INPUT_INVALID');
-    const normalized = value.replace(/\r\n?/g, '\n');
+    const normalized = foldFeedbackLineEndings(value);
     if (CONTROL_CHARACTERS.test(normalized)) throw new FeedbackPreparationError('FEEDBACK_INPUT_INVALID');
     return normalized;
 };
@@ -40,7 +47,10 @@ export const redactFeedbackText = (value) => {
     if (typeof value !== 'string') throw new TypeError('Feedback text must be a string');
     return redactAuthorizationHeaders(redactCookieValues(redactJsonCredentialValues(value)))
         .replace(/\bbearer\s+[^\s;,]+/gi, 'Bearer [REDACTED]')
-        .replace(/\b(?:x-)?api[_-]?key\s*([:=])\s*[^\s;,&}\]]+/gi, (_match, delimiter) => `api_key${delimiter}[REDACTED]`)
+        // The already-redacted alternative comes first so a second pass cannot match ]-terminated
+        // placeholder text as a fresh secret and append another bracket. This protects API-key
+        // placeholders; wire fitting measures the next redaction pass without assuming global idempotence.
+        .replace(/\b(?:x-)?api[_-]?key\s*([:=])\s*(?:\[REDACTED\]|[^\s;,&}\]]+)/gi, (_match, delimiter) => `api_key${delimiter}[REDACTED]`)
         .replace(/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_JWT]');
 };
 
@@ -94,6 +104,10 @@ export const selectFeedbackDiagnostics = (bridgeStatus) => {
           })
         : undefined;
     return compact({
+        // A cloud hook cannot observe the device bridge. Keep this fixed availability fact, never
+        // arbitrary host text or a guessed device state, so support can interpret absent diagnostics.
+        nativeBridgeDiagnostics: bridgeStatus.nativeBridgeDiagnostics === 'unavailable_in_cloud_hook'
+            ? 'unavailable_in_cloud_hook' : undefined,
         bridgeVersion: copyString(bridgeStatus.bridgeVersion),
         bridgeGeneration: copyPositiveInteger(bridgeStatus.bridgeGeneration),
         controlProtocolVersion: copyPositiveInteger(bridgeStatus.controlProtocolVersion),

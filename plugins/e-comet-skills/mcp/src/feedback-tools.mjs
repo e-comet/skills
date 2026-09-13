@@ -1,16 +1,18 @@
 import { constants } from 'node:fs';
 import { isUtf8 } from 'node:buffer';
+import { createHash } from 'node:crypto';
 import { lstat, open } from 'node:fs/promises';
 
-import { BRIDGE_VERSION, FEEDBACK_MAX_BYTES, FEEDBACK_MAX_SUMMARY_LENGTH } from './config.mjs';
-import { consumeFeedbackClaim } from './feedback-claim.mjs';
+import { BRIDGE_VERSION, FEEDBACK_CLOUD_MAX_BYTES, FEEDBACK_CLOUD_UPLOAD_DESTINATIONS, FEEDBACK_MAX_BYTES, FEEDBACK_MAX_SUMMARY_LENGTH } from './config.mjs';
+import { assertHookFields, loadHookSecret, verifyHookSignature } from './hook-signature.mjs';
 import { feedbackArtifactStorageUnavailable, loadVerifiedFeedbackArtifact, registerFeedbackArtifact, retireFeedbackArtifact } from './feedback-artifact-store.mjs';
 import { serializeFeedbackMetadata } from './feedback-metadata.mjs';
-import { redactFeedbackText, renderFeedbackReport } from './feedback-report.mjs';
-import { createFeedbackZip, feedbackZipFramingBytes } from './feedback-zip.mjs';
-import { putFeedbackArchive } from './feedback-upload.mjs';
+import { foldFeedbackLineEndings, redactFeedbackText, renderFeedbackReport } from './feedback-report.mjs';
+import { createFeedbackZip, feedbackZipEntryLayout, feedbackZipEntryNames, feedbackZipFramingBytes } from './feedback-zip.mjs';
+import { assertUploadDestination, putFeedbackArchive } from './feedback-upload.mjs';
 import { FeedbackPreparationError, feedbackSubmissionFailure } from './feedback-errors.mjs';
 import { feedbackDiagnostics, safeFeedbackProperty, withFeedbackOperation } from './feedback-diagnostics.mjs';
+import { isValidFeedbackCloudSubmitInput } from './feedback-host-adapter.mjs';
 
 const ARTIFACT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -18,8 +20,27 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const transcriptUnavailable = (cause) => new FeedbackPreparationError('TRANSCRIPT_UNAVAILABLE', cause);
 const claimInvalid = (cause) => new FeedbackPreparationError('FEEDBACK_CLAIM_INVALID', cause);
 const hookHandoffUnavailable = (cause) => new FeedbackPreparationError('FEEDBACK_HOOK_HANDOFF_UNAVAILABLE', cause);
+const signatureInvalid = () => Object.assign(
+    new Error('The trusted feedback handoff claim could not be verified.'),
+    { code: 'FEEDBACK_CLAIM_INVALID', feedbackReason: 'claim_signature_invalid' },
+);
+
+/**
+ * Verifies the fields the trusted hook injected against the shared local secret. A malformed request
+ * fails as a binding mismatch before any filesystem access; only a well-formed one reads the secret.
+ * @param {{ tool: string, sessionHash?: unknown, signature?: unknown, fields: Record<string, unknown> }} request
+ */
+const verifyHookFields = async ({ tool, sessionHash, signature, fields }) => {
+    try {
+        assertHookFields({ tool, sessionHash, fields });
+        const secret = await loadHookSecret({ create: false });
+        if (!verifyHookSignature({ secret, tool, sessionHash, fields, signature })) throw signatureInvalid();
+    } catch (error) {
+        throw withFeedbackOperation(error, 'claim_consume');
+    }
+};
 const safeSummary = (summary) => {
-    const text = redactFeedbackText(summary.replace(/\r\n?/g, '\n')).toWellFormed();
+    const text = redactFeedbackText(foldFeedbackLineEndings(summary)).toWellFormed();
     let end = Math.min(text.length, FEEDBACK_MAX_SUMMARY_LENGTH);
     if (end < text.length && /[\ud800-\udbff]/u.test(text[end - 1])) end -= 1;
     return text.slice(0, end);
@@ -123,14 +144,14 @@ const readTrustedTranscript = (path, options) => readTrustedFeedbackTranscript(p
  * `dependencies` is an internal composition/test seam; production supplies only getBridgeStatus
  * and uses the validated built-in persistence, ZIP, claim, clock, and runtime metadata functions.
  * @param {{ kind?: string, summary?: string, details?: string, includeTranscript?: boolean, transcriptPath?: string, feedbackClaim?: string, feedbackSession?: string }} input
- * @param {{ getBridgeStatus?: () => unknown, registerArtifact?: typeof registerFeedbackArtifact, readTranscript?: (path: string, options: { maxBytes: number }) => Promise<Buffer>, consumeClaim?: typeof consumeFeedbackClaim, createZip?: FeedbackZipCreator, now?: () => number, platform?: string, arch?: string, version?: string, maxBytes?: number }} dependencies
+ * @param {{ getBridgeStatus?: () => unknown, registerArtifact?: typeof registerFeedbackArtifact, readTranscript?: (path: string, options: { maxBytes: number }) => Promise<Buffer>, verifySignature?: (request: { tool: string, sessionHash?: unknown, signature?: unknown, fields: Record<string, unknown> }) => unknown, createZip?: FeedbackZipCreator, now?: () => number, platform?: string, arch?: string, version?: string, maxBytes?: number }} dependencies
  */
 export const prepareECometFeedback = async (input = {}, dependencies = {}) => {
     const {
         getBridgeStatus,
         registerArtifact = registerFeedbackArtifact,
         readTranscript = readTrustedTranscript,
-        consumeClaim = consumeFeedbackClaim,
+        verifySignature = verifyHookFields,
         createZip = createFeedbackZip,
         now = Date.now,
         platform = process.platform,
@@ -138,18 +159,18 @@ export const prepareECometFeedback = async (input = {}, dependencies = {}) => {
         version = BRIDGE_VERSION,
         maxBytes = FEEDBACK_MAX_BYTES,
     } = dependencies;
-    if (typeof getBridgeStatus !== 'function' || typeof registerArtifact !== 'function' || typeof readTranscript !== 'function' || typeof consumeClaim !== 'function' || typeof createZip !== 'function' || typeof now !== 'function' || !Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    if (typeof getBridgeStatus !== 'function' || typeof registerArtifact !== 'function' || typeof readTranscript !== 'function' || typeof verifySignature !== 'function' || typeof createZip !== 'function' || typeof now !== 'function' || !Number.isSafeInteger(maxBytes) || maxBytes < 1) {
         throw new TypeError('Feedback preparation dependencies are invalid');
     }
     const { kind, summary, details, includeTranscript, transcriptPath, feedbackClaim, feedbackSession } = input;
     if (feedbackClaim === undefined && feedbackSession === undefined && transcriptPath === undefined) {
         throw hookHandoffUnavailable();
     }
-    const claimInput = { kind, summary, details, includeTranscript, ...(transcriptPath === undefined ? {} : { transcriptPath }) };
+    const hookFields = transcriptPath === undefined ? {} : { transcriptPath };
     try {
-        // WHY: hook fields are only data until the local process consumes the matching private capability.
-        // Burning it first prevents a skipped/untrusted hook from reaching a transcript or artifact write.
-        await consumeClaim({ claimToken: feedbackClaim, sessionBinding: feedbackSession, targetTool: 'prepare_e_comet_feedback', input: claimInput });
+        // WHY: hook fields are only data until this process verifies the trusted signature over them.
+        // Verifying first prevents a skipped or untrusted hook from reaching a transcript or artifact write.
+        await verifySignature({ tool: 'prepare_e_comet_feedback', sessionHash: feedbackSession, signature: feedbackClaim, fields: hookFields });
     } catch (error) {
         throw claimInvalid(error);
     }
@@ -254,12 +275,12 @@ const uploadFailure = (artifactId, code, error = undefined, operation = 'upload'
 /**
  * Re-verifies and uploads one stored archive. Transport fields are injected by the trusted host hook.
  * @param {{ artifactId?: string, uploadUrl?: string, requiredHeaders?: Record<string, string>, objectKey?: string, expiresAt?: number, expectedSize?: number, expectedSha256?: string, feedbackClaim?: string, feedbackSession?: string }} input
- * @param {{ loadArtifact?: typeof loadVerifiedFeedbackArtifact, retireArtifact?: typeof retireFeedbackArtifact, upload?: typeof putFeedbackArchive, now?: () => number, consumeClaim?: typeof consumeFeedbackClaim }} dependencies
+ * @param {{ loadArtifact?: typeof loadVerifiedFeedbackArtifact, retireArtifact?: typeof retireFeedbackArtifact, upload?: typeof putFeedbackArchive, now?: () => number, verifySignature?: (request: { tool: string, sessionHash?: unknown, signature?: unknown, fields: Record<string, unknown> }) => unknown }} dependencies
  */
 const submitFeedback = async (input = {}, dependencies = {}) => {
-    const { loadArtifact = loadVerifiedFeedbackArtifact, retireArtifact = retireFeedbackArtifact, upload = putFeedbackArchive, now = Date.now, consumeClaim = consumeFeedbackClaim } = dependencies;
+    const { loadArtifact = loadVerifiedFeedbackArtifact, retireArtifact = retireFeedbackArtifact, upload = putFeedbackArchive, now = Date.now, verifySignature = verifyHookFields } = dependencies;
     const artifactId = safeArtifactId(input.artifactId);
-    if (typeof loadArtifact !== 'function' || typeof retireArtifact !== 'function' || typeof upload !== 'function' || typeof now !== 'function' || typeof consumeClaim !== 'function') {
+    if (typeof loadArtifact !== 'function' || typeof retireArtifact !== 'function' || typeof upload !== 'function' || typeof now !== 'function' || typeof verifySignature !== 'function') {
         throw new TypeError('Feedback submission dependencies are invalid.');
     }
     if (
@@ -275,7 +296,9 @@ const submitFeedback = async (input = {}, dependencies = {}) => {
     ) {
         return submitError(artifactId, 'failed', 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE', 'The trusted e-Comet hook handoff is unavailable.', 'handoff', false, undefined, 'handoff_submit');
     }
-    const claimInput = {
+    // Native authority is a signature; cloud uses the pinned destination. Their entry checks remain
+    // separate and both feed shared uploader validation; stricter downstream checks are intentional.
+    const hookFields = {
         artifactId: input.artifactId,
         uploadUrl: input.uploadUrl,
         requiredHeaders: input.requiredHeaders,
@@ -285,8 +308,9 @@ const submitFeedback = async (input = {}, dependencies = {}) => {
         expectedSha256: input.expectedSha256,
     };
     try {
-        // WHY: consume before artifact reads or request creation so raw transport values never confer authority.
-        await consumeClaim({ claimToken: input.feedbackClaim, sessionBinding: input.feedbackSession, targetTool: 'submit_e_comet_feedback', input: claimInput });
+        // WHY: verify before artifact reads or request creation so raw transport values never confer
+        // authority. The signature covers this artifactId, so a swapped one cannot reuse another grant.
+        await verifySignature({ tool: 'submit_e_comet_feedback', sessionHash: input.feedbackSession, signature: input.feedbackClaim, fields: hookFields });
     } catch (error) {
         return submitError(artifactId, 'failed', 'UPLOAD_GRANT_INVALID', 'The trusted feedback handoff claim could not be verified.', 'grant', false, error, 'claim_verification');
     }
@@ -333,5 +357,94 @@ const submitFeedback = async (input = {}, dependencies = {}) => {
 /** @type {typeof submitFeedback} */
 export const submitECometFeedback = async (input = {}, dependencies = {}) => {
     try { return await submitFeedback(input, dependencies); }
+    catch (error) { return feedbackSubmissionFailure(error, safeFeedbackProperty(input, 'artifactId')); }
+};
+
+// 412 is a success only under the grant that gives it that meaning: `If-None-Match: *` makes the PUT a
+// create, so a precondition failure says the archive this call would have written is already stored.
+// Under any other grant 412 is an ordinary storage rejection, exactly as on the native route.
+const CLOUD_ACCEPTED_STATUSES = Object.freeze([200, 201, 204, 412]);
+const grantForbidsOverwrite = (requiredHeaders) =>
+    Object.entries(requiredHeaders).some(([name, value]) => name.toLowerCase() === 'if-none-match' && value === '*');
+const archiveMismatch = () => Object.assign(
+    new Error('The delivered feedback archive does not match the prepared artifact.'),
+    { feedbackReason: 'archive_mismatch' },
+);
+const archiveShapeRefused = (cause = undefined) => Object.assign(
+    new Error('The delivered feedback archive is not a well-formed feedback package.', cause === undefined ? undefined : { cause }),
+    { feedbackReason: 'archive_shape' },
+);
+
+/**
+ * Bounds the delivered bytes to the archive the canonical writer produces: the entry names its central
+ * directory lists, in order, for this transcript choice. Bytes that agree with the grant and are still
+ * not a feedback package carry their own diagnostic reason (`archive_shape`), distinct from bytes that
+ * disagree with the grant's size or digest (`archive_mismatch`); one error code covers both.
+ */
+const assertFeedbackArchiveShape = (bytes, transcriptIncluded) => {
+    let names;
+    try {
+        names = feedbackZipEntryNames(bytes);
+    } catch (error) {
+        throw archiveShapeRefused(error);
+    }
+    const expected = feedbackZipEntryLayout({ includeTranscript: transcriptIncluded });
+    if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) throw archiveShapeRefused();
+};
+
+/**
+ * Cowork cloud route: the trusted cloud hook could not upload from the sandbox, so it delivered the grant and the
+ * archive bytes inside this call. The device holds no hook secret; the destination pin is the boundary.
+ * @param {{ artifactId?: string, uploadUrl?: string, requiredHeaders?: Record<string, string>, objectKey?: string, expiresAt?: number, expectedSize?: number, expectedSha256?: string, feedbackCloud?: { version: number, operationId: string, nonce: string, transcriptIncluded: boolean, archiveBase64: string } }} input
+ * @param {{ upload?: typeof putFeedbackArchive, now?: () => number, destinations?: ReadonlyArray<{ hostname: string, pathPrefix: string }> }} dependencies
+ */
+const submitCloudFeedback = async (input = {}, dependencies = {}) => {
+    const { upload = putFeedbackArchive, now = Date.now, destinations = FEEDBACK_CLOUD_UPLOAD_DESTINATIONS } = dependencies;
+    const artifactId = safeArtifactId(input.artifactId);
+    if (typeof upload !== 'function' || typeof now !== 'function' || !Array.isArray(destinations)) throw new TypeError('Feedback cloud submission dependencies are invalid.');
+    if (!isValidFeedbackCloudSubmitInput(input) || artifactId === undefined) {
+        return submitError(artifactId, 'failed', 'UPLOAD_GRANT_INVALID', 'The feedback upload grant is invalid or has expired.', 'grant', false,
+            Object.assign(new Error('invalid cloud transport'), { feedbackReason: 'invalid_input' }), 'input_validation');
+    }
+    if (
+        typeof input.uploadUrl !== 'string' || !input.requiredHeaders || typeof input.requiredHeaders !== 'object' || Array.isArray(input.requiredHeaders)
+        // objectKey is validated but never sent: the presigned uploadUrl already carries the destination,
+        // and a grant missing the key the staging hook signed is not a grant this route accepts.
+        || typeof input.objectKey !== 'string' || !Number.isSafeInteger(input.expiresAt) || input.expiresAt * 1000 <= now()
+        || !Number.isSafeInteger(input.expectedSize) || input.expectedSize <= 0 || input.expectedSize > FEEDBACK_CLOUD_MAX_BYTES
+        || typeof input.expectedSha256 !== 'string' || !SHA256.test(input.expectedSha256)
+    ) {
+        return uploadFailure(artifactId, 'UPLOAD_GRANT_INVALID');
+    }
+    try {
+        assertUploadDestination(input.uploadUrl, destinations, input.requiredHeaders);
+    } catch (error) {
+        return submitError(artifactId, 'failed', 'UPLOAD_DESTINATION_REFUSED', 'The feedback upload destination is not an e-Comet storage location.', 'grant', false, error, 'grant_validation');
+    }
+    let bytes;
+    try {
+        bytes = Buffer.from(input.feedbackCloud.archiveBase64, 'base64');
+        if (bytes.length !== input.expectedSize || createHash('sha256').update(bytes).digest('hex') !== input.expectedSha256) throw archiveMismatch();
+        // WHY: grant and bytes arrive in the same input, so size and SHA-256 prove transport integrity,
+        // not provenance. Requiring the prepared archive's own entry list bounds what a substituted grant
+        // can deliver to e-Comet's bucket to a well-formed feedback report.
+        assertFeedbackArchiveShape(bytes, input.feedbackCloud.transcriptIncluded === true);
+    } catch (error) {
+        return submitError(artifactId, 'failed', 'FEEDBACK_ARCHIVE_MISMATCH', 'The delivered feedback archive does not match the prepared artifact.', 'artifact', false, error, 'artifact_read');
+    }
+    try {
+        await upload({ uploadUrl: input.uploadUrl, requiredHeaders: input.requiredHeaders, expiresAt: input.expiresAt, bytes }, {
+            ...(grantForbidsOverwrite(input.requiredHeaders) ? { acceptedStatuses: CLOUD_ACCEPTED_STATUSES } : {}),
+            maxBytes: FEEDBACK_CLOUD_MAX_BYTES,
+        });
+    } catch (error) {
+        return uploadFailure(artifactId, safeFeedbackProperty(error, 'code'), error);
+    }
+    return { ok: true, status: 'uploaded', artifactId, transcriptIncluded: input.feedbackCloud.transcriptIncluded };
+};
+
+/** @type {typeof submitCloudFeedback} */
+export const submitECometCloudFeedback = async (input = {}, dependencies = {}) => {
+    try { return await submitCloudFeedback(input, dependencies); }
     catch (error) { return feedbackSubmissionFailure(error, safeFeedbackProperty(input, 'artifactId')); }
 };

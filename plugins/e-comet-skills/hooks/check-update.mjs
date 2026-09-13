@@ -2,7 +2,7 @@
 
 import { createHash, randomBytes } from 'node:crypto';
 import { realpathSync, statSync } from 'node:fs';
-import { mkdir, open, readFile, readdir, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, open, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -12,13 +12,8 @@ const MAX_MANIFEST_BYTES = 64 * 1024;
 const MAX_SESSION_BYTES = 1024;
 const MAX_STDIN_BYTES = 1024 * 1024;
 const MAX_ETAG_BYTES = 1024;
-const LOCK_STALE_MS = 10_000;
-const GLOBAL_LOCK_WAIT_MS = 3_000;
-const POLL_MS = 25;
 const CACHE_REPLACE_RETRY_LIMIT = 10;
 const CACHE_REPLACE_RETRY_MS = 10;
-export const LOCK_RELEASE_RETRY_LIMIT = 20;
-export const LOCK_RELEASE_RETRY_MS = 5;
 const TRANSIENT_FILESYSTEM_ERRORS = new Set(['EACCES', 'EBUSY', 'EPERM']);
 const UPDATE_URL = 'https://github.com/e-comet/skills#plugin-update';
 export const CHANGELOG_URL = 'https://github.com/e-comet/skills/blob/main/CHANGELOG.md';
@@ -33,10 +28,8 @@ const MAX_ADDED_ENTRY_BYTES = 2048;
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/e-comet/skills/main/plugins/e-comet-skills/.codex-plugin/plugin.json';
 const CACHE_NAME = 'plugin-update-latest-v1.json';
-const GLOBAL_LOCK_NAME = 'plugin-update-latest-v1.lock';
 const SESSION_DIRECTORY = 'plugin-update-sessions-v1';
 const CHANGELOG_STATE_NAME = 'changelog-state-v1.json';
-const CHANGELOG_LOCK_NAME = 'changelog-state-v1.lock';
 
 export const REMOTE_INTERVAL_MS = 86_400_000;
 export const MAX_FUTURE_SKEW_MS = 300_000;
@@ -255,11 +248,9 @@ const selectFor = async (pluginRoot, handledVersion, installedVersion, readFeed)
 };
 
 export const resolveChangelogNotice = async ({
-    acquireStateLock = acquireLock,
     pluginRoot,
     readFeed = readChangelogFeed,
     stateDir,
-    lockOperations = {},
     readState = readHandledState,
     writeState = writeAtomicJson,
 }) => {
@@ -268,32 +259,40 @@ export const resolveChangelogNotice = async ({
         const installedVersion = await readInstalledVersion(pluginRoot);
         if (installedVersion === null) return null;
         await mkdir(stateDir, { recursive: true, mode: 0o700 });
-        // Unlocked pre-read: the steady state is "already handled", and it must cost two reads and no lock.
-        const initialState = await readState(stateDir);
-        if (initialState.status === 'error') return null;
-        // Covers both already-handled directions, not just equality: after a rollback the older plugin root
-        // can only ever decide to do nothing, and must not take the lock to learn that.
-        const initialOrder = initialState.status === 'valid' ? compareCalVer(initialState.version, installedVersion) : null;
-        if (initialOrder !== null && initialOrder >= 0) return null;
-
-        const release = await acquireStateLock(join(stateDir, CHANGELOG_LOCK_NAME), Date.now(), lockOperations);
-        if (release === null) return null;
+        const state = await readState(stateDir);
+        if (state.status === 'error') return null;
+        const handledVersion = state.status === 'valid' ? state.version : null;
+        // The steady state is "already handled": one read, no feed, no write. It also covers the
+        // rollback direction, where an older plugin root can only ever decide to do nothing.
+        const selection = compareCalVer(handledVersion, installedVersion) === -1
+            ? await selectFor(pluginRoot, handledVersion, installedVersion, readFeed)
+            : null;
+        const { emit, store } = decideChangelogNotice({ installedVersion, handledVersion, selection });
+        if (store === null) return null;
+        // Concurrent calls all read the same stale state. Exclusive creation of one election file per
+        // installed version admits a single publisher, and a winner that then reads updated state has
+        // been overtaken and stays silent. This election covers one installed version; overlapping old
+        // and new roots can repeat a notice (accepted residual in docs/local-agent-architecture.md#accepted-residuals).
+        // The version is hashed into the name because a CalVer with build metadata may exceed a filename.
+        // A hook killed inside its timeout can suppress one version's notice; the next recovers: accepted residual, see docs/local-agent-architecture.md#accepted-residuals.
+        const election = join(stateDir, `${CHANGELOG_STATE_NAME}.${sessionKey(installedVersion).slice(0, 32)}.pending`);
         try {
-            const lockedState = await readState(stateDir);
-            if (lockedState.status === 'error') return null;
-            const handledVersion = lockedState.status === 'valid' ? lockedState.version : null;
-            const selection = compareCalVer(handledVersion, installedVersion) === -1
-                ? await selectFor(pluginRoot, handledVersion, installedVersion, readFeed)
-                : null;
-            const { emit, store } = decideChangelogNotice({ installedVersion, handledVersion, selection });
-            if (store !== null) {
-                // Persist before emitting: a lost notification is preferred over a repeated one.
-                await writeState(join(stateDir, CHANGELOG_STATE_NAME), { schemaVersion: 1, lastHandledVersion: store });
-            }
-            return emit ? { version: installedVersion, ...selection } : null;
-        } finally {
-            await release().catch(() => {});
+            await writeFile(election, '', { flag: 'wx', mode: 0o600 });
+        } catch (error) {
+            if (error?.code === 'EEXIST') return null;
+            throw error;
         }
+        try {
+            const current = await readState(stateDir);
+            // A state that cannot be read now may already carry this version: silence over a repeat.
+            if (current.status === 'error') return null;
+            if (current.status === 'valid' && compareCalVer(current.version, installedVersion) >= 0) return null;
+            // Persist before emitting: a lost notification is preferred over a repeated one.
+            await writeState(join(stateDir, CHANGELOG_STATE_NAME), { schemaVersion: 1, lastHandledVersion: store });
+        } finally {
+            await rm(election, { force: true }).catch(() => undefined);
+        }
+        return emit ? { version: installedVersion, ...selection } : null;
     } catch {
         return null;
     }
@@ -367,104 +366,6 @@ export const writeAtomicJson = async (path, value, { renameFile = rename, wait =
     }
 };
 
-const waitForDelay = (delayMs) => new Promise((resolveWait) => setTimeout(resolveWait, delayMs));
-
-export const releaseOwnedLock = async ({
-    lockPath,
-    ownerPath,
-    retryLimit = LOCK_RELEASE_RETRY_LIMIT,
-    waitForRetry = waitForDelay,
-    operations = {},
-}) => {
-    const unlinkOwner = operations.unlink ?? unlink;
-    const removeDirectory = operations.rmdir ?? rmdir;
-    const readDirectory = operations.readdir ?? readdir;
-    for (let attempt = 0; attempt < retryLimit; attempt += 1) {
-        try {
-            await unlinkOwner(ownerPath);
-            break;
-        } catch (error) {
-            if (error?.code === 'ENOENT') return;
-            if (!TRANSIENT_FILESYSTEM_ERRORS.has(error?.code) || attempt === retryLimit - 1) throw error;
-            await waitForRetry(LOCK_RELEASE_RETRY_MS);
-        }
-    }
-    for (let attempt = 0; attempt < retryLimit; attempt += 1) {
-        try {
-            await removeDirectory(lockPath);
-            return;
-        } catch (error) {
-            if (['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error?.code)) return;
-            if (!TRANSIENT_FILESYSTEM_ERRORS.has(error?.code)) throw error;
-            try {
-                if ((await readDirectory(lockPath)).length > 0) return;
-            } catch (readError) {
-                if (readError?.code === 'ENOENT') return;
-                if (!TRANSIENT_FILESYSTEM_ERRORS.has(readError?.code)) throw readError;
-            }
-            if (attempt === retryLimit - 1) throw error;
-            await waitForRetry(LOCK_RELEASE_RETRY_MS);
-        }
-    }
-};
-
-const quarantineStaleLock = async (lockPath, nowMs, quarantineNonce) => {
-    let metadata;
-    let entries;
-    try {
-        metadata = await stat(lockPath);
-        if (nowMs - metadata.mtimeMs <= LOCK_STALE_MS) return false;
-        entries = await readdir(lockPath);
-        if (entries.length > 1) return false;
-    } catch (error) {
-        if (error?.code === 'ENOENT') return true;
-        throw error;
-    }
-    const quarantine = `${lockPath}.stale-${quarantineNonce}`;
-    try {
-        await rename(lockPath, quarantine);
-    } catch (error) {
-        if (error?.code === 'ENOENT') return true;
-        if (error?.code === 'EEXIST') return false;
-        throw error;
-    }
-    const quarantinedMetadata = await stat(quarantine).catch(() => null);
-    const quarantinedEntries = await readdir(quarantine).catch(() => []);
-    const sameDirectory = quarantinedMetadata !== null &&
-        quarantinedMetadata.dev === metadata.dev && quarantinedMetadata.ino === metadata.ino;
-    if (sameDirectory && quarantinedEntries.length === entries.length && quarantinedEntries[0] === entries[0]) {
-        await rm(quarantine, { recursive: true, force: true });
-        return true;
-    }
-    try {
-        await rename(quarantine, lockPath);
-    } catch (error) {
-        if (!['EEXIST', 'ENOTEMPTY'].includes(error?.code)) throw error;
-    }
-    return false;
-};
-
-const acquireLock = async (lockPath, nowMs, operations = {}) => {
-    const owner = randomBytes(16).toString('hex');
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-        try {
-            await mkdir(lockPath, { mode: 0o700 });
-            try {
-                const ownerPath = join(lockPath, owner);
-                await writeFile(ownerPath, '', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-                return () => releaseOwnedLock({ lockPath, ownerPath, operations });
-            } catch (error) {
-                await rm(lockPath, { recursive: true, force: true }).catch(() => {});
-                throw error;
-            }
-        } catch (error) {
-            if (error?.code !== 'EEXIST') throw error;
-            if (!(await quarantineStaleLock(lockPath, nowMs, owner))) return null;
-        }
-    }
-    return null;
-};
-
 const readResponseBody = async (response) => {
     const declaredLength = response.headers.get('content-length');
     if (declaredLength !== null && (!/^\d+$/.test(declaredLength) || Number(declaredLength) > MAX_MANIFEST_BYTES)) return null;
@@ -527,66 +428,27 @@ export const fetchLatestVersion = async ({ cached, fetchImpl, timeoutMs }) => {
     }
 };
 
-const resolveLatestVersion = async ({ dataRoot, fetchImpl, nowMs, lockOperations }) => {
-    let cacheState = await readCacheState(dataRoot, nowMs);
+const resolveLatestVersion = async ({ dataRoot, fetchImpl, nowMs }) => {
+    const cacheState = await readCacheState(dataRoot, nowMs);
     if (cacheState.corrupt) return { fatal: true };
-    let cached = cacheState.value;
+    const cached = cacheState.value;
     const refreshDue = cached === null || cached.lastAttemptAt === null || nowMs - cached.lastAttemptAt >= REMOTE_INTERVAL_MS;
-    const lockPath = join(dataRoot, GLOBAL_LOCK_NAME);
-    if (!refreshDue) {
-        if (cached?.latestVersion) return { fatal: false, deferred: false, cached };
-        if (!(await fileExists(lockPath))) return { fatal: false, deferred: true, cached: null };
-        if (await quarantineStaleLock(lockPath, Date.now(), randomBytes(16).toString('hex'))) {
-            return { fatal: false, deferred: true, cached: null };
-        }
-        const deadline = Date.now() + GLOBAL_LOCK_WAIT_MS;
-        while (Date.now() < deadline) {
-            await new Promise((resolvePoll) => setTimeout(resolvePoll, POLL_MS));
-            cacheState = await readCacheState(dataRoot, nowMs);
-            if (cacheState.corrupt) return { fatal: true };
-            if (cacheState.value?.latestVersion) return { fatal: false, deferred: false, cached: cacheState.value };
-            if (!(await fileExists(lockPath))) return { fatal: false, deferred: true, cached: null };
-        }
-        return { fatal: false, deferred: true, cached: null };
-    }
+    if (!refreshDue) return { fatal: false, cached };
+    // Record the attempt before making it, so a crash mid-fetch still throttles the next process.
+    // Two sessions inside one interval may each reach this line and each make the same request.
+    const attempted = { ...(cached ?? emptyCache()), lastAttemptAt: nowMs };
+    await writeAtomicJson(join(dataRoot, CACHE_NAME), attempted);
+    const fetched = await fetchLatestVersion({ cached, fetchImpl, timeoutMs: FETCH_TIMEOUT_MS });
+    if (fetched === null) return { fatal: false, cached: attempted };
 
-    const release = await acquireLock(lockPath, Date.now(), lockOperations);
-    if (release === null) {
-        if (cached?.latestVersion) return { fatal: false, deferred: false, cached };
-        const deadline = Date.now() + GLOBAL_LOCK_WAIT_MS;
-        while (Date.now() < deadline) {
-            await new Promise((resolvePoll) => setTimeout(resolvePoll, POLL_MS));
-            cacheState = await readCacheState(dataRoot, nowMs);
-            if (cacheState.corrupt) return { fatal: true };
-            if (cacheState.value?.latestVersion) return { fatal: false, deferred: false, cached: cacheState.value };
-            if (!(await fileExists(lockPath))) break;
-        }
-        return { fatal: false, deferred: true, cached: null };
+    let successful;
+    if (cached?.latestVersion && compareCalVer(fetched.latestVersion, cached.latestVersion) < 0) {
+        successful = { ...attempted, latestVersion: cached.latestVersion, etag: cached.etag, lastSuccessAt: cached.lastSuccessAt };
+    } else {
+        successful = { ...attempted, latestVersion: fetched.latestVersion, etag: fetched.etag, lastSuccessAt: nowMs };
     }
-
-    try {
-        cacheState = await readCacheState(dataRoot, nowMs);
-        if (cacheState.corrupt) return { fatal: true };
-        cached = cacheState.value;
-        if (cached?.lastAttemptAt !== null && cached?.lastAttemptAt !== undefined && nowMs - cached.lastAttemptAt < REMOTE_INTERVAL_MS) {
-            return { fatal: false, deferred: false, cached };
-        }
-        const attempted = { ...(cached ?? emptyCache()), lastAttemptAt: nowMs };
-        await writeAtomicJson(join(dataRoot, CACHE_NAME), attempted);
-        const fetched = await fetchLatestVersion({ cached, fetchImpl, nowMs, timeoutMs: FETCH_TIMEOUT_MS });
-        if (fetched === null) return { fatal: false, deferred: false, cached: attempted };
-
-        let successful;
-        if (cached?.latestVersion && compareCalVer(fetched.latestVersion, cached.latestVersion) < 0) {
-            successful = { ...attempted, latestVersion: cached.latestVersion, etag: cached.etag, lastSuccessAt: cached.lastSuccessAt };
-        } else {
-            successful = { ...attempted, latestVersion: fetched.latestVersion, etag: fetched.etag, lastSuccessAt: nowMs };
-        }
-        await writeAtomicJson(join(dataRoot, CACHE_NAME), successful);
-        return { fatal: false, deferred: false, cached: successful };
-    } finally {
-        await release().catch(() => {});
-    }
+    await writeAtomicJson(join(dataRoot, CACHE_NAME), successful);
+    return { fatal: false, cached: successful };
 };
 
 const fileExists = async (path) => {
@@ -599,29 +461,32 @@ const fileExists = async (path) => {
     }
 };
 
-export const checkUpdateForSession = async ({ pluginRoot, dataRoot, event, fetchImpl, nowMs, lockOperations = {} }) => {
+export const checkUpdateForSession = async ({ pluginRoot, dataRoot, event, fetchImpl, nowMs }) => {
     try {
         if (event === null || typeof event?.sessionId !== 'string') return null;
         const sessionsRoot = join(dataRoot, SESSION_DIRECTORY);
         await mkdir(sessionsRoot, { recursive: true, mode: 0o700 });
-        const key = sessionKey(event.sessionId);
-        const checkedPath = join(sessionsRoot, `${key}.checked`);
+        // Session markers are never swept: one empty file per session, exactly as before this change.
+        const checkedPath = join(sessionsRoot, `${sessionKey(event.sessionId)}.checked`);
         if (await fileExists(checkedPath)) return null;
-        const release = await acquireLock(join(sessionsRoot, `${key}.lock`), Date.now(), lockOperations);
-        if (release === null) return null;
+        const installedVersion = await readInstalledVersion(pluginRoot);
+        if (installedVersion === null) return null;
+        const latest = await resolveLatestVersion({ dataRoot, fetchImpl, nowMs });
+        if (latest.fatal) return null;
+        const latestVersion = latest.cached?.latestVersion;
+        // No marker while the latest version is still unknown: another process may be fetching it
+        // right now, and this session keeps its one notice for a later ordinary call.
+        if (latestVersion === null || latestVersion === undefined) return null;
         try {
-            if (await fileExists(checkedPath)) return null;
-            const installedVersion = await readInstalledVersion(pluginRoot);
-            if (installedVersion === null) return null;
-            const latest = await resolveLatestVersion({ dataRoot, fetchImpl, nowMs, lockOperations });
-            if (latest.fatal || latest.deferred) return null;
+            // Exclusive creation is the once-per-session primitive: a concurrent call in the same
+            // session loses here and stays silent instead of repeating the notice.
             await writeFile(checkedPath, '', { flag: 'wx', mode: 0o600 });
-            const latestVersion = latest.cached?.latestVersion;
-            if (latestVersion === null || latestVersion === undefined || compareCalVer(installedVersion, latestVersion) !== -1) return null;
-            return { installedVersion, latestVersion };
-        } finally {
-            await release().catch(() => {});
+        } catch (error) {
+            if (error?.code === 'EEXIST') return null;
+            throw error;
         }
+        if (compareCalVer(installedVersion, latestVersion) !== -1) return null;
+        return { installedVersion, latestVersion };
     } catch {
         return null;
     }

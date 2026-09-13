@@ -45,7 +45,9 @@ const copyReport = async (artifact, directory, stage) => {
     // The delivery copy must never become subject to the original store's retention.
     if (within(path.dirname(sourcePath), path.join(root, 'e-comet-reports'))) throw new Error('invalid_output_directory');
     try { await mkdir(child); } catch (error) { if (error.code !== 'EEXIST') throw error; }
-    if (!(await lstat(child)).isDirectory() || (await lstat(child)).isSymbolicLink()) throw new Error('invalid_output_directory');
+    const childStat = await lstat(child);
+    // lstat accepts only a real directory here; it never follows a symlink.
+    if (!childStat.isDirectory()) throw new Error('invalid_output_directory');
     const physicalChild = await realpath(child);
     if (path.relative(root, physicalChild) !== 'e-comet-reports') throw new Error('invalid_output_directory');
     stage('source');
