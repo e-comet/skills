@@ -3,6 +3,13 @@
 Codex and Claude launch `src/server.mjs` directly over STDIO with the `node` command. The server has no npm runtime
 dependencies; all required source modules are included in this directory. Node.js 22+ is required.
 
+From the installed plugin root, run `node mcp/src/doctor.mjs --json` to inspect bootstrap metadata and storage
+configuration without starting the MCP server. The command always prints one JSON document when collection completes;
+failed checks still exit with status 0. It does not bind the bridge port, create pairing state, remove retained files, or
+contact the extension, e-Comet, or a marketplace. The output identifies only the Node process that ran the doctor. A
+successful result does not prove that the desktop host installed or enabled this plugin, launches this copy, or runs its
+trusted hooks.
+
 The `secondary` bridge role is a normal proxy role. `peer.bridgeVersion` and `extension.version`
 identify different components; version skew alone does not establish a failure cause.
 `extensionConnected:false` means there is no effective extension route, not why it is absent.
@@ -74,6 +81,23 @@ Local tools:
 - `local_bridge_status` — reports whether the extension is connected, and why the bridge cannot reach a primary
   peer when it cannot;
 - `wb_product_images` — public WB image-CDN lookup; this tool does not require the extension.
+
+## Workflow contract lookup
+
+The short `tools/list` catalog routes by intent; `describe_e_comet_tool({name})` returns the full current contract for exactly these eight signed local tools:
+
+- `wb_product_card`, `wb_search_by_query`, `wb_check_by_query`, `wb_recommendations_by_product`, `wb_seller_reviews`;
+- `ozon_seller_promotion_report`, `ozon_seller_promotion_reports`, `ozon_seller_analytics_report`.
+
+The same lookup also supports `prepare_e_comet_feedback` and `submit_e_comet_feedback`, which share one feedback contract. Successful `tools/call` output has `schemaVersion:1`, `type:"e_comet_tool_contract"`, `requestedTool` equal to the requested name, `appliesTo:["browser_job",name]` for a signed tool (or `["prepare_e_comet_feedback","report_issue","submit_e_comet_feedback"]` for either feedback name), and a nonempty `contract` string. The JSON text content mirrors `structuredContent`. The lookup is read-only: it does not start or contact the bridge, extension, signer, or marketplace, and needs no feedback consent for a signed tool. An unsupported name or failed lookup stops that tool's workflow before authorization; do not infer authorization from a catalog description alone.
+
+Choose the matching signed tool first. If its full contract is not already available in the current task, look it up once before remote `browser_job`; reuse the known contract for another call of the same tool and look up a different selected tool separately. Follow the returned business arguments and safety limits, then await exactly one `browser_job` authorization and immediately call the matching local tool once. No discovery, status probe, prose, or other call belongs between a successful `browser_job` and that dependent local call. Preserve partial/completed results and do not automatically retry uncertain creates or rate-limited work. The [authorization handoff](#authorization-handoff) below and packaged [hook implementation](../hooks/) define the trusted transport boundary.
+
+Feedback is separate: only after explicit user agreement to report an e-Comet problem, retrieve the full feedback contract before the first feedback tool and resolve the history choice as it directs. The consented dependent sequence is local `prepare_e_comet_feedback` → remote `report_issue` → local `submit_e_comet_feedback`, awaiting each stage and inserting no discovery between successful stages. It needs no `browser_job` or extension. Do not author hook-only transport fields or retry an uncertain upload. The packaged [feedback hooks](../hooks/) implement the host-specific handoff; the full native versus Cowork cloud boundary is maintained in the private architecture document.
+
+`wb_product_images` is not a lookup target. Call it directly for public CDN image URLs; it needs no describe call, `browser_job`, or Chrome extension. A failed/rate-limited probe is not proof that a product or its photos do not exist.
+
+### Authorization handoff
 
 The agent discovers the matching typed local tool first. Its description then requires sending only the small task
 descriptor to remote `browser_job` before invoking the selected local tool.

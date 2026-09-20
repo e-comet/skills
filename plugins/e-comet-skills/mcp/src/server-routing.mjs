@@ -3,6 +3,26 @@ import { ozonExtensionOutdatedError, ToolExecutionError } from './tool-errors.mj
 import { sendWs, WS_OPEN } from './websocket.mjs';
 import { markOzonPackageNotStarted } from './ozon-report-package-result.mjs';
 
+export const createDiagnosticSnapshotRoute = ({ connections, sendExtension = sendWs }) => ({ requestId }) => {
+    if (connections.extensionReady) {
+        if (!connections.extensionDiagnosticSnapshotReady) throw new ToolExecutionError('UNSUPPORTED_CAPABILITY', 'The connected extension does not support diagnostic snapshots.', 'extension', false);
+        sendExtension(connections.extensionSocket, localMessage(requestId, MESSAGE_TYPES.diagnosticSnapshot, { protocolVersion: 1 }));
+        return;
+    }
+    if (connections.peerReady && connections.peerExtensionDiagnosticSnapshotReady &&
+        connections.authenticatedPrimaryMetadata?.diagnosticForwardingSupported === true && connections.peerSocket?.readyState === WS_OPEN) {
+        connections.peerSocket.send(JSON.stringify({ type: 'peer_diagnostic_snapshot', requestId, protocolVersion: 1 }));
+        return;
+    }
+    // «Спросить некого» и «спрашивать нечем» — разные наблюдения. Пока подключённого расширения нет
+    // ни здесь, ни у первичного процесса, отказ по возможности приписал бы пользователю устаревшую
+    // сборку, хотя наблюдается только отсутствие подключения — самый частый бытовой случай.
+    if (!(connections.peerReady && connections.peerExtensionReady === true && connections.peerSocket?.readyState === WS_OPEN)) {
+        throw new ToolExecutionError('EXTENSION_DISCONNECTED', 'No connected e-Comet extension is reachable for a diagnostic snapshot.', 'extension', false);
+    }
+    throw new ToolExecutionError('UNSUPPORTED_CAPABILITY', 'Extension diagnostic snapshots are unavailable on this route.', 'extension', false);
+};
+
 /**
  * @param {{
  *   connections: {

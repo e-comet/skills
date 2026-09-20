@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { feedbackDiagnostics } from '../mcp/src/feedback-diagnostics.mjs';
 import { sweepExpired } from '../mcp/src/file-retention.mjs';
 import { retryTransientFileOperation } from './transient-file-operation.mjs';
+import { withHookDiagnostic } from './hook-diagnostics.mjs';
 
 const MAX_HOOK_EVENT_BYTES = 1024 * 1024;
 const MAX_SESSION_ID_BYTES = 512;
@@ -374,7 +375,7 @@ const browserJobTargetTool = (event) => {
     return validateTargetTool(LOCAL_TOOL_BY_BROWSER_JOB_TYPE[job.type]);
 };
 
-export const processHookEvent = async (event, { env = process.env, nowMs = Date.now(), fileNow = Date.now } = {}) => {
+const processHookEventAuthoritative = async (event, { env = process.env, nowMs = Date.now(), fileNow = Date.now } = {}) => {
     if (!event || typeof event !== 'object') {
         const error = new HandoffError('HANDOFF_INVALID_EVENT', 'The desktop hook event is invalid.');
         return { exitCode: 2, stdout: '', stderr: `${error.code}: ${error.message}` };
@@ -443,6 +444,27 @@ export const processHookEvent = async (event, { env = process.env, nowMs = Date.
     }
 
     return { exitCode: 0, stdout: '', stderr: '' };
+};
+
+export const processHookEvent = async (event, options = {}) => {
+    const result = await processHookEventAuthoritative(event, options);
+    const eventName = event?.hook_event_name ?? event?.hookEventName;
+    const toolName = event?.tool_name ?? event?.toolName;
+    const isPost = eventName === 'PostToolUse' && REMOTE_BROWSER_JOB_TOOL.test(toolName);
+    const isPre = eventName === 'PreToolUse' && LOCAL_BROWSER_TOOL.test(toolName);
+    if ((!isPost && !isPre) || result.exitCode !== 0) return result;
+    let decision;
+    if (result.stdout) {
+        try { decision = JSON.parse(result.stdout).hookSpecificOutput?.permissionDecision; }
+        catch { return result; }
+    }
+    return withHookDiagnostic(result, () => ({
+        event: eventName, toolFamily: 'browser_job', handler: 'browser_job_handoff',
+        stage: isPost ? 'handoff_staged' : decision === 'deny' ? 'call_denied' : 'input_rewritten',
+        outcome: decision === 'deny' ? 'denied' : 'succeeded',
+        observedAt: new Date(options.nowMs ?? Date.now()).toISOString(),
+        executionPlane: typeof toolName === 'string' && toolName.startsWith('mcp__remote-devices__') ? 'cloud' : 'native',
+    }));
 };
 
 const readStdin = async () => {

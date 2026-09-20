@@ -9,6 +9,21 @@ import { StorageUnavailableError } from './storage-layout.mjs';
 const SAFE_CODE = /^[A-Z][A-Z0-9_]{2,63}$/;
 const MAX_SAFE_MESSAGE_LENGTH = 500;
 const SAFE_STAGES = new Set(['arguments', 'handoff', 'extension', 'authorization', 'execution', 'storage', 'images', 'seller', 'local']);
+const BROWSER_JOB_REJECTION_CODES = new Set(['BROWSER_JOB_REJECTED', 'BROWSER_JOB_ACCOUNT_MISMATCH']);
+const BROWSER_JOB_REJECTION_REASONS = new Set(['public_key_not_configured', 'user_not_available', 'invalid_format', 'invalid_algorithm', 'invalid_signature', 'issuer_mismatch', 'audience_mismatch', 'subject_mismatch', 'expired', 'invalid_job', 'token_reuse', 'ecomet_not_authenticated', 'activation_storage_unavailable', 'unknown']);
+const BROWSER_JOB_INVALID_JOB_DIAGNOSTICS = new Set(['job_type', 'jobs_count', 'descriptor_type', 'descriptor_shape', 'date_from', 'date_to_or_range', 'claims_iat_or_jti']);
+const exactKeys = (value, allowed, required) => value && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).every((key) => allowed.includes(key)) && required.every((key) => Object.hasOwn(value, key));
+
+export const parseBrowserJobRejection = (code, value) => {
+    if (!BROWSER_JOB_REJECTION_CODES.has(code) || !exactKeys(value, ['schemaVersion', 'reason', 'diagnostic'], ['schemaVersion', 'reason']) ||
+        value.schemaVersion !== 1 || !BROWSER_JOB_REJECTION_REASONS.has(value.reason)) return undefined;
+    if (value.diagnostic !== undefined && (value.reason !== 'invalid_job' || !BROWSER_JOB_INVALID_JOB_DIAGNOSTICS.has(value.diagnostic))) return undefined;
+    return Object.freeze({ schemaVersion: 1, reason: value.reason, ...(value.diagnostic === undefined ? {} : { diagnostic: value.diagnostic }) });
+};
+
+export const browserJobRejectionDetails = (error) => error instanceof ToolExecutionError && error.details?.browserJobRejection
+    ? { browserJobRejection: error.details.browserJobRejection } : undefined;
 
 // Причина отказа для сборки расширения, не объявившей возможность Ozon. Терминальный код при этом
 // остаётся OZON_ROUTE_NOT_READY: набор кодов зафиксирован в contracts/local-agent-contract.json,
@@ -29,7 +44,7 @@ const OZON_EXTENSION_OUTDATED_DETAIL_KEYS = Object.freeze([
 // строка вывела бы сообщение за MAX_SAFE_MESSAGE_LENGTH, и весь терминальный ответ выродился бы в
 // нераспознанную ошибку вместо диагноза.
 const SAFE_EXTENSION_VERSION = /^[\w.+-]{1,32}$/;
-const safeExtensionVersion = (value) => (typeof value === 'string' && SAFE_EXTENSION_VERSION.test(value) ? value : undefined);
+export const safeExtensionVersion = (value) => (typeof value === 'string' && SAFE_EXTENSION_VERSION.test(value) ? value : undefined);
 
 const isOzonExtensionOutdatedDetails = (value) =>
     typeof value === 'object' &&
@@ -85,7 +100,10 @@ export const safeExternalToolError = (value, fallbackMessage = 'Browser job auth
             ? value.message
             : fallbackMessage;
     const stage = SAFE_STAGES.has(value?.stage) ? value.stage : 'authorization';
-    return new ToolExecutionError(code, message, stage, value?.retryable === true);
+    const error = new ToolExecutionError(code, message, stage, value?.retryable === true);
+    const rejection = parseBrowserJobRejection(code, value?.browserJobRejection);
+    if (rejection) error.details = Object.freeze({ browserJobRejection: rejection });
+    return error;
 };
 
 export const safeOzonPromotionToolError = (value) => {
@@ -107,6 +125,9 @@ export const safeOzonPromotionToolError = (value) => {
     // приходят как разобранный из JSON обычный объект и instanceof пройти не могут, поэтому чужая
     // сторона сокета не в состоянии дописать собственный текст в контекст модели через это поле.
     if (value instanceof ToolExecutionError && isOzonExtensionOutdatedDetails(value.details)) safe.details = value.details;
+    if (value instanceof ToolExecutionError && value.code === 'OZON_AUTHORIZATION_REJECTED' && value.details?.browserJobRejection) {
+        safe.details = value.details;
+    }
     if (isOzonExecutionInterruptionDetails(value.code, value.details)) {
         safe.details = { phase: value.details.phase, createOutcome: value.details.createOutcome };
     }

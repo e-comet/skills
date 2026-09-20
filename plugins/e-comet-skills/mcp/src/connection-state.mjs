@@ -60,6 +60,7 @@ export class ConnectionState {
     extensionOzonPromotionReady = false;
     extensionOzonPromotionPackageReady = false;
     extensionOzonAnalyticsReady = false;
+    extensionDiagnosticSnapshotReady = false;
     peerSocket = null;
     peerReady = false;
     peerExtensionReady = false;
@@ -67,6 +68,7 @@ export class ConnectionState {
     peerExtensionOzonPromotionReady = false;
     peerExtensionOzonPromotionPackageReady = false;
     peerExtensionOzonAnalyticsReady = false;
+    peerExtensionDiagnosticSnapshotReady = false;
     // Старая первичная сборка поле про возможность Ozon в peer_status не присылает вовсе, и её
     // молчание нельзя читать как «расширение не умеет»: иначе вторичный агент посоветует обновить
     // расширение там, где на самом деле устарел соседний процесс.
@@ -121,6 +123,10 @@ export class ConnectionState {
 
     get effectiveOzonAnalyticsReady() {
         return this.extensionOzonAnalyticsReady || (this.peerReady && this.peerExtensionOzonAnalyticsReady);
+    }
+
+    get effectiveDiagnosticSnapshotReady() {
+        return this.extensionDiagnosticSnapshotReady || (this.peerReady && this.peerExtensionDiagnosticSnapshotReady);
     }
 
     // Отличает «расширение возможность не объявило» от «спросить было не у кого»: известно только
@@ -187,6 +193,7 @@ export class ConnectionState {
             typeof options === 'object' && options.ozonSellerPromotionReportsSupported === true;
         const ozonSellerAnalyticsReportSupported =
             typeof options === 'object' && options.ozonSellerAnalyticsReportSupported === true;
+        const diagnosticSnapshotSupported = typeof options === 'object' && options.diagnosticSnapshotSupported === true;
         const previousSocket = this.extensionSocket;
         const evicted = Boolean(previousSocket) && previousSocket !== socket;
         if (previousSocket !== socket) this.browserContext = { state: 'unknown' };
@@ -208,6 +215,7 @@ export class ConnectionState {
         this.extensionOzonPromotionReady = ozonSellerPromotionReportSupported;
         this.extensionOzonPromotionPackageReady = ozonSellerPromotionReportsSupported;
         this.extensionOzonAnalyticsReady = ozonSellerAnalyticsReportSupported;
+        this.extensionDiagnosticSnapshotReady = diagnosticSnapshotSupported;
         this.extensionVersion = typeof options === 'object' ? options.version : undefined;
         this.extensionLastConnectedAtMs = this.#now();
         this.#resolveExtensionReadyWaiters();
@@ -222,6 +230,7 @@ export class ConnectionState {
         this.extensionOzonPromotionReady = false;
         this.extensionOzonPromotionPackageReady = false;
         this.extensionOzonAnalyticsReady = false;
+        this.extensionDiagnosticSnapshotReady = false;
         this.extensionLastDisconnectedAtMs = this.#now();
         this.browserContext = { state: 'unknown' };
         return true;
@@ -250,6 +259,7 @@ export class ConnectionState {
         this.peerExtensionOzonPromotionReady = message.ozonSellerPromotionReportSupported === true;
         this.peerExtensionOzonPromotionPackageReady = message.ozonSellerPromotionReportsSupported === true;
         this.peerExtensionOzonAnalyticsReady = message.ozonSellerAnalyticsReportSupported === true;
+        this.peerExtensionDiagnosticSnapshotReady = message.diagnosticSnapshotSupported === true;
         this.peerOzonPromotionSupportReported = typeof message.ozonSellerPromotionReportSupported === 'boolean';
         this.peerOzonPromotionPackageSupportReported = typeof message.ozonSellerPromotionReportsSupported === 'boolean';
         this.peerOzonAnalyticsSupportReported = typeof message.ozonSellerAnalyticsReportSupported === 'boolean';
@@ -265,6 +275,7 @@ export class ConnectionState {
                 ? { bridgeVersion: authenticatedPrimary.authenticatedPrimaryBridgeVersion }
                 : {}),
             browserContextPropagationSupported: authenticatedPrimary.browserContextPropagationSupported === true,
+            diagnosticForwardingSupported: authenticatedPrimary.diagnosticForwardingSupported === true,
         };
         this.#resolveExtensionReadyWaiters();
         return wasReady;
@@ -305,6 +316,8 @@ export class ConnectionState {
         this.peerExtensionOzonPromotionReady = false;
         this.peerExtensionOzonPromotionPackageReady = false;
         this.peerExtensionOzonAnalyticsReady = false;
+        this.peerExtensionDiagnosticSnapshotReady = false;
+        this.peerExtensionDiagnosticSnapshotReady = false;
         this.peerOzonPromotionSupportReported = false;
         this.peerOzonPromotionPackageSupportReported = false;
         this.peerOzonAnalyticsSupportReported = false;

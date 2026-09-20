@@ -58,6 +58,7 @@ export class RequestBroker {
         routeSellerOperation,
         routeOzonPromotionReport = undefined,
         routeAuthorization,
+        routeDiagnosticSnapshot = undefined,
         createRequestId = randomUUID,
         defaultTimeout = REQUEST_TIMEOUT_MS,
         authorizationReleaseTimeout = AUTHORIZATION_RELEASE_TIMEOUT_MS,
@@ -75,6 +76,7 @@ export class RequestBroker {
         this.routeSellerOperation = routeSellerOperation;
         this.routeOzonPromotionReport = routeOzonPromotionReport;
         this.routeAuthorization = routeAuthorization;
+        this.routeDiagnosticSnapshot = routeDiagnosticSnapshot;
         this.createRequestId = createRequestId;
         this.defaultTimeout = defaultTimeout;
         this.authorizationReleaseTimeout = authorizationReleaseTimeout;
@@ -88,6 +90,7 @@ export class RequestBroker {
 
     pendingRequests = new Map();
     pendingAuthorizations = new Map();
+    pendingDiagnosticSnapshots = new Map();
     pendingAuthorizationReleases = new Map();
     pendingSellerOperations = new Map();
     pendingOzonPromotionOperations = new Map();
@@ -99,6 +102,7 @@ export class RequestBroker {
     get activeRequestCount() {
         return (
             this.pendingRequests.size +
+            this.pendingDiagnosticSnapshots.size +
             this.pendingAuthorizations.size +
             this.pendingAuthorizationReleases.size +
             this.pendingSellerOperations.size +
@@ -109,6 +113,10 @@ export class RequestBroker {
 
     hasPendingAuthorization(requestId) {
         return this.pendingAuthorizations.has(requestId);
+    }
+
+    hasPendingDiagnosticSnapshot(requestId) {
+        return this.pendingDiagnosticSnapshots.has(requestId);
     }
 
     hasPendingAuthorizationRelease(requestId) {
@@ -129,10 +137,44 @@ export class RequestBroker {
 
     rejectPendingRequests(message) {
         this.#rejectAll(this.pendingRequests, message);
+        this.#rejectAll(this.pendingDiagnosticSnapshots, message);
         this.#rejectAll(this.pendingAuthorizationReleases, message);
         this.#rejectAllSellerOperations(message);
         this.#rejectAllOzonPromotionOperations(message);
         this.#rejectAllOzonReportPackages(message);
+    }
+
+    resolveDiagnosticSnapshot(requestId, snapshot) {
+        const pending = this.#take(this.pendingDiagnosticSnapshots, requestId);
+        if (!pending) return this.#reportUnsettled('diagnostic-snapshot-result', requestId);
+        pending.resolve(snapshot);
+        return true;
+    }
+
+    rejectDiagnosticSnapshot(requestId, error) {
+        const pending = this.#take(this.pendingDiagnosticSnapshots, requestId);
+        if (!pending) return this.#reportUnsettled('diagnostic-snapshot-error', requestId, error?.code);
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+        return true;
+    }
+
+    requestDiagnosticSnapshot(timeout = this.defaultTimeout) {
+        if (typeof this.routeDiagnosticSnapshot !== 'function') {
+            return Promise.reject(new ToolExecutionError('UNSUPPORTED_CAPABILITY', 'Extension diagnostics are unavailable.', 'extension', false));
+        }
+        return new Promise((resolve, reject) => {
+            const requestId = this.createRequestId();
+            const timer = setTimeout(() => {
+                const pending = this.#take(this.pendingDiagnosticSnapshots, requestId);
+                pending?.reject(new ToolExecutionError('EXTENSION_DIAGNOSTIC_TIMEOUT', 'The extension diagnostic snapshot timed out.', 'extension', true));
+            }, timeout);
+            this.pendingDiagnosticSnapshots.set(requestId, { resolve, reject, timer });
+            try { this.routeDiagnosticSnapshot({ requestId }); }
+            catch (error) {
+                const pending = this.#take(this.pendingDiagnosticSnapshots, requestId);
+                pending?.reject(error);
+            }
+        });
     }
 
     rejectPendingAuthorizations(message) {

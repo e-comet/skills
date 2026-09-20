@@ -3,7 +3,7 @@ import { SELLER_AUTHORIZATION_SCOPE_MAX_MS } from './config.mjs';
 import { ozonAnalyticsArtifactName, parseAnalyticsReports } from './ozon-analytics-domain.mjs';
 import { executeOzonReportPackage } from './ozon-report-package-job.mjs';
 import { StorageUnavailableError } from './storage-layout.mjs';
-import { ToolExecutionError } from './tool-errors.mjs';
+import { browserJobRejectionDetails, ToolExecutionError } from './tool-errors.mjs';
 import { OZON_ANALYTICS_TERMINAL_CODE_STAGES, isOzonAnalyticsTerminalDetails, isOzonExecutionInterruptionDetails } from './extension-vocabulary.mjs';
 
 const SIGNED_EXPIRY_SAFETY_RESERVE_MS = 1000;
@@ -26,7 +26,7 @@ export const safeOzonAnalyticsToolError = (error) => {
         // Local ToolExecutionError always owns an initially undefined details field.
         // Absence of evidence must not erase an otherwise known local failure.
         (error?.details !== undefined && !isOzonAnalyticsTerminalDetails(error?.code, error.details) &&
-            !isOzonExecutionInterruptionDetails(error?.code, error.details)) ||
+            !isOzonExecutionInterruptionDetails(error?.code, error.details) && !browserJobRejectionDetails(error)) ||
         stage === undefined ||
         error?.stage !== stage ||
         error?.retryable !== false ||
@@ -39,7 +39,8 @@ export const safeOzonAnalyticsToolError = (error) => {
     return { code: error.code, message: error.message, stage, retryable: false,
         ...(isOzonAnalyticsTerminalDetails(error.code, error.details) ? { details: { marketplaceErrorCode: error.details.marketplaceErrorCode } } : {}),
         ...(isOzonExecutionInterruptionDetails(error.code, error.details)
-            ? { details: { phase: error.details.phase, createOutcome: error.details.createOutcome } } : {}) };
+            ? { details: { phase: error.details.phase, createOutcome: error.details.createOutcome } } : {}),
+        ...(browserJobRejectionDetails(error) ? { details: browserJobRejectionDetails(error) } : {}) };
 };
 
 export const executeOzonAnalyticsJob = async ({

@@ -1,6 +1,6 @@
 {
   "name": "e-comet-skills",
-  "version": "2026.9.2",
+  "version": "2026.9.3",
   "description": "MCP tools for e-Comet seller analytics, live Wildberries data, and Ozon Seller promotion and analytics reports.",
   "author": {
     "name": "e-Comet",
@@ -11,6 +11,7 @@
   "license": "Apache-2.0",
   "keywords": ["mcp", "wildberries", "wb", "ozon", "seller", "e-comet"],
   "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
   "interface": {
     "displayName": "e-Comet MCP Tools",
     "shortDescription": "Seller analytics and live reports",

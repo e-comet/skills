@@ -67,6 +67,7 @@ export const createBridgeRuntime = ({
     let peerConnectPending = false;
     let listenerState = 'pending';
     let lastBridgeStartAttemptAtMs = null;
+    let listenerObservation = Object.freeze({ observedAt: new Date(connections.now()).toISOString() });
     // Which classifications the current degraded episode has already announced. A retry is never logged on its
     // own — a process that lives for days would write a line every 30 seconds — and a code that alternates
     // between attempts cannot re-announce either, because each one is only ever recorded once. The set is
@@ -342,6 +343,7 @@ export const createBridgeRuntime = ({
                 socket,
                 localMessage(state.helloId, MESSAGE_TYPES.hello, {
                     clientName: 'e-comet-local-bridge',
+                    browserJobRejectionVersion: 1,
                     clientVersion: BRIDGE_VERSION,
                     protocolVersion: EXTENSION_PROTOCOL_VERSION,
                     bridgeGeneration: BRIDGE_GENERATION,
@@ -505,6 +507,8 @@ export const createBridgeRuntime = ({
     // code follow the degraded-episode rules: announced once per episode, never once per retry.
     const onListenFailure = (error) => {
         listenerState = 'failed';
+        const systemCode = ['EACCES', 'EPERM', 'EADDRNOTAVAIL', 'EAFNOSUPPORT', 'EINVAL'].includes(error?.code) ? error.code : undefined;
+        listenerObservation = Object.freeze({ observedAt: new Date(connections.now()).toISOString(), ...(systemCode ? { systemCode } : {}) });
         process.exitCode = 1;
         connections.recordPeerRejection(PEER_REJECTION_CODES.listenFailed);
         if (!announcedDegradedCodes.has(PEER_REJECTION_CODES.listenFailed)) {
@@ -522,6 +526,7 @@ export const createBridgeRuntime = ({
     // accumulate one callback per attempt and fire them all together when the port finally frees.
     server.on('listening', () => {
         listenerState = 'listening';
+        listenerObservation = Object.freeze({ observedAt: new Date(connections.now()).toISOString() });
         bridgeStartPending = false;
         clearStaleExitVerdict();
         noteDegradedEpisodeEnded('primary');
@@ -697,6 +702,7 @@ export const createBridgeRuntime = ({
         bridgeStartPending = false;
         if (error.code === 'EADDRINUSE') {
             listenerState = 'address_in_use';
+            listenerObservation = Object.freeze({ observedAt: new Date(connections.now()).toISOString(), systemCode: 'EADDRINUSE' });
             if (connections.peerReconnectBackoffStep === 0) {
                 log(`local bridge already exists at ${host}:${port}; using it as the primary instance`);
             }
@@ -739,12 +745,13 @@ export const createBridgeRuntime = ({
 
     const status = () => {
         const peerRejection = connections.peerRejectionStatus();
-        return {
+        const publicStatus = /** @type {any} */ ({
             extensionConnected: connections.effectiveExtensionReady,
             browserJobSupported: connections.effectiveBrowserJobReady,
             bridgeRole: server.listening ? 'primary' : connections.peerReady ? 'secondary' : 'disconnected',
             bridgeTransitioning: handoff.transitioning,
             listenerState,
+            listenerObservation,
             browserContext: connections.effectiveBrowserContext,
             extensionLastConnectedAtMs: connections.effectiveExtensionLastConnectedAtMs,
             extensionLastDisconnectedAtMs: connections.effectiveExtensionLastDisconnectedAtMs,
@@ -765,7 +772,10 @@ export const createBridgeRuntime = ({
                 ? { peer: connections.authenticatedPrimaryMetadata }
                 : {}),
             ...(peerRejection === undefined ? {} : { peerRejection }),
-        };
+        });
+        const pairingObservation = peerTokenSource?.observation?.();
+        if (pairingObservation) publicStatus.pairingObservation = pairingObservation;
+        return publicStatus;
     };
     status.broadcast = broadcastPeerStatus;
 

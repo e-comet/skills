@@ -8,10 +8,12 @@ import { assertHookFields, loadHookSecret, verifyHookSignature } from './hook-si
 import { feedbackArtifactStorageUnavailable, loadVerifiedFeedbackArtifact, registerFeedbackArtifact, retireFeedbackArtifact } from './feedback-artifact-store.mjs';
 import { serializeFeedbackMetadata } from './feedback-metadata.mjs';
 import { foldFeedbackLineEndings, redactFeedbackText, renderFeedbackReport } from './feedback-report.mjs';
+import { extractFeedbackToolCalls } from './feedback-tool-calls.mjs';
 import { createFeedbackZip, feedbackZipEntryLayout, feedbackZipEntryNames, feedbackZipFramingBytes } from './feedback-zip.mjs';
 import { assertUploadDestination, putFeedbackArchive } from './feedback-upload.mjs';
 import { FeedbackPreparationError, feedbackSubmissionFailure } from './feedback-errors.mjs';
 import { feedbackDiagnostics, safeFeedbackProperty, withFeedbackOperation } from './feedback-diagnostics.mjs';
+import { diagnosticCheck } from './diagnostic-facts.mjs';
 import { isValidFeedbackCloudSubmitInput } from './feedback-host-adapter.mjs';
 
 const ARTIFACT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -135,8 +137,6 @@ export const readTrustedFeedbackTranscript = async (path, options = {}) => {
     }
 };
 
-const readTrustedTranscript = (path, options) => readTrustedFeedbackTranscript(path, options);
-
 /** @typedef {(input: { reportBytes: Buffer, metadataBytes: Buffer, transcriptBytes?: Buffer }, options: { maxBytes: number }) => Buffer | Promise<Buffer>} FeedbackZipCreator */
 
 /**
@@ -144,13 +144,13 @@ const readTrustedTranscript = (path, options) => readTrustedFeedbackTranscript(p
  * `dependencies` is an internal composition/test seam; production supplies only getBridgeStatus
  * and uses the validated built-in persistence, ZIP, claim, clock, and runtime metadata functions.
  * @param {{ kind?: string, summary?: string, details?: string, includeTranscript?: boolean, transcriptPath?: string, feedbackClaim?: string, feedbackSession?: string }} input
- * @param {{ getBridgeStatus?: () => unknown, registerArtifact?: typeof registerFeedbackArtifact, readTranscript?: (path: string, options: { maxBytes: number }) => Promise<Buffer>, verifySignature?: (request: { tool: string, sessionHash?: unknown, signature?: unknown, fields: Record<string, unknown> }) => unknown, createZip?: FeedbackZipCreator, now?: () => number, platform?: string, arch?: string, version?: string, maxBytes?: number }} dependencies
+ * @param {{ getBridgeStatus?: () => unknown, registerArtifact?: typeof registerFeedbackArtifact, readTranscript?: (path: string, options: { maxBytes: number }) => Promise<Buffer>, verifySignature?: (request: { tool: string, sessionHash?: unknown, signature?: unknown, fields: Record<string, unknown> }) => unknown, createZip?: FeedbackZipCreator, now?: () => number, platform?: string, arch?: string, version?: string, maxBytes?: number, route?: 'native' | 'cloud' }} dependencies
  */
 export const prepareECometFeedback = async (input = {}, dependencies = {}) => {
     const {
         getBridgeStatus,
         registerArtifact = registerFeedbackArtifact,
-        readTranscript = readTrustedTranscript,
+        readTranscript = readTrustedFeedbackTranscript,
         verifySignature = verifyHookFields,
         createZip = createFeedbackZip,
         now = Date.now,
@@ -158,6 +158,8 @@ export const prepareECometFeedback = async (input = {}, dependencies = {}) => {
         arch = process.arch,
         version = BRIDGE_VERSION,
         maxBytes = FEEDBACK_MAX_BYTES,
+        // Where this archive is prepared: the native dispatcher on the device, or the Cowork cloud hook.
+        route = 'native',
     } = dependencies;
     if (typeof getBridgeStatus !== 'function' || typeof registerArtifact !== 'function' || typeof readTranscript !== 'function' || typeof verifySignature !== 'function' || typeof createZip !== 'function' || typeof now !== 'function' || !Number.isSafeInteger(maxBytes) || maxBytes < 1) {
         throw new TypeError('Feedback preparation dependencies are invalid');
@@ -177,13 +179,42 @@ export const prepareECometFeedback = async (input = {}, dependencies = {}) => {
     let diagnostics = {};
     try {
         diagnostics = await getBridgeStatus();
-    } catch {
+    } catch (error) {
         // Diagnostics are optional; reporting must remain possible during bridge failures.
+        const code = safeFeedbackProperty(error, 'code');
+        diagnostics = { bridgeStatusCollection: diagnosticCheck({ check: 'bridge_status_collection', state: 'failed',
+            observedAt: new Date(now()).toISOString(), source: 'feedback_preparation', executionPlane: 'device',
+            cause: ['EACCES', 'EPERM'].includes(code) ? 'permission_denied' : 'unknown' }) };
     }
     const atOperation = (operation, action) => {
         try { return action(); } catch (error) { throw withFeedbackOperation(error, operation); }
     };
-    const reportBytes = atOperation('report_render', () => renderFeedbackReport({ kind, summary, details, diagnostics, includeTranscript }));
+    // Validate the authored report before transcript I/O. Reuse this report if no calls
+    // are available, including hosts that cannot provide a path when history is declined.
+    let reportBytes = atOperation('report_render', () => renderFeedbackReport({ kind, summary, details, diagnostics, includeTranscript, route, toolCalls: [] }));
+    let snapshot;
+    if (transcriptPath !== undefined || includeTranscript === true) {
+        let toolCalls;
+        let toolCallsTruncated;
+        try {
+            // One bounded read serves both the diagnostic tool names and the optional raw history.
+            // The shared package budget is the most any archive can carry, so a host session larger
+            // than it yields its newest complete records instead of loading and decoding a snapshot
+            // that no archive could hold. Extraction stays inside this boundary: every failure on
+            // the transcript path, including decoding, belongs to the transcript category.
+            const selected = await readTranscript(transcriptPath, { maxBytes: FEEDBACK_MAX_BYTES });
+            if (!Buffer.isBuffer(selected)) throw transcriptUnavailable();
+            snapshot = completeJsonlTail(selected, FEEDBACK_MAX_BYTES);
+            toolCallsTruncated = truncatedTranscripts.has(snapshot);
+            toolCalls = extractFeedbackToolCalls(snapshot);
+        } catch (error) {
+            throw transcriptUnavailable(error);
+        }
+        // The per-archive budget applies only afterwards, when raw history is selected.
+        if (toolCalls.length > 0 || toolCallsTruncated) {
+            reportBytes = atOperation('report_render', () => renderFeedbackReport({ kind, summary, details, diagnostics, includeTranscript, route, toolCalls, toolCallsTruncated }));
+        }
+    }
     const createdAt = atOperation('metadata_encode', () => new Date(now()).toISOString());
     const transcriptIncluded = includeTranscript === true;
     let transcriptTruncated = false;
@@ -196,14 +227,8 @@ export const prepareECometFeedback = async (input = {}, dependencies = {}) => {
     if (transcriptIncluded) {
         const provisionalMetadataBytes = serializeMetadata(0);
         const remaining = Math.max(0, maxBytes - framingBytes - reportBytes.length - provisionalMetadataBytes.length);
-        try {
-            const selected = await readTranscript(transcriptPath, { maxBytes: remaining });
-            if (!Buffer.isBuffer(selected)) throw transcriptUnavailable();
-            transcriptBytes = completeJsonlTail(selected, remaining);
-            transcriptTruncated = truncatedTranscripts.has(transcriptBytes);
-        } catch (error) {
-            throw transcriptUnavailable(error);
-        }
+        transcriptBytes = completeJsonlTail(snapshot, remaining);
+        transcriptTruncated = truncatedTranscripts.has(transcriptBytes);
     }
     const fitSourceBudget = () => {
         for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -351,7 +376,9 @@ const submitFeedback = async (input = {}, dependencies = {}) => {
     }
     // Retirement/tombstone reconciliation is private maintenance. Storage acceptance is the only public outcome.
     await retireArtifact({ artifactId }).catch(() => undefined);
-    return { ok: true, status: 'uploaded', artifactId, transcriptIncluded: artifact.transcriptIncluded };
+    // The object key the accepted upload wrote is the one identifier both the seller and support can name.
+    // It is published only here, after acceptance: an unaccepted grant names an object that does not exist.
+    return { ok: true, status: 'uploaded', artifactId, transcriptIncluded: artifact.transcriptIncluded, reportId: input.objectKey };
 };
 
 /** @type {typeof submitFeedback} */
@@ -440,7 +467,7 @@ const submitCloudFeedback = async (input = {}, dependencies = {}) => {
     } catch (error) {
         return uploadFailure(artifactId, safeFeedbackProperty(error, 'code'), error);
     }
-    return { ok: true, status: 'uploaded', artifactId, transcriptIncluded: input.feedbackCloud.transcriptIncluded };
+    return { ok: true, status: 'uploaded', artifactId, transcriptIncluded: input.feedbackCloud.transcriptIncluded, reportId: input.objectKey };
 };
 
 /** @type {typeof submitCloudFeedback} */

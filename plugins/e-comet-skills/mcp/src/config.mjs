@@ -42,9 +42,9 @@ export const CONTROL_PROTOCOL_VERSION = 1;
 export const EXTENSION_PROTOCOL_VERSION = 4;
 export const SUPPORTED_MCP_PROTOCOL_VERSIONS = ['2025-06-18'];
 export const LATEST_MCP_PROTOCOL_VERSION = SUPPORTED_MCP_PROTOCOL_VERSIONS[0];
-// 5: a build that can proxy indexed Ozon report packages must replace an already-running generation-4 primary;
-// otherwise the capable secondary remains behind a primary that cannot advertise or route the package operation.
-const DEFAULT_BRIDGE_GENERATION = 5;
+// 6: diagnostic forwarding and reviewed rejection evidence require replacing an older primary that cannot
+// negotiate those frames. Existing drain-and-takeover semantics preserve already admitted business work.
+const DEFAULT_BRIDGE_GENERATION = 6;
 export const resolveBridgeGeneration = ({ env = process.env } = {}) => {
     const mode = env.NODE_ENV;
     if (mode !== 'test' && mode !== 'development') return DEFAULT_BRIDGE_GENERATION;
@@ -198,6 +198,12 @@ export const FEEDBACK_MAX_BYTES = 32 * 1024 * 1024;
 // Cowork cloud route: the archive travels inside the bridged call input, so it is bounded by the
 // measured device-bridge capacity, not by the native 32 MiB budget.
 export const FEEDBACK_CLOUD_MAX_BYTES = 256 * 1024;
+// Every probe that gathers evidence while a report is prepared is abandoned after this long: the
+// extension's read-only snapshot, the installation reads, the browser-profile scan and the Codex hook
+// inspector, which needs up to five seconds for a cold start. Preparation is independent of extension
+// readiness by contract, so a stalled route may cost seconds, never the 45-second business deadline,
+// and a report is never lost to the evidence gathered for it.
+export const FEEDBACK_EVIDENCE_TIMEOUT_MS = 5000;
 // Only e-Comet's own storage may receive a device-side cloud upload; the device cannot verify hook provenance.
 export const FEEDBACK_CLOUD_UPLOAD_DESTINATIONS = Object.freeze([
     Object.freeze({ hostname: 'storage.yandexcloud.net', pathPrefix: '/e-comet-mcp-feedback/' }),

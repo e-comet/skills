@@ -10,9 +10,10 @@ import { MAX_MCP_MESSAGE_BYTES, FEEDBACK_MAX_BYTES as MAX_FEEDBACK_ARCHIVE_BYTES
 import { sweepExpired } from '../mcp/src/file-retention.mjs';
 import { loadHookSecret, signHookFields } from '../mcp/src/hook-signature.mjs';
 import { foldFeedbackLineEndings, redactFeedbackText } from '../mcp/src/feedback-report.mjs';
-import { toolInputSchemas, validateSchemaValue } from '../mcp/src/tool-schemas.mjs';
+import { isPublishableObjectKey, toolInputSchemas, toolOutputSchemas, validateSchemaValue } from '../mcp/src/tool-schemas.mjs';
 import { FEEDBACK_DIAGNOSTIC_FILESYSTEM_CODES, feedbackDiagnostics, safeFeedbackProperty, withFeedbackOperation } from '../mcp/src/feedback-diagnostics.mjs';
 import { retryTransientFileOperation } from './transient-file-operation.mjs';
+import { withHookDiagnostic } from './hook-diagnostics.mjs';
 
 // PostToolUse can carry one maximum-size MCP request and response. Reserve another 256 KiB for the
 // host's session/tool metadata and platform paths while keeping malformed stdin decisively bounded.
@@ -32,7 +33,6 @@ const FEEDBACK_KINDS = new Set(['bug', 'wrong_data', 'missing_capability', 'uncl
 const SUBMIT_TARGET_TOOL = 'submit_e_comet_feedback';
 const COWORK_UUID_NAMESPACE = '2da262fd-fd1f-4636-90cb-75b02fd1f1f1';
 const MAX_UPLOAD_URL_BYTES = 8 * 1024;
-const MAX_OBJECT_KEY_BYTES = 1024;
 const MAX_REQUIRED_HEADERS = 32;
 const MAX_HEADER_NAME_BYTES = 128;
 const MAX_HEADER_VALUE_BYTES = 8 * 1024;
@@ -48,11 +48,12 @@ const MIN_STAGE_GRANT_REMAINING_MS = GRANT_START_WINDOW_MS + GRANT_HANDOFF_RESER
 const MIN_CLAIM_GRANT_REMAINING_MS = GRANT_START_WINDOW_MS;
 const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const HEADER_VALUE_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
-const OBJECT_KEY_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const ISO_EXPIRY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|([+-])(\d{2}):(\d{2}))$/;
 const PROTOTYPE_SPECIAL_HEADER_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
 const LOCAL_FEEDBACK_TOOL =
     /^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:prepare_e_comet_feedback|submit_e_comet_feedback)$/;
+const CLOUD_FEEDBACK_TOOL =
+    /^mcp__remote-devices__plugin_e-comet-skills_e-comet-local__(?:prepare_e_comet_feedback|submit_e_comet_feedback)$/;
 const REMOTE_REPORT_ISSUE_TOOL = new RegExp(
     `^mcp__(?:e[-_]comet|e_comet_stage|https_mcp_(?:stage_int_)?e[-_]comet_io_mcp|plugin_e-comet-skills_e-comet|remote-devices__plugin_e-comet-skills_e-comet|${COWORK_UUID_NAMESPACE})__report_issue$`
 );
@@ -307,10 +308,7 @@ const validateUploadGrant = (grant, { nowMs, expectedSize, allowExpired = false 
         typeof grant.uploadUrl !== 'string' ||
         byteLength(grant.uploadUrl) < 1 ||
         byteLength(grant.uploadUrl) > MAX_UPLOAD_URL_BYTES ||
-        typeof grant.objectKey !== 'string' ||
-        byteLength(grant.objectKey) < 1 ||
-        byteLength(grant.objectKey) > MAX_OBJECT_KEY_BYTES ||
-        OBJECT_KEY_CONTROL_CHARACTERS.test(grant.objectKey) ||
+        !isPublishableObjectKey(grant.objectKey) ||
         !isRecord(grant.requiredHeaders) ||
         !Number.isSafeInteger(grant.expiresAt) ||
         grant.expiresAt < 1 ||
@@ -438,6 +436,10 @@ const PREPARED_RESULT_KEYS = [
 const GRANT_RESULT_KEYS = ['expires_at', 'object_key', 'required_headers', 'upload_url'];
 const exactKeys = (candidate, keys) =>
     Object.keys(candidate).sort().join('\0') === [...keys].sort().join('\0');
+const exactKeysWithOptionalOperationDiagnostic = (candidate, keys) => {
+    const names = Object.keys(candidate).filter((name) => name !== 'operationDiagnostic');
+    return names.sort().join('\0') === [...keys].sort().join('\0');
+};
 
 const parseWholeBoundedJson = (text, invalid) => {
     if (typeof text !== 'string' || byteLength(text) > MAX_TOOL_RESULT_JSON_BYTES) throw invalid();
@@ -472,7 +474,8 @@ const invalidPrepared = () =>
 const validatePreparedResult = (candidate) => {
     if (
         !isRecord(candidate) ||
-        !exactKeys(candidate, PREPARED_RESULT_KEYS) ||
+        !exactKeysWithOptionalOperationDiagnostic(candidate, PREPARED_RESULT_KEYS) ||
+        !validateSchemaValue(candidate, toolOutputSchemas.prepare_e_comet_feedback) ||
         candidate.ok !== true ||
         candidate.status !== 'prepared' ||
         typeof candidate.summary !== 'string' ||
@@ -868,6 +871,8 @@ const transcriptPathFromEvent = (event) => {
             'The trusted feedback transcript is unavailable.'
         );
     }
+    // Codex may explicitly report that its transcript path is unavailable.
+    if (candidates[0] === null) return undefined;
     return validateTranscriptPath(candidates[0]);
 };
 
@@ -957,15 +962,14 @@ export const prepareInputWithTrustedTranscript = (event) => {
     if (!validateSchemaValue(toolInput, toolInputSchemas.prepare_e_comet_feedback)) {
         throw new FeedbackHandoffError('FEEDBACK_INVALID_INPUT', 'The feedback preparation arguments are invalid.');
     }
-    if (!toolInput.includeTranscript) return { ...toolInput };
     const transcriptPath = transcriptPathFromEvent(event);
-    if (transcriptPath === undefined) {
+    if (transcriptPath === undefined && toolInput.includeTranscript) {
         throw new FeedbackHandoffError(
             'FEEDBACK_TRANSCRIPT_UNAVAILABLE',
             'The trusted feedback transcript is unavailable.'
         );
     }
-    return { ...toolInput, transcriptPath };
+    return { ...toolInput, ...(transcriptPath === undefined ? {} : { transcriptPath }) };
 };
 
 // Hooks receive arguments, not the host's JSON-RPC id/_meta. Leave bounded headroom
@@ -1039,7 +1043,7 @@ const loadSigningSecret = async (env) => {
     }
 };
 
-export const processHookEvent = async (event, _options = {}) => {
+const processHookEventAuthoritative = async (event, _options = {}) => {
     if (!isRecord(event)) {
         const error = new FeedbackHandoffError('FEEDBACK_INVALID_EVENT', 'The desktop hook event is invalid.');
         return { exitCode: 2, stdout: '', stderr: `${error.code}: ${error.message}` };
@@ -1051,7 +1055,7 @@ export const processHookEvent = async (event, _options = {}) => {
     // model-authored adapter fields never select cloud execution.
     // Native matchers tolerate historical spelling aliases; that does not attest an
     // underscore-spelled cloud consumer. Broaden this boundary only with host evidence.
-    if (/^mcp__remote-devices__plugin_e-comet-skills_e-comet-local__(?:prepare_e_comet_feedback|submit_e_comet_feedback)$/.test(toolName)
+    if (CLOUD_FEEDBACK_TOOL.test(toolName)
         && (['PreToolUse', 'PostToolUse'].includes(eventName)
             || (eventName === 'PostToolUseFailure' && toolName.endsWith('__prepare_e_comet_feedback')))) {
         try {
@@ -1234,6 +1238,64 @@ export const processHookEvent = async (event, _options = {}) => {
     }
 
     return { exitCode: 0, stdout: '', stderr: '' };
+};
+
+const feedbackDiagnosticOutcome = (result, eventName) => {
+    if (eventName === 'PostToolUseFailure') return 'failed';
+    try {
+        const output = JSON.parse(result.stdout).hookSpecificOutput;
+        if (output.permissionDecision === 'deny') return 'denied';
+        const replaced = output.updatedToolOutput?.[0]?.text;
+        if (typeof replaced === 'string') {
+            const status = JSON.parse(replaced).status;
+            if (status === 'uncertain') return 'uncertain';
+            if (['failed', 'not_started', 'grant_not_staged'].includes(status)) return 'failed';
+        }
+    } catch { /* Empty successful native Post output is expected. */ }
+    return 'succeeded';
+};
+
+export const processHookEvent = async (event, options = {}) => {
+    const result = await processHookEventAuthoritative(event, options);
+    const eventName = event?.hook_event_name ?? event?.hookEventName;
+    const toolName = event?.tool_name ?? event?.toolName;
+    let cloud = CLOUD_FEEDBACK_TOOL.test(toolName);
+    const target = typeof toolName === 'string' ? toolName.slice(toolName.lastIndexOf('__') + 2) : '';
+    const family = target === 'prepare_e_comet_feedback' ? 'feedback_prepare'
+        : target === 'submit_e_comet_feedback' ? 'feedback_submit'
+            : REMOTE_REPORT_ISSUE_TOOL.test(toolName) ? 'feedback_authorization' : undefined;
+    const routedLocal = cloud || LOCAL_FEEDBACK_TOOL.test(toolName);
+    const routedRemote = eventName === 'PostToolUse' && REMOTE_REPORT_ISSUE_TOOL.test(toolName);
+    if (!family || result.exitCode !== 0 || (!routedRemote && !routedLocal)
+        || !['PreToolUse', 'PostToolUse', 'PostToolUseFailure'].includes(eventName)) return result;
+    if (eventName === 'PostToolUse' && family === 'feedback_prepare'
+        && isRecord(toolResponseFromEvent(event)) && toolResponseFromEvent(event).isError === true) return result;
+    if (eventName === 'PostToolUse' && family === 'feedback_authorization'
+        && isRecord(toolResponseFromEvent(event)) && toolResponseFromEvent(event).isError === true) return result;
+    let decision;
+    let updatedToolOutput = false;
+    if (result.stdout) {
+        try {
+            const output = JSON.parse(result.stdout).hookSpecificOutput;
+            decision = output?.permissionDecision;
+            updatedToolOutput = output?.updatedToolOutput !== undefined;
+            if (family === 'feedback_authorization' && updatedToolOutput) cloud = true;
+        } catch { return result; }
+    }
+    if (eventName === 'PreToolUse' && decision !== 'deny') {
+        try {
+            if (JSON.parse(result.stdout).hookSpecificOutput?.updatedInput === undefined) return result;
+        } catch { return result; }
+    }
+    return withHookDiagnostic(result, () => ({
+        event: eventName, toolFamily: family,
+        handler: cloud && family !== 'feedback_authorization' ? 'feedback_cloud' : 'feedback_handoff',
+        stage: eventName === 'PreToolUse' ? decision === 'deny' ? 'call_denied' : 'input_rewritten'
+            : updatedToolOutput ? 'result_replaced' : family === 'feedback_authorization' ? 'handoff_staged' : 'result_observed',
+        outcome: feedbackDiagnosticOutcome(result, eventName),
+        observedAt: new Date(options.nowMs ?? options.cloud?.now?.() ?? Date.now()).toISOString(),
+        executionPlane: cloud ? 'cloud' : 'native',
+    }));
 };
 
 const readStdin = async () => {

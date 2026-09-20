@@ -3,8 +3,8 @@ import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/pr
 import { join, resolve } from 'node:path';
 import { MAX_MCP_MESSAGE_BYTES, FEEDBACK_ARTIFACT_RETENTION_MS, FEEDBACK_MAX_BYTES } from '../mcp/src/config.mjs';
 import { sweepExpired } from '../mcp/src/file-retention.mjs';
-import { toolOutputSchemas, validateSchemaValue } from '../mcp/src/tool-schemas.mjs';
-import { feedbackHostAdapterMarkerSchema } from '../mcp/src/feedback-host-adapter.mjs';
+import { isPublishableObjectKey, toolOutputSchemas, validateSchemaValue } from '../mcp/src/tool-schemas.mjs';
+import { FEEDBACK_HOST_ADAPTER_VERSION, feedbackHostAdapterMarkerSchema } from '../mcp/src/feedback-host-adapter.mjs';
 
 const METADATA_BYTES = 64 * 1024;
 const MAX_OPERATION_BYTES = MAX_MCP_MESSAGE_BYTES + METADATA_BYTES;
@@ -36,7 +36,9 @@ const validOperationTransport = transport => record(transport)
     && TRANSPORT_FIELDS.every(key => Object.hasOwn(transport, key))
     && typeof transport.uploadUrl === 'string' && transport.uploadUrl.length > 0
     && record(transport.requiredHeaders)
-    && typeof transport.objectKey === 'string' && transport.objectKey.length > 0
+    // The device publishes this key to the seller, so a re-emitted transport must clear the same bound the
+    // grant cleared when it was claimed.
+    && isPublishableObjectKey(transport.objectKey)
     && Number.isSafeInteger(transport.expiresAt) && transport.expiresAt > 0
     && Number.isSafeInteger(transport.expectedSize) && transport.expectedSize > 0 && transport.expectedSize <= FEEDBACK_MAX_BYTES
     && typeof transport.expectedSha256 === 'string' && HASH.test(transport.expectedSha256)
@@ -178,7 +180,7 @@ export class CloudFeedbackStore {
             version: 1,
             state: 'pending',
             binding,
-            marker: { version: 1, operationId: randomUUID(), nonce: randomBytes(32).toString('base64url') },
+            marker: { version: FEEDBACK_HOST_ADAPTER_VERSION, operationId: randomUUID(), nonce: randomBytes(32).toString('base64url') },
             input,
             originalInputHash,
             createdAtMs: this.now(),

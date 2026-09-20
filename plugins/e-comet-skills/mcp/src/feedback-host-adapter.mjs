@@ -1,12 +1,16 @@
 import { FEEDBACK_CLOUD_MAX_BYTES } from './config.mjs';
+import { isValidFeedbackDeviceSnapshot } from './feedback-device-diagnostics.mjs';
 
-export const FEEDBACK_HOST_ADAPTER_VERSION = 1;
+// 3: the device projection carries client name and version, takeover and timing fields, and the
+// preparation-time evidence checks; an older cloud half fails closed until both halves are updated.
+export const FEEDBACK_HOST_ADAPTER_VERSION = 3;
 export const FEEDBACK_CLOUD_TRANSPORT_VERSION = 1;
 export const FEEDBACK_CLOUD_ARCHIVE_BASE64_MAX_LENGTH = Math.ceil(FEEDBACK_CLOUD_MAX_BYTES / 3) * 4;
 
 const UUID_V4_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
 const NONCE_RE = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
 const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 export const feedbackHostAdapterMarkerSchema = {
     type: 'object',
@@ -79,7 +83,7 @@ const messages = {
     prepare_e_comet_feedback: 'The host feedback preparation result is unavailable. Do not authorize or submit feedback from this result.',
 };
 
-export const feedbackHostResultUnavailable = (targetTool, marker) => ({
+export const feedbackHostResultUnavailable = (targetTool, marker, bridgeStatus) => ({
     ok: false,
     status: 'host_result_unavailable',
     adapter: {
@@ -88,6 +92,7 @@ export const feedbackHostResultUnavailable = (targetTool, marker) => ({
         nonce: marker.nonce,
         targetTool,
     },
+    bridgeStatus,
     error: {
         code: 'FEEDBACK_HOST_RESULT_UNAVAILABLE',
         message: messages[targetTool],
@@ -95,3 +100,14 @@ export const feedbackHostResultUnavailable = (targetTool, marker) => ({
         retryable: false,
     },
 });
+
+export const isValidFeedbackHostAdapterResult = (targetTool, marker, value) => {
+    if (!messages[targetTool] || !record(marker) || marker.version !== FEEDBACK_HOST_ADAPTER_VERSION) return false;
+    if (!record(value) || Object.keys(value).length !== 5 || value.ok !== false || value.status !== 'host_result_unavailable') return false;
+    if (!record(value.adapter) || Object.keys(value.adapter).length !== 4 || value.adapter.version !== FEEDBACK_HOST_ADAPTER_VERSION
+        || value.adapter.operationId !== marker.operationId || value.adapter.nonce !== marker.nonce || value.adapter.targetTool !== targetTool) return false;
+    if (!isValidFeedbackDeviceSnapshot(value.bridgeStatus)) return false;
+    if (!record(value.error) || Object.keys(value.error).length !== 4) return false;
+    return value.error.code === 'FEEDBACK_HOST_RESULT_UNAVAILABLE' && value.error.message === messages[targetTool]
+        && value.error.stage === 'handoff' && value.error.retryable === false;
+};

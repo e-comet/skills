@@ -1,3 +1,5 @@
+import { diagnosticCheck } from './diagnostic-facts.mjs';
+
 const iso = (value) => {
     if (!Number.isFinite(value) || Math.abs(value) > 8.64e15) return undefined;
     try {
@@ -40,6 +42,9 @@ export const deriveBridgeDiagnostics = (raw) => {
 
     const lastConnectedAt = iso(raw.extensionLastConnectedAtMs);
     const lastDisconnectedAt = iso(raw.extensionLastDisconnectedAtMs);
+    const observedAt = raw.observedAt ?? new Date().toISOString();
+    const listenerPassed = raw.bridgeRole === 'primary' || (raw.bridgeRole === 'secondary' && raw.listenerState === 'address_in_use');
+    const pairing = raw.pairingObservation;
     return {
         state,
         extension: {
@@ -60,5 +65,18 @@ export const deriveBridgeDiagnostics = (raw) => {
         },
         ...(raw.peer ? { peer: raw.peer } : {}),
         browserContext: raw.browserContext ?? { state: 'unknown' },
+        diagnostics: {
+            snapshot: diagnosticCheck({ check: 'snapshot', state: 'passed', observedAt, source: 'local_bridge_status', executionPlane: 'device' }),
+            listener: diagnosticCheck({ check: 'listener', state: listenerPassed ? 'passed' : raw.listenerState === 'failed' ? 'failed' : 'unknown', observedAt: raw.listenerObservation?.observedAt ?? observedAt,
+                source: 'bridge_runtime', executionPlane: 'device', facts: { operation: 'bind_listener', listenerState: raw.listenerState,
+                    ...(raw.listenerObservation?.systemCode ? { systemCode: raw.listenerObservation.systemCode } : {}) },
+                ...(raw.listenerState === 'address_in_use' && !listenerPassed ? { cause: 'address_in_use' } : {}),
+                ...(raw.listenerState === 'failed' ? { cause: 'listen_failed' } : {}) }),
+            pairingSource: diagnosticCheck({ check: 'pairing_source', state: pairing ? (pairing.state === 'passed' ? 'passed' : 'failed') : 'not_checked', observedAt: pairing?.observedAt ?? observedAt,
+                source: 'peer_token_source', executionPlane: 'device', ...(pairing?.reason ? { cause: pairing.reason } : {}) }),
+            routeFreshness: diagnosticCheck({ check: 'route_freshness', state: Number.isFinite(raw.routeLastObservedAtMs) ? 'passed' : 'unknown', observedAt,
+                source: 'extension_heartbeat', executionPlane: raw.bridgeRole === 'secondary' ? 'peer' : 'device',
+                ...(Number.isFinite(raw.routeLastObservedAtMs) ? { facts: { lastObservedAt: iso(raw.routeLastObservedAtMs) } } : { cause: 'unknown', nextCheck: 'observe_extension_heartbeat' }) }),
+        },
     };
 };

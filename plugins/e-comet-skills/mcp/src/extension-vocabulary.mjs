@@ -9,6 +9,7 @@ export const MESSAGE_TYPES = Object.freeze({
     wbFetch: 'wb_fetch',
     browserJobAuthorize: 'browser_job_authorize',
     browserJobAuthorizationRelease: 'browser_job_authorization_release',
+    diagnosticSnapshot: 'diagnostic_snapshot',
     ozonPromotionOperation: 'ozon_seller_promotion_report_operation',
     ozonPromotionPackageOperation: 'ozon_seller_promotion_reports_operation',
     ozonPromotionStreamAck: 'ozon_seller_promotion_report_stream_ack',
@@ -22,6 +23,7 @@ export const MESSAGE_TYPES = Object.freeze({
     wbFetchStreamEnd: 'wb_fetch_stream_end',
     browserJobAuthorizeResult: 'browser_job_authorize_result',
     browserJobAuthorizationReleaseResult: 'browser_job_authorization_release_result',
+    diagnosticSnapshotResult: 'diagnostic_snapshot_result',
     ozonReportPhase: 'ozon_seller_report_phase',
     ozonPromotionStreamStart: 'ozon_seller_promotion_report_stream_start',
     ozonPromotionStreamChunk: 'ozon_seller_promotion_report_stream_chunk',
@@ -39,7 +41,8 @@ export const MESSAGE_TYPES = Object.freeze({
 
 export const localMessage = (id, type, payload) => ({ id, type, payload });
 
-export const PEER_CAPABILITIES = Object.freeze({ browserContextPropagation: 'browser_context_propagation' });
+export const PEER_CAPABILITIES = Object.freeze({ browserContextPropagation: 'browser_context_propagation', diagnosticForwarding: 'diagnostic_snapshot_forwarding_v1', browserJobRejection: 'browser_job_rejection_v1' });
+export const DIAGNOSTIC_SNAPSHOT_CAPABILITY = 'diagnostic_snapshot_v1';
 
 export const peerStatusMessage = ({
     connections,
@@ -58,7 +61,8 @@ export const peerStatusMessage = ({
     bridgeGeneration,
     bridgeVersion,
     instanceId: handoff.instanceId,
-    capabilities: [PEER_CAPABILITIES.browserContextPropagation],
+    capabilities: [PEER_CAPABILITIES.browserContextPropagation, PEER_CAPABILITIES.diagnosticForwarding],
+    ...(connections.extensionDiagnosticSnapshotReady === undefined ? {} : { diagnosticSnapshotSupported: connections.extensionDiagnosticSnapshotReady === true }),
     browserContext: connections.browserContext,
     ...(connections.extensionOzonPromotionReady === undefined
         ? {}
@@ -82,6 +86,7 @@ export const peerStatusMessage = ({
 export const CLIENT_TO_EXTENSION_MESSAGE_TYPES = Object.freeze([
     MESSAGE_TYPES.browserJobAuthorize,
     MESSAGE_TYPES.browserJobAuthorizationRelease,
+    MESSAGE_TYPES.diagnosticSnapshot,
     MESSAGE_TYPES.hello,
     MESSAGE_TYPES.ping,
     // Ответ на heartbeat расширения. Отсутствие pong в этом списке означало, что
@@ -93,6 +98,7 @@ export const CLIENT_TO_EXTENSION_MESSAGE_TYPES = Object.freeze([
 export const EXTENSION_TO_CLIENT_MESSAGE_TYPES = Object.freeze([
     MESSAGE_TYPES.browserJobAuthorizeResult,
     MESSAGE_TYPES.browserJobAuthorizationReleaseResult,
+    MESSAGE_TYPES.diagnosticSnapshotResult,
     MESSAGE_TYPES.error,
     MESSAGE_TYPES.helloAck,
     MESSAGE_TYPES.ping,
@@ -152,7 +158,7 @@ export const OZON_ANALYTICS_TERMINAL_CODE_STAGES = Object.freeze({
     OPERATION_CANCELLED: 'cancelled',
     OPERATION_DEADLINE_EXCEEDED: 'deadline',
 });
-export const EXTENSION_CAPABILITIES = Object.freeze(['wb_fetch', 'browser_job', 'seller_reviews']);
+export const EXTENSION_CAPABILITIES = Object.freeze(['wb_fetch', 'browser_job', 'seller_reviews', DIAGNOSTIC_SNAPSHOT_CAPABILITY]);
 
 // Стадия операции продавца внутри payload'а `wb_fetch`. Расширение решает по ней,
 // какой admission применить, поэтому набор объявлен enum'ом SellerOperationStage в

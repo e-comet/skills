@@ -5,7 +5,7 @@ import { prepareECometFeedback } from '../mcp/src/feedback-tools.mjs';
 import { registerFeedbackArtifact, loadVerifiedFeedbackArtifact, retireFeedbackArtifact } from '../mcp/src/feedback-artifact-store.mjs';
 import { feedbackPreparationFailure } from '../mcp/src/feedback-errors.mjs';
 import { feedbackDiagnostics } from '../mcp/src/feedback-diagnostics.mjs';
-import { FEEDBACK_HOST_ADAPTER_VERSION, FEEDBACK_CLOUD_TRANSPORT_VERSION, feedbackHostResultUnavailable, isValidFeedbackHostAdapterInput, isValidFeedbackCloudSubmitInput } from '../mcp/src/feedback-host-adapter.mjs';
+import { FEEDBACK_HOST_ADAPTER_VERSION, FEEDBACK_CLOUD_TRANSPORT_VERSION, isValidFeedbackHostAdapterResult, isValidFeedbackHostAdapterInput, isValidFeedbackCloudSubmitInput } from '../mcp/src/feedback-host-adapter.mjs';
 import { FEEDBACK_MESSAGE_MAX_LENGTH, toolInputSchemas, toolOutputSchemas, validateSchemaValue } from '../mcp/src/tool-schemas.mjs';
 import { claimUploadGrant, discardUploadGrant, stagePreparedArtifact, prepareInputWithTrustedTranscript, fitPrepareWireInput,
     cloudPostToolOutput as postOutput, FEEDBACK_ENVELOPE_RESERVE_BYTES } from './feedback-handoff.mjs';
@@ -19,7 +19,10 @@ const TERMINAL_UPLOAD_STATUSES = ['uploaded', 'rejected', 'uncertain'];
 // report.md framing, metadata.json and the ZIP directory share the cloud archive with the fitted
 // report, and a consented history tail takes what is left. The report is bounded by the archive the
 // device has to carry, not only by the host wire: an oversized report is shortened, never refused.
-const CLOUD_ARCHIVE_RESERVE_BYTES = 8192;
+// The reserve covers everything the archive holds besides the authored text: the report's own device
+// evidence (capped at 16 KiB by the projection), up to one hundred tool-call lines of at most a
+// timestamp, a 256-character name and a short outcome, metadata.json and the ZIP directory.
+const CLOUD_ARCHIVE_RESERVE_BYTES = 64 * 1024;
 const CLOUD_PREPARE_LIMIT_BYTES = FEEDBACK_CLOUD_MAX_BYTES - CLOUD_ARCHIVE_RESERVE_BYTES;
 // These fixed-width sizing placeholders never leave this process. The store
 // generates the actual random marker after the report has been fitted.
@@ -257,7 +260,7 @@ export const processCloudFeedbackEvent = async (event, options = {}) => {
         if (eventName === 'PostToolUseFailure') return prepareRefusalOutput(eventName);
         response = normalizeCloudResponse(hostValue(event, 'tool_response', 'toolResponse'), { allowError: true });
         if (response.status === 'failed' && validateSchemaValue(response, toolOutputSchemas.prepare_e_comet_feedback)) return prepareRefusalOutput(eventName);
-        if (!equal(response, feedbackHostResultUnavailable(target, marker))) throw invalid();
+        if (!isValidFeedbackHostAdapterResult(target, marker, response)) throw invalid();
     }
     const claim = await store.claimOperation(binding);
     if (claim.result) return postOutput(claim.result);
@@ -272,8 +275,8 @@ export const processCloudFeedbackEvent = async (event, options = {}) => {
         if (target === 'prepare_e_comet_feedback') {
             const effective = { ...op.input.authored, ...(op.input.transcriptPath ? { transcriptPath: op.input.transcriptPath } : {}) };
             result = await prepareECometFeedback({ ...effective, feedbackSession }, {
-                ...trusted, maxBytes: FEEDBACK_CLOUD_MAX_BYTES,
-                getBridgeStatus: () => ({ nativeBridgeDiagnostics: 'unavailable_in_cloud_hook' }),
+                ...trusted, maxBytes: FEEDBACK_CLOUD_MAX_BYTES, route: 'cloud',
+                getBridgeStatus: () => response.bridgeStatus,
                 registerArtifact: value => registerFeedbackArtifact(value, artifactOptions),
                 ...(options.cloud?.readTranscript ? { readTranscript: options.cloud.readTranscript } : {}),
             });

@@ -2,6 +2,7 @@ import { ARTIFACT_MAX_FILE_BYTES, EXTENSION_PROTOCOL_VERSION, MAX_BROWSER_JOB_TE
 import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
 import {
     AUTHORIZATION_FETCH_ERROR_CODES,
+    DIAGNOSTIC_SNAPSHOT_CAPABILITY,
     EXTENSION_TO_CLIENT_MESSAGE_TYPES,
     isSellerOperationStage,
     localMessage,
@@ -20,7 +21,7 @@ import {
 } from './extension-vocabulary.mjs';
 import { parseAnalyticsDateRange } from './ozon-analytics-domain.mjs';
 import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
-import { ToolExecutionError, safeExternalToolError, safeOzonPromotionToolError } from './tool-errors.mjs';
+import { ToolExecutionError, parseBrowserJobRejection, safeExternalToolError, safeOzonPromotionToolError } from './tool-errors.mjs';
 import { encodeFrame } from './websocket.mjs';
 
 const MAX_ID_LENGTH = 128;
@@ -32,6 +33,19 @@ const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const MAX_SAFE_MESSAGE_LENGTH = 500;
 
 const isRecord = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+export const isDiagnosticSnapshot = (payload) =>
+    isRecord(payload) &&
+    hasOnlyKeys(payload, ['protocolVersion', 'observedAt', 'extensionVersion', 'capabilities', 'activationIdentity', 'storageRead', 'ports']) &&
+    Object.keys(payload).length === 7 && payload.protocolVersion === 1 &&
+    typeof payload.observedAt === 'string' && payload.observedAt.length <= 64 &&
+    typeof payload.extensionVersion === 'string' && payload.extensionVersion.length <= 128 &&
+    Array.isArray(payload.capabilities) && payload.capabilities.every((item) => typeof item === 'string' && item.length <= 128) &&
+    isRecord(payload.activationIdentity) && Object.keys(payload.activationIdentity).length === 1 &&
+    ['present', 'absent', 'unknown'].includes(payload.activationIdentity.state) &&
+    isRecord(payload.storageRead) && Object.keys(payload.storageRead).length === 1 &&
+    ['passed', 'failed', 'unknown'].includes(payload.storageRead.state) &&
+    isRecord(payload.ports) && hasOnlyKeys(payload.ports, ['wb', 'wbSeller', 'ozon']) && Object.keys(payload.ports).length === 3 &&
+    ['wb', 'wbSeller', 'ozon'].every((key) => typeof payload.ports[key] === 'boolean' || payload.ports[key] === 'unknown');
 const isNonNegativeSafeInteger = (value) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const hasOnlyKeys = (value, keys) => Object.keys(value).every((key) => keys.includes(key));
 const isBoundedString = (value, maxLength) => typeof value === 'string' && value.length > 0 && value.length <= maxLength;
@@ -219,6 +233,10 @@ export const parseExtensionServerMessage = (value) => {
     }
 
     const { payload, type } = value;
+    if (type === MESSAGE_TYPES.browserJobAuthorizeResult && payload.browserJobRejection !== undefined && !parseBrowserJobRejection(payload.error?.code, payload.browserJobRejection)) {
+        return { ok: true, message: { ...value, payload: { ...payload, browserJobRejection: undefined } } };
+    }
+    if (type === MESSAGE_TYPES.diagnosticSnapshotResult && !isDiagnosticSnapshot(payload)) return { ok: false };
     if (type === MESSAGE_TYPES.ozonReportPhase && !isValidOzonReportPhase(payload)) return { ok: false };
     if (type === MESSAGE_TYPES.wbFetchStreamStart) {
         if (!isValidSellerStreamStart(payload)) return { ok: false };
@@ -285,7 +303,18 @@ export const createExtensionProtocol = ({
         }
 
         const parsed = parseExtensionServerMessage(message);
-        if (!parsed.ok) return;
+        if (!parsed.ok) {
+            // Коррелированный снимок неверной формы закрывает свой запрос сразу. Без этого он
+            // оседал молча, e_comet_diagnose ждал полный таймаут и сообщал причину «unknown»
+            // вместо наблюдаемого отказа по форме. Содержимое payload не логируем.
+            if (state.extensionHandshakeComplete && message?.type === MESSAGE_TYPES.diagnosticSnapshotResult &&
+                typeof message.id === 'string' && requestBroker.hasPendingDiagnosticSnapshot?.(message.id)) {
+                requestBroker.rejectDiagnosticSnapshot(message.id, new ToolExecutionError('EXTENSION_DIAGNOSTIC_INVALID',
+                    'The extension diagnostic snapshot did not match the negotiated diagnostic_snapshot_v1 shape.', 'extension', false));
+                log(`rejected malformed diagnostic snapshot result ${message.id}`);
+            }
+            return;
+        }
         message = parsed.message;
 
         const { payload, type } = message;
@@ -320,6 +349,8 @@ export const createExtensionProtocol = ({
                         Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_PROMOTION_PACKAGE_CAPABILITY),
                     ozonSellerAnalyticsReportSupported:
                         Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_ANALYTICS_CAPABILITY),
+                    diagnosticSnapshotSupported:
+                        Array.isArray(payload.capabilities) && payload.capabilities.includes(DIAGNOSTIC_SNAPSHOT_CAPABILITY),
                     version: payload.extensionVersion,
                 }
             );
@@ -367,7 +398,9 @@ export const createExtensionProtocol = ({
             );
             // Коллекцию выбираем по принадлежности: `a() || b()` всегда дёргал первую и
             // печатал ложный «поздний ответ» на каждый протокольный отказ авторизации.
-            const settled = requestBroker.hasPendingAuthorization(message.id)
+            const settled = requestBroker.hasPendingDiagnosticSnapshot?.(message.id)
+                ? requestBroker.rejectDiagnosticSnapshot(message.id, rejection)
+                : requestBroker.hasPendingAuthorization(message.id)
                 ? requestBroker.rejectAuthorization(message.id, rejection)
                 : requestBroker.hasPendingAuthorizationRelease(message.id)
                   ? requestBroker.rejectAuthorizationRelease(message.id, rejection)
@@ -384,10 +417,15 @@ export const createExtensionProtocol = ({
 
         if (type === MESSAGE_TYPES.browserJobAuthorizeResult) {
             if (payload.error) {
-                requestBroker.rejectAuthorization(message.id, safeExternalToolError(payload.error));
+                requestBroker.rejectAuthorization(message.id, safeExternalToolError({ ...payload.error, browserJobRejection: payload.browserJobRejection }));
             } else {
                 requestBroker.resolveAuthorization(message.id, payload.authorization);
             }
+            return;
+        }
+
+        if (type === MESSAGE_TYPES.diagnosticSnapshotResult) {
+            requestBroker.resolveDiagnosticSnapshot(message.id, payload);
             return;
         }
 

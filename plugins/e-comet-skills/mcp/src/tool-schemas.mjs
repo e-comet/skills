@@ -12,6 +12,7 @@ import {
 } from './config.mjs';
 import { PEER_REJECTION_CODES } from './connection-state.mjs';
 import { FEEDBACK_DIAGNOSTIC_OPERATIONS, FEEDBACK_DIAGNOSTIC_ERROR_TYPES, FEEDBACK_DIAGNOSTIC_SYSTEM_CODES, FEEDBACK_DIAGNOSTIC_MODULES, FEEDBACK_DIAGNOSTIC_REASONS } from './feedback-diagnostics.mjs';
+import { CONTRACT_TOOL_NAMES } from './tool-contracts.mjs';
 import { feedbackCloudTransportSchema, feedbackHostAdapterMarkerSchema } from './feedback-host-adapter.mjs';
 import {
     EXTENSION_UPDATE_URL,
@@ -23,6 +24,10 @@ import {
 import { OZON_EXTENSION_OUTDATED_REASON, OZON_PROMOTION_TERMINAL_CODE_STAGES } from './tool-errors.mjs';
 import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
 import { OZON_PACKAGE_STOP_REASONS } from './ozon-report-package-result.mjs';
+import { DIAGNOSTIC_STATES, extensionInstallFactsSchema, hookPermissionsFactsSchema } from './diagnostic-facts.mjs';
+// The producers validate their facts against these; the feedback projection reads the same objects.
+export { extensionInstallFactsSchema, hookPermissionsFactsSchema };
+import { feedbackDeviceSnapshotSchema } from './feedback-device-diagnostics.mjs';
 
 const string = { type: 'string' };
 const boolean = { type: 'boolean' };
@@ -43,6 +48,7 @@ const object = (properties, required = [], additionalProperties = false) => ({
 
 const array = (items, extra = {}) => ({ type: 'array', items, ...extra });
 const objectUnion = (...schemas) => ({ type: 'object', oneOf: schemas });
+const described = (schema, description) => ({ ...schema, description });
 const liveAggregateSchemas = (schema) => [
     {
         ...schema,
@@ -180,6 +186,13 @@ const liveBaseProperties = {
     storageWarnings,
 };
 
+const browserJobRejectionSchema = objectUnion(
+    object({ schemaVersion: { const: 1 }, reason: { const: 'invalid_job' }, diagnostic: { type: 'string', enum: ['job_type', 'jobs_count', 'descriptor_type', 'descriptor_shape', 'date_from', 'date_to_or_range', 'claims_iat_or_jti'] } }, ['schemaVersion', 'reason']),
+    ...['public_key_not_configured', 'user_not_available', 'invalid_format', 'invalid_algorithm', 'invalid_signature', 'issuer_mismatch', 'audience_mismatch', 'subject_mismatch', 'expired', 'token_reuse', 'ecomet_not_authenticated', 'activation_storage_unavailable', 'unknown']
+        .map((reason) => object({ schemaVersion: { const: 1 }, reason: { const: reason } }, ['schemaVersion', 'reason']))
+);
+const browserJobRejectionDetailsSchema = object({ browserJobRejection: browserJobRejectionSchema }, ['browserJobRejection']);
+
 export const toolErrorSchema = object({
     ok: { const: false },
     code: string,
@@ -189,10 +202,10 @@ export const toolErrorSchema = object({
         enum: ['arguments', 'handoff', 'extension', 'authorization', 'execution', 'storage', 'images', 'seller', 'local'],
     },
     retryable: boolean,
-    details: object({
+    details: objectUnion(object({
         operation: { const: 'create_result' },
         systemCode: { type: 'string', enum: ['EEXIST', 'EACCES', 'EPERM', 'ENOSPC', 'EDQUOT', 'EROFS', 'ENOTDIR', 'EBUSY'] },
-    }, ['operation', 'systemCode']),
+    }, ['operation', 'systemCode']), browserJobRejectionDetailsSchema),
     resultPath: string,
     storageWarnings,
 }, ['ok', 'code', 'message', 'stage', 'retryable']);
@@ -401,81 +414,130 @@ const peerRejectionSchema = object(
     {
         // Derived, never restated: a hand-copied list would let a new rejection code ship as tool output that
         // fails this very schema, in the one tool an operator reads when the bridge is already wedged.
-        code: { type: 'string', enum: Object.values(PEER_REJECTION_CODES) },
-        since: string,
-        retryAt: string,
+        code: described({ type: 'string', enum: Object.values(PEER_REJECTION_CODES) }, 'Current safe classification of the continuous authenticated-peer rejection streak.'),
+        since: described(string, 'ISO timestamp when the current continuous peer-rejection streak began; omitted when no safe time is available.'),
+        retryAt: described(string, 'ISO timestamp of the scheduled peer reconnect; omitted when no retry is armed.'),
     },
     ['code']
 );
 
 const storageTargetStatusSchema = objectUnion(
-    object({ state: { const: 'ready' }, backend: { type: 'string', enum: ['plugin_data', 'application_data', 'override'] } }, ['state', 'backend']),
-    object(
+    described(object({ state: described({ const: 'ready' }, 'Configuration resolved a target; this does not prove the target is writable.'), backend: described({ type: 'string', enum: ['plugin_data', 'application_data', 'override'] }, 'Configuration source that resolved this target, without exposing its filesystem path.') }, ['state', 'backend']), 'A configured target resolved successfully; no write was attempted.'),
+    described(object(
         {
-            state: { const: 'unavailable' },
-            reason: {
+            state: described({ const: 'unavailable' }, 'Configuration could not resolve this target; this does not identify a host-installation failure.'),
+            reason: described({
                 type: 'string',
                 enum: ['plugin_data_missing', 'plugin_data_invalid', 'plugin_data_conflict', 'application_data_invalid', 'override_invalid'],
-            },
+            }, 'Closed configuration reason for the unavailable target; paths and raw environment values are omitted.'),
         },
         ['state', 'reason']
-    )
+    ), 'A configured target could not be resolved; this does not prove the plugin is absent or disabled.')
 );
 
 const storageStatusSchema = object(
     {
-        results: storageTargetStatusSchema,
-        marketplaceArtifacts: storageTargetStatusSchema,
-        feedbackArtifacts: storageTargetStatusSchema,
+        results: described(storageTargetStatusSchema, 'Resolved storage configuration for ordinary tool results.'),
+        marketplaceArtifacts: described(storageTargetStatusSchema, 'Resolved storage configuration for marketplace report artifacts.'),
+        feedbackArtifacts: described(storageTargetStatusSchema, 'Resolved storage configuration for explicit-consent feedback artifacts.'),
     },
     ['results', 'marketplaceArtifacts', 'feedbackArtifacts']
 );
 
-const bridgeStatusSchema = object({
-    ok: { const: true },
-    extensionConnected: boolean,
-    browserJobSupported: boolean,
-    bridgeRole: { type: 'string', enum: ['primary', 'secondary', 'disconnected'] },
-    bridgeTransitioning: boolean,
-    listenerState: { type: 'string', enum: ['pending', 'listening', 'address_in_use', 'failed'] },
-    state: { type: 'string', enum: ['initializing', 'listen_failed', 'waiting_for_extension', 'extension_connected_no_wb_tab', 'extension_contended', 'extension_context_unknown', 'peer_context_unknown', 'ready', 'extension_update_required', 'peer_reconnecting', 'peer_unavailable'] },
-    extension: object({
-        state: { type: 'string', enum: ['never_connected', 'connected', 'disconnected'] },
-        route: { type: 'string', enum: ['direct', 'peer', 'none'] },
-        lastConnectedAt: string,
-        lastDisconnectedAt: string,
-        version: string,
-        ozonSellerPromotionReportSupported: boolean,
-        ozonSellerPromotionReportsSupported: boolean,
-        ozonSellerAnalyticsReportSupported: boolean,
-    }, ['state', 'route']),
-    peer: object({ bridgeVersion: string, browserContextPropagationSupported: boolean }),
-    browserContext: object({
-        state: { type: 'string', enum: ['unknown', 'known'] },
-        wbTabConnected: boolean,
-        sellerTabConnected: boolean,
-        changedAt: string,
-    }, ['state']),
-    extensionLastConnectedAtMs: { type: ['number', 'null'] },
-    extensionLastDisconnectedAtMs: { type: ['number', 'null'] },
-    extensionTakeovers: object({
-        count: { type: 'integer' },
-        lastAtMs: { type: ['number', 'null'] },
-        saturated: boolean,
-    }, ['count', 'lastAtMs', 'saturated']),
-    extensionVersion: string,
-    ozonSellerPromotionReportSupported: boolean,
-    ozonSellerPromotionReportsSupported: boolean,
-    ozonSellerAnalyticsReportSupported: boolean,
-    peerRejection: peerRejectionSchema,
-    bridgeVersion: string,
-    bridgeGeneration: positiveInteger,
-    controlProtocolVersion: positiveInteger,
-    extensionProtocolVersion: positiveInteger,
-    instanceId: string,
-    websocket: string,
-    storage: storageStatusSchema,
-}, ['ok', 'extensionConnected', 'bridgeRole', 'storage']);
+const diagnosticBase = (check, facts, causes = ['unknown']) => object({
+    check: described({ const: check }, 'Stable identifier for the observation represented by this check.'), state: described({ type: 'string', enum: DIAGNOSTIC_STATES }, 'Result of this bounded observation; unknown and unsupported remain distinct from failure.'), observedAt: described(string, 'ISO timestamp at which this check made its observation.'),
+    source: described(string, 'Component that produced this fact, without implying evidence from another execution plane.'), executionPlane: described(string, 'Execution plane on which the check actually ran.'), ...(facts ? { facts: described(facts, 'Typed facts observed by this check; omitted when the source supplied no safe facts.') } : {}),
+    cause: described({ type: 'string', enum: causes }, 'Safe closed cause classification; omitted when the state needs no cause or none was observed.'), evidenceRefs: described(array(described(string, 'One safe reference to separately retained evidence, not an embedded path or raw error.')), 'Safe references to separately retained evidence; omitted when no such evidence exists.'), nextCheck: described(string, 'Smallest named observation that can discriminate the remaining uncertainty; omitted when none is needed.'),
+}, ['check', 'state', 'observedAt', 'source', 'executionPlane']);
+
+const bridgeDiagnosticsSchema = object({
+    snapshot: described(diagnosticBase('snapshot'), 'Timestamped production of the status snapshot; it is not a product-health verdict.'),
+    runtime: described(diagnosticBase('runtime', object({ nodeVersion: described(string, 'Version of the Node.js process executing this MCP server.'), platform: described(string, 'Node.js platform identifier for the process executing this MCP server.'), arch: described(string, 'Node.js architecture identifier for the process executing this MCP server.'), bridgeVersion: described(string, 'Version of the local bridge build executing this check.'), mcpProtocolVersion: described(string, 'MCP protocol version negotiated with the current client; omitted when unavailable.') }, ['nodeVersion', 'platform', 'arch', 'bridgeVersion'])), 'Facts about the Node.js process running this MCP server.'),
+    client: described(diagnosticBase('client', object({ name: described(string, 'Bounded client name supplied in MCP initialize metadata.'), version: described(string, 'Bounded client version supplied in MCP initialize metadata.'), provenance: described({ const: 'client_reported' }, 'Marks these values as client-reported rather than trusted host identity.') }, ['name', 'version', 'provenance'])), 'Sanitized MCP initialize metadata; it does not prove host identity or hook support.'),
+    listener: described(diagnosticBase('listener', object({ operation: described({ const: 'bind_listener' }, 'Names the already-observed listener bind operation; status does not retry it.'), listenerState: described({ type: 'string', enum: ['pending', 'listening', 'address_in_use', 'failed'] }, 'Last listener bind event observed by the bridge, not current port ownership.'), systemCode: described({ type: 'string', enum: ['EACCES', 'EPERM', 'EADDRINUSE', 'EADDRNOTAVAIL', 'EAFNOSUPPORT', 'EINVAL'] }, 'Allowlisted operating-system code from the bind observation; omitted when unavailable.') }, ['operation', 'listenerState']), ['address_in_use', 'listen_failed', 'unknown']), 'Existing listener-bind observation; a healthy secondary can report address_in_use as passed.'),
+    pairingSource: described(diagnosticBase('pairing_source', undefined, ['permission_denied', 'insecure_permissions', 'missing', 'corrupt', 'unsupported', 'io_error']), 'Safe pairing-source classification with no token, path, owner, or raw exception.'),
+    routeFreshness: described(diagnosticBase('route_freshness', object({ lastObservedAt: described(string, 'Timestamp of an actually observed route response; omitted when no producer supplies one.') }, ['lastObservedAt'])), 'Freshness of a real extension-route observation, never inferred from browser-context changes.'),
+    storage: described(diagnosticBase('storage', object({ scope: described({ const: 'configuration' }, 'Declares that these storage facts cover configuration resolution only.'), targets: described(storageStatusSchema, 'Sanitized configured storage targets without paths or write claims.') }, ['scope', 'targets'])), 'Read-only storage configuration observation; it does not test writability.'),
+}, ['snapshot', 'runtime', 'client', 'listener', 'pairingSource', 'routeFreshness', 'storage']);
+
+const bridgeStatusSchema = described(object({
+    ok: described({ const: true }, 'Confirms that the status response was constructed; it is not a product-health result.'),
+    extensionConnected: described(boolean, 'Whether an effective direct or authenticated-peer extension route is currently observed.'),
+    browserJobSupported: described(boolean, 'Whether the effective route advertised browser-job support; it does not prove a particular operation will succeed.'),
+    bridgeRole: described({ type: 'string', enum: ['primary', 'secondary', 'disconnected'] }, 'Current local bridge role; secondary is a normal healthy role when another primary owns the listener.'),
+    bridgeTransitioning: described(boolean, 'Whether the bridge is currently changing role; it does not authorize waiting or retrying a business operation.'),
+    listenerState: described({ type: 'string', enum: ['pending', 'listening', 'address_in_use', 'failed'] }, 'Last listener bind event, which does not independently identify current port ownership.'),
+    state: described({ type: 'string', enum: ['initializing', 'listen_failed', 'waiting_for_extension', 'extension_connected_no_wb_tab', 'extension_contended', 'extension_context_unknown', 'peer_context_unknown', 'ready', 'extension_update_required', 'peer_reconnecting', 'peer_unavailable'] }, 'Ordered compatibility summary of observed bridge state, not a complete fault list or retry instruction.'),
+    extension: described(object({
+        state: described({ type: 'string', enum: ['never_connected', 'connected', 'disconnected'] }, 'Effective extension connection observation, including retained disconnected state.'),
+        route: described({ type: 'string', enum: ['direct', 'peer', 'none'] }, 'Route supplying the effective extension observation.'),
+        lastConnectedAt: described(string, 'ISO timestamp of the last observed effective extension connection; omitted if never observed.'),
+        lastDisconnectedAt: described(string, 'ISO timestamp of the last observed effective extension disconnection; omitted if never observed.'),
+        version: described(string, 'Version last reported by the effective extension route; retained after disconnect and omitted if unobserved.'),
+        ozonSellerPromotionReportSupported: described(boolean, 'Capability reported for a single Ozon promotion report; omission means unobserved.'),
+        ozonSellerPromotionReportsSupported: described(boolean, 'Capability reported for packaged Ozon promotion reports; omission means unobserved.'),
+        ozonSellerAnalyticsReportSupported: described(boolean, 'Capability reported for an Ozon analytics report; omission means unobserved.'),
+    }, ['state', 'route']), 'Effective browser-extension observation from a direct or authenticated-peer route.'),
+    peer: described(object({
+        bridgeVersion: described(string, 'Bridge version reported by the authenticated primary peer.'),
+        browserContextPropagationSupported: described(boolean, 'Whether the authenticated primary advertises browser-context propagation.'),
+        diagnosticForwardingSupported: described(boolean, 'Whether the authenticated primary advertised diagnostic_snapshot_forwarding_v1. False includes legacy or other primaries that did not advertise it. This field alone says nothing about extension capability or whether a diagnostic snapshot request will succeed.'),
+    }), 'Authenticated primary-peer metadata; normally omitted on a primary.'),
+    browserContext: described(object({
+        state: described({ type: 'string', enum: ['unknown', 'known'] }, 'Whether registered WB browser-port facts were observed.'),
+        wbTabConnected: described(boolean, 'Whether the extension reports a registered standalone WB page port; this does not prove login.'),
+        sellerTabConnected: described(boolean, 'Whether the extension reports a registered WB Seller page port; this does not describe Ozon.'),
+        changedAt: described(string, 'ISO timestamp when the registered-port observation changed; it is not a freshness guarantee.'),
+    }, ['state']), 'Extension-reported WB and WB Seller port registration; it does not cover Ozon readiness.'),
+    extensionLastConnectedAtMs: described({ oneOf: [described(number, 'Observed effective extension connection time as Unix epoch milliseconds.'), described({ type: 'null' }, 'No effective extension connection has ever been observed.')] }, 'Legacy millisecond copy of the effective extension connection time; null means never observed.'),
+    extensionLastDisconnectedAtMs: described({ oneOf: [described(number, 'Observed effective extension disconnection time as Unix epoch milliseconds.'), described({ type: 'null' }, 'No effective extension disconnection has ever been observed.')] }, 'Legacy millisecond copy of the effective extension disconnection time; null means never observed.'),
+    extensionTakeovers: described(object({
+        count: described({ type: 'integer' }, 'Number of takeovers retained within the bounded recent observation window.'),
+        lastAtMs: described({ oneOf: [described(number, 'Last observed takeover time as Unix epoch milliseconds.'), described({ type: 'null' }, 'No extension takeover has ever been observed.')] }, 'Last observed takeover time in milliseconds; it can fall outside the count window.'),
+        saturated: described(boolean, 'Whether the bounded counter is a lower bound because more takeovers occurred than retained.'),
+    }, ['count', 'lastAtMs', 'saturated']), 'Bounded recent observations of extension socket takeovers without browser-profile identity.'),
+    extensionVersion: described(string, 'Legacy copy of the effective extension version; it is not independent evidence.'),
+    ozonSellerPromotionReportSupported: described(boolean, 'Legacy copy of the single-promotion-report capability; omission means unobserved.'),
+    ozonSellerPromotionReportsSupported: described(boolean, 'Legacy copy of the packaged-promotion-reports capability; omission means unobserved.'),
+    ozonSellerAnalyticsReportSupported: described(boolean, 'Legacy copy of the analytics-report capability; omission means unobserved.'),
+    peerRejection: described(peerRejectionSchema, 'Current continuous peer-rejection streak; omitted when none is active.'),
+    bridgeVersion: described(string, 'Version of the local bridge build producing this status.'),
+    bridgeGeneration: described(positiveInteger, 'Compatibility generation used for coordinated bridge replacement.'),
+    controlProtocolVersion: described(positiveInteger, 'Local authenticated peer-control protocol version.'),
+    extensionProtocolVersion: described(positiveInteger, 'Extension protocol version supported by this bridge build.'),
+    instanceId: described(string, 'Ephemeral identifier of this local bridge process; it is not a host or user identity.'),
+    websocket: described(string, 'Configured loopback WebSocket endpoint; it does not prove ownership or reachability.'),
+    storage: described(storageStatusSchema, 'Read-only resolution status for the three configured storage targets.'),
+    diagnostics: described(bridgeDiagnosticsSchema, 'Typed passive observations collected with this status response.'),
+}, ['ok', 'extensionConnected', 'bridgeRole', 'storage']), 'Passive local bridge status response; successful construction is distinct from product health.');
+
+const operationDiagnosticSchema = described(object({
+    schemaVersion: described({ const: 1 }, 'Version of the operation-diagnostic receipt contract.'), handle: described(string, 'Opaque handle for the latest real completion in this MCP process.'), stage: described(string, 'Last operation stage established by the producer.'), outcome: described({ type: 'string', enum: ['succeeded', 'partial', 'failed', 'uncertain'] }, 'Observed terminal outcome without converting uncertainty into failure.'),
+    retryDisposition: described({ type: 'string', enum: ['allowed', 'forbidden', 'requires_new_authorization', 'unknown'] }, 'Whether repeating the original operation is safe under its existing authorization contract.'),
+}, ['schemaVersion', 'handle', 'stage', 'outcome', 'retryDisposition']), 'Terminal receipt for one exact real operation completion in this MCP process.');
+export const codexMcpAuthFactsSchema = object({
+    host: { const: 'codex' }, context: { const: 'configuration_snapshot' },
+    inspector: { const: 'cli_config_reader' },
+    status: { type: 'string', enum: ['not_logged_in', 'credentials_present', 'unknown_status', 'missing', 'ambiguous'] },
+    installationMatch: { const: 'not_verified' },
+    servers: array(object({
+        role: { type: 'string', enum: ['remote', 'local'] },
+        authStatus: { type: 'string', enum: ['unknown', 'unsupported', 'notLoggedIn', 'bearerToken', 'oAuth'] },
+        enabled: boolean,
+    }, ['role', 'authStatus'])),
+}, ['host', 'context', 'inspector', 'status', 'installationMatch', 'servers']);
+const diagnosisCheckSchema = described(object({
+    check: described(string, 'Stable identifier for this bounded diagnostic observation.'), state: described({ type: 'string', enum: DIAGNOSTIC_STATES }, 'Observation result, preserving unknown, unsupported, and not_checked separately.'), observedAt: described(string, 'ISO timestamp at which this check made its observation.'), source: described(string, 'Component that produced the check without implying another execution plane.'), executionPlane: described(string, 'Execution plane on which this check actually ran.'),
+    facts: described({ type: 'object', additionalProperties: true }, 'Check-specific sanitized facts defined in DIAGNOSTICS.md; omitted when unavailable.'), cause: described(string, 'Safe cause classification defined for this check; omitted when none was observed.'), evidenceRefs: described(array(described(string, 'One safe reference to separately retained evidence, not an embedded path or raw error.')), 'Safe references to separately retained evidence; omitted when none exist.'), nextCheck: described(string, 'Smallest named observation that can discriminate remaining uncertainty.'),
+}, ['check', 'state', 'observedAt', 'source', 'executionPlane']), 'One bounded diagnostic observation with explicit provenance and omission semantics.');
+const diagnosisSchema = described(object({
+    schemaVersion: described({ const: 1 }, 'Version of the scoped diagnosis response contract.'), scope: described({ type: 'string', enum: ['installation', 'runtime', 'last_operation'] }, 'Diagnostic scope actually evaluated by this response.'),
+    mode: described({ type: 'string', enum: ['passive', 'safe_probes'] }, 'Requested observation mode; safe_probes runs only explicitly allowlisted probes.'), checks: described(array(described(diagnosisCheckSchema, 'One bounded DiagnosticCheck in response order.')), 'Ordered bounded checks produced for the selected scope and mode.'), operation: described(operationDiagnosticSchema, 'Receipt for the exact requested operation handle; omitted outside a matched last_operation diagnosis.'),
+}, ['schemaVersion', 'scope', 'mode', 'checks']), 'Scoped technical diagnosis response that preserves uncertainty and never repeats business work.');
+
+const withOperationDiagnostic = (schema) => schema.oneOf
+    ? { ...schema, oneOf: schema.oneOf.map(withOperationDiagnostic) }
+    : { ...schema, properties: { ...schema.properties, operationDiagnostic: operationDiagnosticSchema } };
 
 const triggerUrlProperty = {
     type: 'string',
@@ -544,6 +606,7 @@ const ozonPromotionErrorSchema = objectUnion(
                 stage: { const: stage },
                 retryable: { const: false },
                 ...(code === 'OZON_ROUTE_NOT_READY' ? { details: ozonExtensionOutdatedDetailsSchema } : {}),
+                ...(code === 'OZON_AUTHORIZATION_REJECTED' ? { details: browserJobRejectionDetailsSchema } : {}),
             },
             ['code', 'message', 'stage', 'retryable']
         )
@@ -623,6 +686,7 @@ const ozonPackageError = (codeStages, analytics = false) =>
                         marketplaceErrorCode: { type: 'integer', minimum: -2147483648, maximum: 2147483647 },
                     }, ['marketplaceErrorCode']) } : {}),
                     ...(code === 'OZON_EXECUTION_INTERRUPTED' ? { details: ozonExecutionInterruptionDetailsSchema } : {}),
+                    ...(code === 'OZON_AUTHORIZATION_REJECTED' ? { details: browserJobRejectionDetailsSchema } : {}),
                 },
                 ['code', 'message', 'stage', 'retryable']
             )
@@ -822,9 +886,20 @@ const feedbackPrepareFailureSchema = object(
     { ok: { const: false }, status: { const: 'failed' }, error: feedbackPreparationErrorSchema },
     ['ok', 'status', 'error']
 );
+// The storage object key an accepted upload wrote, published as this report's support reference. Every
+// route that accepts, stores, re-emits or publishes that key tests it here, so the value cannot pass one
+// boundary and fail another; the byte bound is at least as strict as the schema's code-unit maxLength.
+export const FEEDBACK_REPORT_ID_MAX_LENGTH = 1024;
+const REPORT_ID_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+export const isPublishableObjectKey = (value) =>
+    typeof value === 'string'
+    && value.length > 0
+    && Buffer.byteLength(value, 'utf8') <= FEEDBACK_REPORT_ID_MAX_LENGTH
+    && !REPORT_ID_CONTROL_CHARACTERS.test(value);
 const feedbackSubmitSuccessSchema = object(
-    { ok: { const: true }, status: { const: 'uploaded' }, artifactId: feedbackArtifactIdSchema, transcriptIncluded: boolean },
-    ['ok', 'status', 'artifactId', 'transcriptIncluded']
+    { ok: { const: true }, status: { const: 'uploaded' }, artifactId: feedbackArtifactIdSchema, transcriptIncluded: boolean,
+        reportId: { type: 'string', minLength: 1, maxLength: FEEDBACK_REPORT_ID_MAX_LENGTH } },
+    ['ok', 'status', 'artifactId', 'transcriptIncluded', 'reportId']
 );
 const feedbackSubmitFailureSchema = object(
     { ok: { const: false }, status: { type: 'string', enum: ['failed', 'rejected', 'uncertain'] }, artifactId: feedbackArtifactIdSchema, error: feedbackErrorSchema },
@@ -847,6 +922,7 @@ const feedbackPrepareHostUnavailableSchema = object(
             ...feedbackHostAdapterMarkerSchema.properties,
             targetTool: { const: 'prepare_e_comet_feedback' },
         }, ['version', 'operationId', 'nonce', 'targetTool']),
+        bridgeStatus: feedbackDeviceSnapshotSchema,
         error: object({
             code: { const: 'FEEDBACK_HOST_RESULT_UNAVAILABLE' },
             message: feedbackMessage,
@@ -854,11 +930,37 @@ const feedbackPrepareHostUnavailableSchema = object(
             retryable: { const: false },
         }, ['code', 'message', 'stage', 'retryable']),
     },
-    ['ok', 'status', 'adapter', 'error']
+    ['ok', 'status', 'adapter', 'bridgeStatus', 'error']
 );
 
+const describedToolName = described(
+    { type: 'string', enum: [...CONTRACT_TOOL_NAMES] },
+    'Exact local e-Comet tool whose current supported tool contract is requested.'
+);
+
+const describedToolContractSchema = object({
+    schemaVersion: { const: 1 },
+    type: { const: 'e_comet_tool_contract' },
+    requestedTool: { type: 'string', enum: [...CONTRACT_TOOL_NAMES] },
+    appliesTo: array({
+        type: 'string',
+        enum: ['browser_job', ...CONTRACT_TOOL_NAMES, 'report_issue'],
+    }, { minItems: 2, maxItems: 3, uniqueItems: true }),
+    contract: { type: 'string', minLength: 1 },
+}, ['schemaVersion', 'type', 'requestedTool', 'appliesTo', 'contract']);
+
 export const toolInputSchemas = {
-    local_bridge_status: object({}),
+    local_bridge_status: described(object({}), 'No arguments: this tool passively observes existing local bridge state.'),
+    e_comet_diagnose: described(object({
+        scope: described({ type: 'string', enum: ['installation', 'runtime', 'last_operation'] }, 'Evidence domain to inspect: packaged installation, current bridge runtime, or one exact operation receipt.'),
+        mode: described({ type: 'string', enum: ['passive', 'safe_probes'] }, 'Passive reads existing facts; safe_probes additionally runs only the explicitly selected allowlisted probes.'),
+        operationHandle: described(string, 'Opaque handle returned by the exact terminal operation; required only for last_operation and never substitutes the latest result.'),
+        probes: described(array(described({ type: 'string', enum: ['storage_write', 'extension_snapshot', 'hook_permissions', 'codex_mcp_auth', 'extension_install'] }, 'storage_write, hook_permissions, codex_mcp_auth and extension_install apply only to installation; extension_snapshot applies only to runtime.'), { uniqueItems: true }), 'Allowlisted probes requested for safe_probes mode; an inapplicable requested probe is not executed and is omitted from checks.'),
+    }, ['scope', 'mode']), 'Selects one diagnostic scope and observation mode without authorizing a business operation.'),
+    describe_e_comet_tool: described(
+        object({ name: describedToolName }, ['name']),
+        'Selects one current supported tool contract without executing a business operation.'
+    ),
     wb_product_card: liveInputSchema(),
     wb_search_by_query: liveInputSchema('productLimitPerQuery', 'query'),
     wb_check_by_query: liveInputSchema(),
@@ -926,132 +1028,41 @@ export const toolInputSchemas = {
 
 export const toolOutputSchemas = {
     local_bridge_status: bridgeStatusSchema,
-    wb_product_card: objectUnion(...liveAggregateSchemas(productCardSuccessSchema), toolErrorSchema),
-    wb_search_by_query: objectUnion(...liveAggregateSchemas(searchSuccessSchema), toolErrorSchema),
-    wb_check_by_query: objectUnion(...liveAggregateSchemas(checkSuccessSchema), toolErrorSchema),
-    wb_recommendations_by_product: objectUnion(...liveAggregateSchemas(recommendationsSuccessSchema), toolErrorSchema),
-    wb_seller_reviews: objectUnion(sellerReviewsSuccessSchema, toolErrorSchema),
-    prepare_e_comet_feedback: objectUnion(feedbackPrepareSuccessSchema, feedbackPrepareFailureSchema, feedbackPrepareHostUnavailableSchema),
-    submit_e_comet_feedback: objectUnion(feedbackSubmitSuccessSchema, feedbackSubmitFailureSchema, feedbackCloudNotStartedSchema),
-    wb_product_images: objectUnion(...liveAggregateSchemas(imagesSuccessSchema), toolErrorSchema),
-    ozon_seller_promotion_report: objectUnion(ozonPromotionSuccessSchema, ozonPromotionFailureSchema, ozonPromotionPreflightFailureSchema),
-    ozon_seller_promotion_reports: packageResultSchema(
+    e_comet_diagnose: diagnosisSchema,
+    describe_e_comet_tool: describedToolContractSchema,
+    wb_product_card: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(productCardSuccessSchema), toolErrorSchema)),
+    wb_search_by_query: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(searchSuccessSchema), toolErrorSchema)),
+    wb_check_by_query: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(checkSuccessSchema), toolErrorSchema)),
+    wb_recommendations_by_product: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(recommendationsSuccessSchema), toolErrorSchema)),
+    wb_seller_reviews: withOperationDiagnostic(objectUnion(sellerReviewsSuccessSchema, toolErrorSchema)),
+    prepare_e_comet_feedback: withOperationDiagnostic(objectUnion(feedbackPrepareSuccessSchema, feedbackPrepareFailureSchema, feedbackPrepareHostUnavailableSchema)),
+    submit_e_comet_feedback: withOperationDiagnostic(objectUnion(feedbackSubmitSuccessSchema, feedbackSubmitFailureSchema, feedbackCloudNotStartedSchema)),
+    wb_product_images: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(imagesSuccessSchema), toolErrorSchema)),
+    ozon_seller_promotion_report: withOperationDiagnostic(objectUnion(ozonPromotionSuccessSchema, ozonPromotionFailureSchema, ozonPromotionPreflightFailureSchema)),
+    ozon_seller_promotion_reports: withOperationDiagnostic(packageResultSchema(
         'ozon_seller_promotion_reports',
         'periods',
         promotionPackageItems
-    ),
-    ozon_seller_analytics_report: packageResultSchema(
+    )),
+    ozon_seller_analytics_report: withOperationDiagnostic(packageResultSchema(
         'ozon_seller_analytics_report',
         'reports',
         analyticsPackageItems
-    ),
+    )),
 };
 
-const canonicalUniqueValue = (value, ancestors = new Set()) => {
-    if (value === null) return 'null';
-    if (typeof value === 'string') return `string:${JSON.stringify(value)}`;
-    if (typeof value === 'number') return `number:${Number.isNaN(value) ? 'NaN' : String(value)}`;
-    if (typeof value === 'boolean') return `boolean:${value}`;
-    if (typeof value === 'undefined') return 'undefined';
-    if (typeof value === 'bigint') return `bigint:${value}`;
-    if (typeof value !== 'object') return `${typeof value}:${String(value)}`;
-    if (ancestors.has(value)) throw new TypeError('Schema values must not contain cycles.');
-    ancestors.add(value);
-    try {
-        if (Array.isArray(value)) {
-            return `array:[${Array.from({ length: value.length }, (_, index) =>
-                Object.hasOwn(value, index) ? canonicalUniqueValue(value[index], ancestors) : 'hole'
-            ).join(',')}]`;
-        }
-        return `object:{${Object.keys(value)
-            .sort()
-            .map((key) => `${JSON.stringify(key)}:${canonicalUniqueValue(value[key], ancestors)}`)
-            .join(',')}}`;
-    } finally {
-        ancestors.delete(value);
-    }
+export const schemaContractTerms = (schema = bridgeStatusSchema) => {
+    const terms = new Set();
+    const visit = (node, path) => {
+        if (!node || typeof node !== 'object') return;
+        if (path) terms.add(path);
+        if (Array.isArray(node.enum)) for (const value of node.enum) terms.add(`${path}=${value}`);
+        if (Object.hasOwn(node, 'const') && ['string', 'boolean', 'number'].includes(typeof node.const)) terms.add(`${path}=${node.const}`);
+        for (const alternative of node.oneOf ?? []) visit(alternative, path);
+        for (const [name, child] of Object.entries(node.properties ?? {})) visit(child, path ? `${path}.${name}` : name);
+    };
+    visit(schema, '');
+    return Object.freeze([...terms].sort());
 };
 
-const hasUniqueItems = (values) => {
-    const primitiveValues = new Set();
-    const structuredValues = new Set();
-    try {
-        for (const value of values) {
-            if (value !== null && typeof value === 'object') {
-                const identity = canonicalUniqueValue(value);
-                if (structuredValues.has(identity)) return false;
-                structuredValues.add(identity);
-            } else {
-                if (primitiveValues.has(value)) return false;
-                primitiveValues.add(value);
-            }
-        }
-    } catch {
-        return false;
-    }
-    return true;
-};
-
-export const validateSchemaValue = (value, schema) => {
-    if (schema.allOf && !schema.allOf.every((candidate) => validateSchemaValue(value, candidate))) return false;
-    if (schema.contains) {
-        if (!Array.isArray(value)) return false;
-        const matches = value.filter((item) => validateSchemaValue(item, schema.contains)).length;
-        if (matches < (schema.minContains ?? 1) || matches > (schema.maxContains ?? Infinity)) return false;
-    }
-    if (schema.oneOf) {
-        return schema.oneOf.filter((candidate) => validateSchemaValue(value, candidate)).length === 1;
-    }
-    if (Object.hasOwn(schema, 'const')) return Object.is(value, schema.const);
-    if (!schema.type) return true;
-    if (schema.type === 'object') {
-        if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-        const properties = schema.properties || {};
-        if ((schema.required || []).some((name) => !Object.hasOwn(value, name))) return false;
-        return Object.entries(value).every(([name, propertyValue]) => {
-            if (!Object.hasOwn(properties, name)) {
-                if (schema.additionalProperties === false) return false;
-                if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
-                    return validateSchemaValue(propertyValue, schema.additionalProperties);
-                }
-                return true;
-            }
-            const propertySchema = properties[name];
-            return validateSchemaValue(propertyValue, propertySchema);
-        });
-    }
-    if (schema.type === 'array') {
-        if (!Array.isArray(value) || value.length < (schema.minItems ?? 0) || value.length > (schema.maxItems ?? Infinity)) return false;
-        if (!value.every((item) => validateSchemaValue(item, schema.items))) return false;
-        return !schema.uniqueItems || hasUniqueItems(value);
-    }
-    if (schema.type === 'string') {
-        return (
-            typeof value === 'string' &&
-            value.length >= (schema.minLength ?? 0) &&
-            value.length <= (schema.maxLength ?? Infinity) &&
-            (!schema.enum || schema.enum.includes(value)) &&
-            (!schema.pattern || new RegExp(schema.pattern).test(value))
-        );
-    }
-    if (schema.type === 'integer') {
-        return (
-            Number.isSafeInteger(value) &&
-            value >= (schema.minimum ?? -Infinity) &&
-            value <= (schema.maximum ?? Infinity)
-        );
-    }
-    if (schema.type === 'number') {
-        return (
-            typeof value === 'number' &&
-            Number.isFinite(value) &&
-            value >= (schema.minimum ?? -Infinity) &&
-            value <= (schema.maximum ?? Infinity) &&
-            value > (schema.exclusiveMinimum ?? -Infinity) &&
-            value < (schema.exclusiveMaximum ?? Infinity)
-        );
-    }
-    if (schema.type === 'boolean') return typeof value === 'boolean';
-    if (schema.type === 'null') return value === null;
-    return false;
-};
+export { validateSchemaValue } from './schema-validation.mjs';

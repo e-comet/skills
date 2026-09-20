@@ -24,6 +24,7 @@ import {
 } from './config.mjs';
 import { ConnectionState } from './connection-state.mjs';
 import { deriveBridgeDiagnostics } from './bridge-diagnostics.mjs';
+import { collectStaticFacts, diagnosticCheck } from './diagnostic-facts.mjs';
 import { createExtensionProtocol } from './extension-protocol.mjs';
 import { maintainFeedbackArtifacts } from './feedback-artifact-store.mjs';
 import { localMessage, MESSAGE_TYPES } from './extension-vocabulary.mjs';
@@ -35,7 +36,7 @@ import { createPeerTokenSource } from './peer-token-source.mjs';
 import { createPeerProtocol } from './peer-protocol.mjs';
 import { RequestBroker } from './request-broker.mjs';
 import { pruneResults } from './result-store.mjs';
-import { createOzonPromotionRoute } from './server-routing.mjs';
+import { createDiagnosticSnapshotRoute, createOzonPromotionRoute } from './server-routing.mjs';
 import { attachStdioTransport } from './stdio-transport.mjs';
 import { ToolExecutionError } from './tool-errors.mjs';
 import { connectWebSocket } from './websocket-client.mjs';
@@ -143,6 +144,7 @@ const requestBroker = new RequestBroker({
         );
     },
     routeOzonPromotionReport: createOzonPromotionRoute({ connections }),
+    routeDiagnosticSnapshot: createDiagnosticSnapshotRoute({ connections }),
     routeAuthorization: ({ requestId, token }) => {
         if (connections.extensionReady && !connections.extensionBrowserJobReady) {
             throw new ToolExecutionError(
@@ -257,18 +259,35 @@ const requestBrowserJobAuthorization = (...args) => requestBroker.requestAuthori
 const shutdownController = new AbortController();
 const handleMcpMessage = createMcpMessageHandler({
     reportOutputDirectory: process.env.CLAUDE_PROJECT_DIR,
-    getBridgeStatus: () => {
-        const rawStatus = runtime.status();
+    getBridgeStatus: (/** @type {any} */ metadata = {}) => {
+        const { clientInfo, protocolVersion, clientObservedAt } = metadata;
+        const rawStatus = /** @type {any} */ (runtime.status());
+        const { pairingObservation: _pairingObservation, listenerObservation: _listenerObservation, ...publicRawStatus } = rawStatus;
+        const observedAt = new Date().toISOString();
+        const storage = storageStatus(STORAGE_LAYOUT);
+        const derived = deriveBridgeDiagnostics({ ...rawStatus, observedAt });
+        const staticChecks = Object.fromEntries(collectStaticFacts({
+            platform: process.platform, arch: process.arch,
+            versions: { node: process.version, bridge: BRIDGE_VERSION, mcp: protocolVersion },
+            storageLayout: storage, pairingObservation: rawStatus.pairingObservation, observedAt,
+        }).map((check) => [check.check, check]));
         return ({
-        ...rawStatus,
-        ...deriveBridgeDiagnostics(rawStatus),
+        ...publicRawStatus,
+        ...derived,
         bridgeVersion: BRIDGE_VERSION,
         bridgeGeneration: BRIDGE_GENERATION,
         controlProtocolVersion: CONTROL_PROTOCOL_VERSION,
         extensionProtocolVersion: EXTENSION_PROTOCOL_VERSION,
         instanceId,
         websocket: `ws://${HOST}:${PORT}${EXTENSION_PATH}`,
-        storage: storageStatus(STORAGE_LAYOUT),
+        storage,
+        diagnostics: {
+            ...derived.diagnostics,
+            runtime: staticChecks.runtime,
+            client: diagnosticCheck({ check: 'client', state: clientInfo ? 'passed' : 'not_checked', observedAt: clientObservedAt ?? observedAt,
+                source: 'mcp_initialize', executionPlane: 'client', ...(clientInfo ? { facts: { ...clientInfo, provenance: 'client_reported' } } : {}) }),
+            storage: staticChecks.storage,
+        },
     });},
     waitForExtensionReady: () => connections.waitForExtensionReady(EXTENSION_READINESS_WAIT_MS),
     // A degraded secondary retries slowly in the background; an actual request is the signal to try again now.
@@ -277,6 +296,8 @@ const handleMcpMessage = createMcpMessageHandler({
     // for the same call and split the wiring across two modules.
     ensureBridgeConnected: () => runtime.ensureBridgeConnected(),
     requestBrowserJobAuthorization,
+    // Diagnosis uses the broker's business deadline; feedback preparation passes its own shorter one.
+    requestExtensionDiagnosticSnapshot: (timeoutMs) => requestBroker.requestDiagnosticSnapshot(timeoutMs),
     shutdownSignal: shutdownController.signal,
     log,
 });

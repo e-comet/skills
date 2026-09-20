@@ -17,6 +17,7 @@ import {
     isValidSellerStreamChunk,
     isValidSellerStreamEnd,
     isValidSellerStreamStart,
+    isDiagnosticSnapshot,
     parseExtensionServerMessage,
 } from './extension-protocol.mjs';
 import { createPeerAuthNonce, createPeerAuthProof, isValidPeerAuthNonce, peerTokensEqual } from './peer-auth.mjs';
@@ -321,6 +322,7 @@ export const createPeerProtocol = ({
         pendingPeerAuth: null,
         peerGeneration: null,
         peerInstanceId: null,
+        peerCapabilities: [],
         // The secondary reuses its authorize requestId as authorizationScopeId on every scoped fetch.
         authorizationLeases: new Map(),
         sellerOperationRequests: new Set(),
@@ -336,6 +338,7 @@ export const createPeerProtocol = ({
                       bridgeVersion: BRIDGE_VERSION,
                       instanceId: handoff.instanceId,
                       clientNonce: createPeerAuthNonce(),
+                      capabilities: [PEER_CAPABILITIES.browserJobRejection],
                   }
                 : undefined,
         });
@@ -372,6 +375,7 @@ export const createPeerProtocol = ({
     const completeServerHandshake = (state, peerIdentity, { mutualPeerAuthentication = false } = {}) => {
         state.peerGeneration = peerIdentity.bridgeGeneration;
         state.peerInstanceId = peerIdentity.instanceId;
+        state.peerCapabilities = Array.isArray(peerIdentity.capabilities) ? peerIdentity.capabilities.filter((item) => item === PEER_CAPABILITIES.browserJobRejection) : [];
         state.peerHandshakeComplete = true;
         state.mutualPeerAuthentication = mutualPeerAuthentication;
         state.pendingPeerAuth = null;
@@ -385,7 +389,8 @@ export const createPeerProtocol = ({
             bridgeVersion: BRIDGE_VERSION,
             instanceId: handoff.instanceId,
             handoffSupported: true,
-            capabilities: [PEER_CAPABILITIES.browserContextPropagation],
+            capabilities: [PEER_CAPABILITIES.browserContextPropagation, PEER_CAPABILITIES.diagnosticForwarding],
+            diagnosticSnapshotSupported: connections.extensionDiagnosticSnapshotReady,
             browserContext: connections.browserContext,
             ...(connections.extensionOzonPromotionReady === undefined
                 ? {}
@@ -490,6 +495,8 @@ export const createPeerProtocol = ({
                 authenticatedPrimaryBridgeVersion: authenticatedPrimary.bridgeVersion,
                 browserContextPropagationSupported:
                     Array.isArray(message.capabilities) && message.capabilities.includes(PEER_CAPABILITIES.browserContextPropagation),
+                diagnosticForwardingSupported:
+                    Array.isArray(message.capabilities) && message.capabilities.includes(PEER_CAPABILITIES.diagnosticForwarding),
             });
             // A welcome on a superseded socket publishes nothing: the readiness it would set could never be
             // cleared, because disconnectPeer only acts for the current socket.
@@ -529,6 +536,8 @@ export const createPeerProtocol = ({
                 authenticatedPrimaryBridgeVersion: state.authenticatedPrimary?.bridgeVersion,
                 browserContextPropagationSupported:
                     connections.authenticatedPrimaryMetadata?.browserContextPropagationSupported === true,
+                diagnosticForwardingSupported:
+                    connections.authenticatedPrimaryMetadata?.diagnosticForwardingSupported === true,
             });
             if (wasReady === null) return;
             // Only a connection *becoming* ready settles the topology here. A routine broadcast on an
@@ -543,7 +552,7 @@ export const createPeerProtocol = ({
             return;
         }
         if (message?.type === 'peer_browser_job_authorize_result' && typeof message.requestId === 'string') {
-            if (message.error) requestBroker.rejectAuthorization(message.requestId, safeExternalToolError(message.error));
+            if (message.error) requestBroker.rejectAuthorization(message.requestId, safeExternalToolError({ ...message.error, browserJobRejection: message.browserJobRejection }));
             else if (!requestBroker.resolveAuthorization(message.requestId, message.authorization)) {
                 const sendLateRelease = (releaseRequestId) =>
                     state.socket.send(
@@ -570,6 +579,12 @@ export const createPeerProtocol = ({
                     }
                 }
             }
+            return;
+        }
+        if (message?.type === 'peer_diagnostic_snapshot_result' && typeof message.requestId === 'string') {
+            const exact = Object.keys(message).every((key) => ['type', 'requestId', 'snapshot', 'error'].includes(key));
+            if (exact && isDiagnosticSnapshot(message.snapshot)) requestBroker.resolveDiagnosticSnapshot(message.requestId, message.snapshot);
+            else requestBroker.rejectDiagnosticSnapshot(message.requestId, new ToolExecutionError('EXTENSION_DIAGNOSTIC_FAILED', 'The primary could not collect extension diagnostics.', 'extension', false));
             return;
         }
         if (
@@ -766,6 +781,9 @@ export const createPeerProtocol = ({
                 bridgeVersion: message.bridgeVersion,
                 instanceId: message.instanceId,
                 clientNonce: message.clientNonce,
+                capabilities: Array.isArray(message.capabilities)
+                    ? message.capabilities.filter((item) => item === PEER_CAPABILITIES.browserJobRejection)
+                    : [],
             };
             const primary = {
                 bridgeGeneration: handoff.generation,
@@ -1309,7 +1327,22 @@ export const createPeerProtocol = ({
                         stage: 'authorization',
                         retryable: false,
                     }),
+                    ...(state.peerCapabilities.includes(PEER_CAPABILITIES.browserJobRejection) && error?.details?.browserJobRejection
+                        ? { browserJobRejection: error.details.browserJobRejection }
+                        : {}),
                 });
+            }
+            return;
+        }
+        if (message?.type === 'peer_diagnostic_snapshot' && typeof message.requestId === 'string' && message.requestId.length > 0 && message.requestId.length <= 128 &&
+            message.protocolVersion === 1 && Object.keys(message).length === 3) {
+            // A requester disconnect does not cancel the already-forwarded read-only probe; the existing broker
+            // completion/deadline settles it. See docs/local-agent-architecture.md#accepted-residuals.
+            try {
+                const snapshot = await requestBroker.requestDiagnosticSnapshot();
+                send(state.socket, { type: 'peer_diagnostic_snapshot_result', requestId: message.requestId, snapshot });
+            } catch {
+                send(state.socket, { type: 'peer_diagnostic_snapshot_result', requestId: message.requestId, error: 'unavailable' });
             }
             return;
         }
