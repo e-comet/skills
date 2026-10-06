@@ -190,8 +190,38 @@ const codexToolResult = (record, pending) => {
     if (outcome) call.outcome = outcome;
 };
 
+// Qwen 0.25 records direct Google Content parts, not Claude content blocks. Only
+// these observed top-level shapes are projected; system/managed records and nested
+// text are not searched. Raw consented history remains the original JSONL bytes.
+const qwenToolCalls = (record, pending) => {
+    if (record.type !== 'assistant' || !Array.isArray(record.message?.parts)) return [];
+    const calls = [];
+    for (const part of record.message.parts) {
+        const item = part?.functionCall;
+        if (!isObject(item) || !acceptedToolName(item.name)) continue;
+        const call = callRecord(item.name, record.timestamp);
+        if (typeof item.id === 'string') pending.set(item.id, call);
+        calls.push(call);
+    }
+    return calls;
+};
+
+const qwenToolResults = (record, pending) => {
+    if (record.type !== 'tool_result' || !Array.isArray(record.message?.parts)) return;
+    for (const part of record.message.parts) {
+        const item = part?.functionResponse;
+        if (!isObject(item) || typeof item.id !== 'string' || !isObject(item.response)) continue;
+        const call = pending.get(item.id);
+        if (!call || item.name !== call.name) continue;
+        pending.delete(item.id);
+        const outcome = projectFeedbackToolOutcome(item.response.output,
+            record.toolCallResult?.status === 'error' || Object.hasOwn(item.response, 'error'), call.name);
+        if (outcome) call.outcome = outcome;
+    }
+};
+
 /**
- * Extract the tool calls in documented Claude and Codex JSONL records: the safe direct name, the
+ * Extract tool calls in Claude, Codex and observed Qwen JSONL records: the safe direct name, the
  * record timestamp when the host wrote one, and the closed outcome of the correlated result.
  * Payloads are never searched recursively because transcript content is untrusted diagnostic input.
  *
@@ -215,6 +245,8 @@ export const extractFeedbackToolCalls = (jsonlBytes) => {
         const codexCall = codexToolCall(record, pending);
         if (codexCall !== undefined) calls.push(codexCall);
         codexToolResult(record, pending);
+        calls.push(...qwenToolCalls(record, pending));
+        qwenToolResults(record, pending);
     }
     return calls;
 };

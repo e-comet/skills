@@ -7,9 +7,12 @@ description: Use when e-Comet installation, local MCP startup, browser extension
 
 Base every conclusion on an observed typed result. Absence of a local tool can be a valid remote-only installation and does not prove a broken full installation.
 
+In **Qwen Code**, first read [Qwen](references/qwen.md). Its host actions replace Codex/Cowork rows below;
+common extension, storage, operation and feedback rules still apply.
+
 ## Triage before any conclusion
 
-Both hosts load tools on demand. Search the host tool catalog for `e-comet` with a large result limit, or search by
+Codex and Claude load tools on demand. Search the host tool catalog for `e-comet` with a large result limit, or search by
 exact tool name. A fresh task's start list proves nothing. A truncated search result does not prove absence; use the
 host's supported bounded search again or search for the exact capability before calling it unavailable.
 
@@ -73,7 +76,7 @@ For feedback sending or feedback-specific recovery, call `describe_e_comet_tool(
 1. For a host launch or bootstrap failure, use the independent [public fallback](https://github.com/e-comet/skills#troubleshooting). If Node can run the packaged file, collect exactly one `node mcp/src/doctor.mjs --json` result. Doctor covers only that Node execution plane.
 2. For current local runtime facts, the agent calls `local_bridge_status`. `ok:true` means the response was produced, not that the product is healthy. A secondary with `address_in_use` can be healthy.
 3. The agent calls `e_comet_diagnose` with the narrowest scope for installation evidence, runtime extension context, or an exact operation receipt. Installation probes are `storage_write`, `extension_install`, and, only for an observed Codex host, `hook_permissions` and `codex_mcp_auth`; the runtime probe is `extension_snapshot`. All require `safe_probes`. Pairing has no probe: runtime diagnosis can only return the existing `pairingSource` observation. Repeating a passive read does not guarantee a more specific cause.
-4. Read [DIAGNOSTICS.md](../../mcp/DIAGNOSTICS.md) for exact field and enum meanings. After the host is observed, read only [Codex](references/codex.md) or [Claude](references/claude.md).
+4. Read [DIAGNOSTICS.md](../../mcp/DIAGNOSTICS.md) for field meanings and only the observed host's reference: [Qwen](references/qwen.md), [Codex](references/codex.md), or [Claude](references/claude.md).
 
 ## Extension rules
 

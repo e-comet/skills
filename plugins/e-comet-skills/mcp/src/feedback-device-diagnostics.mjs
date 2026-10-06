@@ -1,5 +1,5 @@
 import { PEER_REJECTION_CODES } from './connection-state.mjs';
-import { EXTENSION_SNAPSHOT_VOCABULARY, extensionInstallFactsSchema, extensionSnapshotFactsSchema, hookPermissionsFactsSchema, isCanonicalTimestamp } from './diagnostic-facts.mjs';
+import { EXTENSION_SNAPSHOT_VOCABULARY, MCP_CONFIGURATION_FACTS, extensionInstallFactsSchema, extensionSnapshotFactsSchema, hookPermissionsFactsSchema, isCanonicalTimestamp } from './diagnostic-facts.mjs';
 import { validateSchemaValue } from './schema-validation.mjs';
 
 const STATES = new Set(['passed', 'failed', 'unknown', 'not_checked', 'unsupported']);
@@ -58,9 +58,12 @@ const extensionSnapshotFacts = value => {
 const LAYOUTS = ['installed_plugin', 'canonical_source'];
 const packageLayoutFacts = value => (record(value) && onlyKeys(value, ['layout']) && LAYOUTS.includes(value.layout) ? { layout: value.layout } : undefined);
 const packageMetadataFacts = name => value => (record(value) && onlyKeys(value, ['name', 'version']) && value.name === name && text(value.version) ? { name, version: value.version } : undefined);
-const MCP_CONFIGURATION = Object.freeze({ transport: 'stdio', command: 'node', cwd: '.', entrypoint: 'mcp/src/server.mjs' });
-const mcpConfigurationFacts = value => (record(value) && onlyKeys(value, Object.keys(MCP_CONFIGURATION))
-    && Object.entries(MCP_CONFIGURATION).every(([key, expected]) => value[key] === expected) ? { ...MCP_CONFIGURATION } : undefined);
+const MCP_CONFIGURATIONS = Object.values(MCP_CONFIGURATION_FACTS);
+const mcpConfigurationFacts = value => {
+    const match = record(value) ? MCP_CONFIGURATIONS.find(configuration => onlyKeys(value, Object.keys(configuration))
+        && Object.entries(configuration).every(([key, expected]) => value[key] === expected)) : undefined;
+    return match ? { ...match } : undefined;
+};
 
 const specs = {
     bridgeStatusCollection: { check: 'bridge_status_collection', sources: ['feedback_preparation'], planes: ['device'], causes: ['permission_denied', 'unknown'] },
@@ -99,6 +102,7 @@ const specs = {
     packageLayout: { check: 'package_layout', sources: ['module_location'], planes: ['device'], causes: ['unknown'], facts: packageLayoutFacts, strict: true },
     packageMetadata: { check: 'package_metadata', sources: ['package_metadata'], planes: ['device'], causes: ['missing', 'corrupt', 'io_error'], facts: packageMetadataFacts('@e-comet/local-mcp'), strict: true },
     codexManifest: { check: 'codex_manifest', sources: ['package_metadata'], planes: ['device'], causes: ['missing', 'corrupt', 'io_error'], facts: packageMetadataFacts('e-comet-skills'), strict: true },
+    qwenManifest: { check: 'qwen_manifest', sources: ['package_metadata'], planes: ['device'], causes: ['missing', 'corrupt', 'io_error'], facts: packageMetadataFacts('e-comet-skills'), strict: true },
     mcpConfiguration: { check: 'mcp_configuration', sources: ['package_metadata'], planes: ['device'], causes: ['missing', 'corrupt', 'io_error'], facts: mcpConfigurationFacts, strict: true },
     entrypoint: { check: 'entrypoint', sources: ['filesystem_metadata'], planes: ['device'], causes: ['missing', 'io_error'], strict: true },
     extensionInstall: { check: 'extension_install', sources: ['browser_profile_metadata'], planes: ['device'],
@@ -246,8 +250,10 @@ export const feedbackDeviceDiagnosticsSchema = diagnosticObject({
     packageLayout: checkSchema('package_layout', ['module_location'], ['device'], diagnosticObject({ layout: { type: 'string', enum: LAYOUTS } }, ['layout']), ['unknown']),
     packageMetadata: checkSchema('package_metadata', ['package_metadata'], ['device'], packageMetadataSchema('@e-comet/local-mcp'), ['missing', 'corrupt', 'io_error']),
     codexManifest: checkSchema('codex_manifest', ['package_metadata'], ['device'], packageMetadataSchema('e-comet-skills'), ['missing', 'corrupt', 'io_error']),
-    mcpConfiguration: checkSchema('mcp_configuration', ['package_metadata'], ['device'],
-        diagnosticObject(Object.fromEntries(Object.entries(MCP_CONFIGURATION).map(([key, value]) => [key, { const: value }])), Object.keys(MCP_CONFIGURATION)), ['missing', 'corrupt', 'io_error']),
+    qwenManifest: checkSchema('qwen_manifest', ['package_metadata'], ['device'], packageMetadataSchema('e-comet-skills'), ['missing', 'corrupt', 'io_error']),
+    mcpConfiguration: checkSchema('mcp_configuration', ['package_metadata'], ['device'], { type: 'object', oneOf: MCP_CONFIGURATIONS.map(configuration =>
+        diagnosticObject(Object.fromEntries(Object.entries(configuration).map(([key, value]) => [key, { const: value }])), Object.keys(configuration))) },
+        ['missing', 'corrupt', 'io_error']),
     entrypoint: checkSchema('entrypoint', ['filesystem_metadata'], ['device'], undefined, ['missing', 'io_error']),
     extensionInstall: checkSchema('extension_install', ['browser_profile_metadata'], ['device'], extensionInstallFactsSchema, ['permission_denied', 'io_error', 'directory_absent', 'unknown']),
     hookPermissions: checkSchema('hook_permissions', ['codex_hooks_list', 'device_process'], ['device'], hookPermissionsFactsSchema, ['permission_denied', 'missing', 'unavailable', 'unsupported', 'unknown']),

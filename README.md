@@ -35,7 +35,7 @@
 ### Полная
 
 > [!IMPORTANT]
-> Необходим ИИ-агент с поддержкой плагинов: Claude Desktop (Cowork), Claude Code, ChatGPT Desktop (Codex) или Codex CLI с платной подпиской.
+> Необходим ИИ-агент с поддержкой плагинов: Claude Desktop (Cowork), Claude Code, ChatGPT Desktop (Codex), Codex CLI с платной подпиской или Qwen Code.
 
 #### Браузер и расширение
 
@@ -104,6 +104,16 @@ claude plugin install e-comet-skills@e-comet-skills
 codex plugin marketplace add https://github.com/e-comet/skills
 codex plugin add e-comet-skills@e-comet-skills
 ```
+
+</details>
+
+<details>
+<summary>Qwen Code</summary>
+
+1. Откройте `Plugins` → `Extensions` → `Add` → `Source`.
+2. Вставьте `https://github.com/e-comet/skills`, нажмите `Install` и подтвердите установку.
+3. В `Plugins` → `MCP` подключите `e-comet`, авторизовавшись по почте.
+4. Начните новый чат.
 
 </details>
 

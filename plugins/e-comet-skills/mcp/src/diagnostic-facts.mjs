@@ -6,6 +6,13 @@ const safeText = (value) => typeof value === 'string' && value.length > 0 && val
 export const sanitizeClientInfo = (value) => value && safeText(value.name) && safeText(value.version)
     ? Object.freeze({ name: value.name, version: value.version }) : null;
 
+// The fixed launch facts the doctor reports for each installed package format's `mcp_configuration`; the
+// feedback projection admits exactly these and nothing else.
+export const MCP_CONFIGURATION_FACTS = Object.freeze({
+    plugin: Object.freeze({ transport: 'stdio', command: 'node', cwd: '.', entrypoint: 'mcp/src/server.mjs' }),
+    qwen: Object.freeze({ transport: 'stdio', command: 'node', cwd: '${extensionPath}', entrypoint: 'qwen/browser-job-proxy.mjs' }),
+});
+
 export const diagnosticCheck = (/** @type {any} */ input) => {
     const { check, state, observedAt, source, executionPlane, facts, cause, evidenceRefs, nextCheck } = input;
     if (!DIAGNOSTIC_STATES.includes(state)) throw new TypeError(`Unrecognized diagnostic state: ${state}`);

@@ -1,0 +1,46 @@
+{
+  "name": "e-comet-skills",
+  "displayName": "e-Comet",
+  "description": "e-Comet seller analytics, live Wildberries data, and Ozon Seller reports for Qwen Code.",
+  "mcpServers": {
+    "e-comet": {
+      "httpUrl": "https://mcp.e-comet.io/mcp"
+    },
+    "e-comet-local": {
+      "command": "node",
+      "args": [
+        "${extensionPath}/qwen/browser-job-proxy.mjs"
+      ],
+      "cwd": "${extensionPath}",
+      "timeout": 7200000
+    }
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^mcp__(?:e-comet__(?:browser_job|report_issue)|e-comet-local__prepare_e_comet_feedback)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/qwen/browser-job-post.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Securing e-Comet browser authorization"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^mcp__e-comet-local__prepare_e_comet_feedback$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/qwen/feedback-handoff.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Preparing e-Comet feedback context"
+          }
+        ]
+      }
+    ]
+  }
+}

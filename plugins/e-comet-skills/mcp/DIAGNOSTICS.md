@@ -81,12 +81,18 @@ configuration but performs no write, listener, pairing, retention, extension, au
 Doctor checks use the shared check fields and state/cause vocabularies above. `runtime` describes the executing Node
 process. `storage` reports the same configuration-only target facts described above. `package_layout.facts.layout` is
 `canonical_source` or `installed_plugin`; it describes where the running file resides and is not proof of host
-installation. `package_metadata.facts.name` and `.version` validate the canonical npm package. Installed layout instead
+installation. `package_metadata.facts.name` and `.version` validate the MCP package. Installed Claude/Codex layout
 uses `codex_manifest.facts.name` and `.version`, plus `mcp_configuration.facts.transport`, `.command`, `.cwd`, and `.entrypoint`.
-`entrypoint` checks only that the referenced server file exists and never imports it. Metadata and entrypoint failures use
+A native Qwen package instead validates `qwen-extension.json` as `qwen_manifest` and requires its bundled MCP package
+metadata. A present invalid Qwen manifest is reported as invalid rather than falling back to Codex checks.
+`entrypoint` checks only that the referenced launch files exist and never imports them. For Qwen it checks both the
+local proxy and the underlying MCP server. Metadata and entrypoint failures use
 the closed causes `missing`, `corrupt`, or `io_error`. Versions must use the bounded Node/npm release-version grammar;
 malformed values make their metadata check corrupt and are never copied to output. The installed command is valid only
-with the packaged `cwd:"."` and relative `mcp/src/server.mjs` entrypoint.
+with the packaged `cwd:"."` and relative `mcp/src/server.mjs` entrypoint in Claude/Codex layout. Qwen configuration uses
+`cwd:"${extensionPath}"` and `${extensionPath}/qwen/browser-job-proxy.mjs`; emitted facts retain these fixed relative
+configuration values, never an installed absolute path. Package format is not proof of the calling host, authorization,
+hook enablement or hook execution.
 
 The doctor fact shapes are exact: `package_layout.facts.layout` is derived from the running doctor's location;
 `package_metadata.facts.name` and `.version` come from canonical npm metadata; `codex_manifest.facts.name` and
@@ -274,8 +280,9 @@ Codex runtime, not a trusted host identity. The report's `## Host` section repea
 Code archive prepared on the same device.
 
 Preparation additionally collects, in parallel, one read-only `extension_snapshot`, recorded as `not_checked` with
-cause `unavailable` without any request when no extension route is connected; the passive installation checks
-`package_layout`, `package_metadata` or `codex_manifest`, `mcp_configuration`, and `entrypoint`; the `extension_install`
+cause `unavailable` without any request when no extension route is connected; the passive installation checks the
+package format produces (`package_layout`, `package_metadata`, `codex_manifest` or `qwen_manifest`, `mcp_configuration`,
+and `entrypoint`); the `extension_install`
 probe; and, only when the client name identifies Codex, the `hook_permissions` probe. Every probe is abandoned at the
 same five-second evidence deadline instead of the business deadline, so a stalled read or inspector can cost seconds
 but never the report; an abandoned snapshot request is the `unknown` observation with cause `unavailable` above. Each
