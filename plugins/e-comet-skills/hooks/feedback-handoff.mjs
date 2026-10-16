@@ -591,6 +591,17 @@ const validateRemoteInput = (remoteInput) => {
     return { kind: remoteInput.kind, sizeBytes: remoteInput.size_bytes };
 };
 
+/** Read-only native recovery uses the same validated, retained state as the hooks. */
+export const readPreparedArtifact = async ({ env = process.env, sessionId, nowMs = Date.now() }) => {
+    validateSessionId(sessionId);
+    let entry;
+    try { entry = parsePreparedEntry(await readBoundedState(preparedPathForSession(resolveStoreDirectory(env), sessionId))); }
+    catch (error) { if (error?.code === 'ENOENT') return undefined; throw error; }
+    if (!isFreshEntry(entry, nowMs, STATE_RETENTION_MS)) return undefined;
+    return validatePreparedMetadata({ artifactId: entry.artifactId, kind: entry.kind, sizeBytes: entry.sizeBytes,
+        sha256: entry.sha256, transcriptIncluded: entry.transcriptIncluded });
+};
+
 export const stagePreparedArtifact = async ({
     dataDirectory,
     sessionId,

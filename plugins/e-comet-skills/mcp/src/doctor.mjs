@@ -3,7 +3,7 @@ import { realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { MCP_CONFIGURATION_FACTS, collectStaticFacts, diagnosticCheck } from './diagnostic-facts.mjs';
+import { collectStaticFacts, diagnosticCheck, MCP_CONFIGURATION_FACTS } from './diagnostic-facts.mjs';
 import { resolveStorageLayout } from './storage-layout.mjs';
 
 const sourceDirectory = dirname(fileURLToPath(import.meta.url));
@@ -22,11 +22,11 @@ const readJson = async (path) => {
     }
 };
 
-const fileCheck = async (paths, observedAt) => {
+const fileCheck = async (path, observedAt) => {
     try {
-        const valid = (await Promise.all(paths.map(path => stat(path)))).every(metadata => metadata.isFile());
-        return diagnosticCheck({ check: 'entrypoint', state: valid ? 'passed' : 'failed', observedAt,
-            source: 'filesystem_metadata', executionPlane: 'device', ...(valid ? {} : { cause: 'missing' }) });
+        const isFile = (await stat(path)).isFile();
+        return diagnosticCheck({ check: 'entrypoint', state: isFile ? 'passed' : 'failed', observedAt,
+            source: 'filesystem_metadata', executionPlane: 'device', ...(isFile ? {} : { cause: 'missing' }) });
     } catch (error) {
         return diagnosticCheck({ check: 'entrypoint', state: 'failed', observedAt, source: 'filesystem_metadata',
             executionPlane: 'device', cause: error?.code === 'ENOENT' ? 'missing' : 'io_error' });
@@ -44,17 +44,8 @@ const safeVersion = (value) => typeof value === 'string' && value.length <= 128 
 const validateMcpConfiguration = (observation) => {
     if (observation.state !== 'passed') return observation;
     const local = observation.value?.mcpServers?.['e-comet-local'];
-    return local?.type === 'stdio' && local.command === 'node' && Array.isArray(local.args)
-        && local.args.length === 1 && local.args[0] === 'mcp/src/server.mjs' && local.cwd === '.'
-        ? { state: 'passed', value: local } : { state: 'failed', cause: 'corrupt' };
-};
-
-const validateQwenMcpConfiguration = (observation) => {
-    if (observation.state !== 'passed') return observation;
-    const local = observation.value?.mcpServers?.['e-comet-local'];
-    return (local?.type === undefined || local.type === 'stdio') && local?.command === 'node'
-        && Array.isArray(local.args) && local.args.length === 1
-        && local.args[0] === '${extensionPath}/qwen/browser-job-proxy.mjs' && local.cwd === '${extensionPath}'
+    return local?.type === MCP_CONFIGURATION_FACTS.transport && local.command === MCP_CONFIGURATION_FACTS.command && Array.isArray(local.args)
+        && local.args.length === 1 && local.args[0] === MCP_CONFIGURATION_FACTS.entrypoint && local.cwd === MCP_CONFIGURATION_FACTS.cwd
         ? { state: 'passed', value: local } : { state: 'failed', cause: 'corrupt' };
 };
 
@@ -67,29 +58,12 @@ export const collectDoctorReport = async ({ env = process.env, platform = proces
     checks.push(diagnosticCheck({ check: 'package_layout', state: 'passed', observedAt, source: 'module_location',
         executionPlane: 'device', facts: { layout: installedLayout ? 'installed_plugin' : 'canonical_source' } }));
 
-    const entrypointPaths = [join(packageRoot, 'src', 'server.mjs')];
-    const qwenObservation = installedLayout ? await readJson(join(pluginRoot, 'qwen-extension.json')) : undefined;
-    const qwenLayout = installedLayout && qwenObservation.cause !== 'missing';
+    let entrypointPath = join(packageRoot, 'src', 'server.mjs');
     if (!installedLayout) {
         const validPackage = packageObservation.state === 'passed'
             && packageObservation.value?.name === '@e-comet/local-mcp' && safeVersion(packageObservation.value?.version);
         checks.push(metadataCheck('package_metadata', validPackage ? packageObservation : { state: 'failed', cause: packageObservation.cause ?? 'corrupt' },
             observedAt, validPackage ? { name: '@e-comet/local-mcp', version: packageObservation.value.version } : undefined));
-    } else if (qwenLayout) {
-        // This identifies the package format, not the caller's host or hook trust.
-        // A present but corrupt Qwen manifest must not fall back to another format.
-        const validQwen = qwenObservation.state === 'passed' && qwenObservation.value?.name === 'e-comet-skills'
-            && safeVersion(qwenObservation.value?.version);
-        checks.push(metadataCheck('qwen_manifest', validQwen ? qwenObservation : { state: 'failed', cause: qwenObservation.cause ?? 'corrupt' },
-            observedAt, validQwen ? { name: 'e-comet-skills', version: qwenObservation.value.version } : undefined));
-        const validPackage = packageObservation.state === 'passed'
-            && packageObservation.value?.name === '@e-comet/local-mcp' && safeVersion(packageObservation.value?.version);
-        checks.push(metadataCheck('package_metadata', validPackage ? packageObservation : { state: 'failed', cause: packageObservation.cause ?? 'corrupt' },
-            observedAt, validPackage ? { name: '@e-comet/local-mcp', version: packageObservation.value.version } : undefined));
-        const mcpObservation = validateQwenMcpConfiguration(qwenObservation);
-        checks.push(metadataCheck('mcp_configuration', mcpObservation, observedAt,
-            mcpObservation.state === 'passed' ? { ...MCP_CONFIGURATION_FACTS.qwen } : undefined));
-        entrypointPaths.push(join(pluginRoot, 'qwen', 'browser-job-proxy.mjs'));
     } else {
         const codexObservation = await readJson(join(pluginRoot, '.codex-plugin', 'plugin.json'));
         const validCodex = codexObservation.state === 'passed' && codexObservation.value?.name === 'e-comet-skills'
@@ -98,11 +72,11 @@ export const collectDoctorReport = async ({ env = process.env, platform = proces
             observedAt, validCodex ? { name: 'e-comet-skills', version: codexObservation.value.version } : undefined));
         const mcpObservation = validateMcpConfiguration(await readJson(join(pluginRoot, '.mcp.json')));
         checks.push(metadataCheck('mcp_configuration', mcpObservation, observedAt,
-            mcpObservation.state === 'passed' ? { ...MCP_CONFIGURATION_FACTS.plugin } : undefined));
-        if (mcpObservation.state === 'passed') entrypointPaths[0] = join(pluginRoot, mcpObservation.value.cwd, mcpObservation.value.args[0]);
+            mcpObservation.state === 'passed' ? MCP_CONFIGURATION_FACTS : undefined));
+        if (mcpObservation.state === 'passed') entrypointPath = join(pluginRoot, mcpObservation.value.cwd, mcpObservation.value.args[0]);
     }
 
-    checks.push(await fileCheck(entrypointPaths, observedAt));
+    checks.push(await fileCheck(entrypointPath, observedAt));
     return Object.freeze({ schemaVersion: 1, checks, limitations: Object.freeze({
         hostInstallation: 'not_checked', hostEnablement: 'not_checked', hookTrust: 'not_checked', otherExecutionPlanes: 'not_checked',
     }) });

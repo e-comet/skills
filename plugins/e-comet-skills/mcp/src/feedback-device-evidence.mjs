@@ -11,7 +11,6 @@ const INSTALLATION_SLOTS = Object.freeze({
     package_layout: 'packageLayout',
     package_metadata: 'packageMetadata',
     codex_manifest: 'codexManifest',
-    qwen_manifest: 'qwenManifest',
     mcp_configuration: 'mcpConfiguration',
     entrypoint: 'entrypoint',
 });

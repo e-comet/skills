@@ -1,0 +1,53 @@
+{
+  "name": "dsh-e-comet-skills",
+  "version": "2026.10.2",
+  "description": "Аналитика своих товаров, настройки рекламы, живые данные Wildberries и отчёты Ozon",
+  "icon": "./plugins/e-comet-skills/assets/logo.png",
+  "type": "module",
+  "main": "./deepseek/index.mjs",
+  "exports": {
+    ".": "./deepseek/index.mjs",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./client": "./deepseek/client.js"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/e-comet/skills.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "deepseek/",
+    "locale/",
+    "plugins/e-comet-skills/hooks/",
+    "plugins/e-comet-skills/mcp/",
+    "plugins/e-comet-skills/.codex-plugin/plugin.json",
+    "plugins/e-comet-skills/.mcp.json",
+    "plugins/e-comet-skills/assets/logo.png",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./deepseek/cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
+    }
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-subprocess": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-skill-filesystem": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-log-export": "^0.2.0-rc.2"
+  }
+}

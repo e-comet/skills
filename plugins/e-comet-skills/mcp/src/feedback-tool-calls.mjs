@@ -26,6 +26,8 @@ const OUTCOME_KEYS = new Set(['ok', 'status', 'code', 'stage', 'isError']);
 // not stall the single-threaded server while it looks for four small fields. Beyond this, only the
 // host's own error flag is kept.
 const OUTCOME_TEXT_MAX_LENGTH = 1_048_576;
+// Shared with the DeepSeek renderer: compact JSON follows this exact trailing delimiter.
+export const STRUCTURED_MCP_EVIDENCE_MARKER = '\nStructured MCP evidence: ';
 // functions.exec wraps the tool's own output behind a timing header; the tool output follows this marker.
 const EXEC_OUTPUT_MARKER = /\r?\nOutput:\r?\n/;
 
@@ -44,20 +46,28 @@ const E_COMET_TOOL_NAMES = new Set(tools.map((tool) => tool.name));
 // the suffix: `info`, `query_metrics` and `campaign_settings` are names another server may legitimately
 // publish, and a suffix match would hand it the channel the catalog restriction closes. Matching the
 // whole name is what lets every one of them be read without that risk. `report_issue` never reaches
-// here, being excluded as a feedback tool. The update hook and the `hooks.json` matcher carry the same set.
+// here, being excluded as a feedback tool. The update hook and the `hooks.json` matcher carry the same set. A method
+// the server publishes before our next release is missing from all three until then: accepted residual, see
+// docs/local-agent-architecture.md#accepted-residuals.
 export const REMOTE_E_COMET_TOOL_NAMES = Object.freeze([
     'browser_job', 'campaign_clusters_settings', 'campaign_settings', 'campaign_target_products_settings',
     'describe_metrics', 'info', 'list_entities', 'org_balance', 'query_forecast', 'query_metrics',
     'query_phrase_frequency',
+    'find_account', 'product_settings', 'stock_rebalancer_settings', 'stock_rebalancer_status',
+    'update_campaign_settings', 'update_campaign_clusters_settings', 'update_campaign_target_products_settings',
+    'update_product_settings', 'update_stock_rebalancer_settings',
 ]);
-const REMOTE_TOOL_NAME = new RegExp(`^mcp__[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}__(?:${REMOTE_E_COMET_TOOL_NAMES.join('|')})$`);
+const REMOTE_TOOL_NAME = new RegExp(`^mcp__(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|e-comet)__(?:${REMOTE_E_COMET_TOOL_NAMES.join('|')})$`);
 
 const toolSuffix = (name) => name.split('__').at(-1);
 
 const isFeedbackTool = (name) => FEEDBACK_TOOL_SUFFIXES.has(toolSuffix(name));
 
 const isECometTool = (name) => typeof name === 'string'
-    && (E_COMET_TOOL_NAMES.has(toolSuffix(name)) || REMOTE_TOOL_NAME.test(name));
+    && (E_COMET_TOOL_NAMES.has(toolSuffix(name)) || REMOTE_TOOL_NAME.test(name)
+        // The extractor still excludes feedback calls. The native bridge also uses
+        // this closed projection to keep a failed authorization's transport private.
+        || name === 'mcp__e-comet__report_issue');
 
 export const isFeedbackToolName = (value) =>
     typeof value === 'string' && value.length <= TOOL_NAME_MAX_LENGTH && TOOL_NAME.test(value);
@@ -190,38 +200,55 @@ const codexToolResult = (record, pending) => {
     if (outcome) call.outcome = outcome;
 };
 
-// Qwen 0.25 records direct Google Content parts, not Claude content blocks. Only
-// these observed top-level shapes are projected; system/managed records and nested
-// text are not searched. Raw consented history remains the original JSONL bytes.
-const qwenToolCalls = (record, pending) => {
-    if (record.type !== 'assistant' || !Array.isArray(record.message?.parts)) return [];
-    const calls = [];
-    for (const part of record.message.parts) {
-        const item = part?.functionCall;
-        if (!isObject(item) || !acceptedToolName(item.name)) continue;
-        const call = callRecord(item.name, record.timestamp);
-        if (typeof item.id === 'string') pending.set(item.id, call);
-        calls.push(call);
+// Native DSH session v4 logs use numeric milliseconds and exact top-level events. Do not
+// walk message payloads or parse authored arguments: only names and correlated outcomes leave here.
+// Prepared-receipt recovery has separate session/argument rules; retain independent pairing ownership:
+// docs/local-agent-architecture.md#accepted-residuals.
+const deepseekToolEvent = (record, pending) => {
+    if (!isObject(record.data)) return undefined;
+    const data = record.data;
+    const direct = record.type === 'tool/call';
+    const nested = record.type === 'tool/ptc-dispatch-start';
+    if (direct || nested) {
+        if (!acceptedToolName(data.name)) return undefined;
+        const timestamp = Number.isSafeInteger(record.time) && record.time >= 0 && record.time <= 253402300799999
+            ? new Date(record.time).toISOString() : undefined;
+        const call = callRecord(data.name, timestamp);
+        const id = direct ? data.callId : data.subCallId;
+        if (typeof id === 'string') pending.set(`deepseek:${direct ? 'direct' : 'ptc'}:${id}`, call);
+        return call;
     }
-    return calls;
-};
-
-const qwenToolResults = (record, pending) => {
-    if (record.type !== 'tool_result' || !Array.isArray(record.message?.parts)) return;
-    for (const part of record.message.parts) {
-        const item = part?.functionResponse;
-        if (!isObject(item) || typeof item.id !== 'string' || !isObject(item.response)) continue;
-        const call = pending.get(item.id);
-        if (!call || item.name !== call.name) continue;
-        pending.delete(item.id);
-        const outcome = projectFeedbackToolOutcome(item.response.output,
-            record.toolCallResult?.status === 'error' || Object.hasOwn(item.response, 'error'), call.name);
-        if (outcome) call.outcome = outcome;
-    }
+    const message = record.type === 'tool/result' && isObject(data.message) ? data.message : undefined;
+    const outcome = record.type === 'tool/ptc-dispatch' ? data : message;
+    if (!outcome) return undefined;
+    const id = message ? message.toolCallId : data.subCallId;
+    if (typeof id !== 'string') return undefined;
+    const key = `deepseek:${message ? 'direct' : 'ptc'}:${id}`;
+    const call = pending.get(key);
+    if (!call || (!message && data.name !== call.name)) return undefined;
+    pending.delete(key);
+    // DSH ToolRuntime prefixes thrown MCP failures with exactly "Error: ".
+    // Prefer our trailing compact evidence over the rendered summary/resource links.
+    // Bound the entire block before scanning, and never search prose for JSON fields.
+    const content = outcome.isError === true && Array.isArray(outcome.content)
+        ? outcome.content.map((block) => {
+            if (!isObject(block) || block.type !== 'text' || typeof block.text !== 'string'
+                || block.text.length > OUTCOME_TEXT_MAX_LENGTH || !block.text.startsWith('Error: ')) return block;
+            const marker = block.text.lastIndexOf(STRUCTURED_MCP_EVIDENCE_MARKER);
+            const text = marker < 0 ? block.text.slice(7)
+                : block.text.slice(marker + STRUCTURED_MCP_EVIDENCE_MARKER.length);
+            // Starting at the object prevents the generic exec-output wrapper parser
+            // from admitting prose before a malformed or forged evidence suffix.
+            return { ...block, text: text.startsWith('{') ? text : '' };
+        })
+        : outcome.content;
+    const projected = projectFeedbackToolOutcome(content, outcome.isError === true, call.name);
+    if (projected) call.outcome = projected;
+    return undefined;
 };
 
 /**
- * Extract tool calls in Claude, Codex and observed Qwen JSONL records: the safe direct name, the
+ * Extract tool calls in native Claude, Codex and DeepSeek JSONL records: the safe direct name, the
  * record timestamp when the host wrote one, and the closed outcome of the correlated result.
  * Payloads are never searched recursively because transcript content is untrusted diagnostic input.
  *
@@ -245,8 +272,8 @@ export const extractFeedbackToolCalls = (jsonlBytes) => {
         const codexCall = codexToolCall(record, pending);
         if (codexCall !== undefined) calls.push(codexCall);
         codexToolResult(record, pending);
-        calls.push(...qwenToolCalls(record, pending));
-        qwenToolResults(record, pending);
+        const deepseekCall = deepseekToolEvent(record, pending);
+        if (deepseekCall) calls.push(deepseekCall);
     }
     return calls;
 };

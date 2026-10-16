@@ -8,16 +8,16 @@ import { retryTransientFileOperation } from './transient-file-operation.mjs';
 import { withHookDiagnostic } from './hook-diagnostics.mjs';
 
 const MAX_HOOK_EVENT_BYTES = 1024 * 1024;
-const MAX_SESSION_ID_BYTES = 512;
+export const MAX_SESSION_ID_BYTES = 512;
 const MAX_TRIGGER_URL_BYTES = 131072;
-const HANDOFF_TTL_MS = 90_000;
+export const HANDOFF_TTL_MS = 90_000;
 const CLOCK_SKEW_MS = 5_000;
 const STORE_DIRECTORY = 'browser-job-handoff-v1';
 const CLAIM_MARKER_SUFFIX = '.claimed';
 const REMOTE_BROWSER_JOB_TOOL = /^mcp__.+__browser_job$/;
 const LOCAL_BROWSER_TOOL =
     /^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:wb_product_card|wb_search_by_query|wb_check_by_query|wb_recommendations_by_product|wb_seller_reviews|ozon_seller_promotion_report|ozon_seller_promotion_reports|ozon_seller_analytics_report)$/;
-const LOCAL_TOOL_BY_BROWSER_JOB_TYPE = Object.freeze({
+export const LOCAL_TOOL_BY_BROWSER_JOB_TYPE = Object.freeze({
     product_card: 'wb_product_card',
     search_by_query: 'wb_search_by_query',
     check_by_query: 'wb_check_by_query',
@@ -120,7 +120,7 @@ const parseStoredEntry = (text, { requireTarget = false } = {}) => {
     return entry;
 };
 
-const isEntryFresh = (entry, nowMs) =>
+export const isEntryFresh = (entry, nowMs) =>
     entry.createdAtMs <= nowMs + CLOCK_SKEW_MS && nowMs - entry.createdAtMs <= HANDOFF_TTL_MS;
 
 const ensurePrivateStoreDirectory = async (dataDirectory) => {

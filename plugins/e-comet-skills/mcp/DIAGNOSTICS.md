@@ -81,18 +81,16 @@ configuration but performs no write, listener, pairing, retention, extension, au
 Doctor checks use the shared check fields and state/cause vocabularies above. `runtime` describes the executing Node
 process. `storage` reports the same configuration-only target facts described above. `package_layout.facts.layout` is
 `canonical_source` or `installed_plugin`; it describes where the running file resides and is not proof of host
-installation. `package_metadata.facts.name` and `.version` validate the MCP package. Installed Claude/Codex layout
+installation. `package_metadata.facts.name` and `.version` validate the canonical npm package. Installed layout instead
 uses `codex_manifest.facts.name` and `.version`, plus `mcp_configuration.facts.transport`, `.command`, `.cwd`, and `.entrypoint`.
-A native Qwen package instead validates `qwen-extension.json` as `qwen_manifest` and requires its bundled MCP package
-metadata. A present invalid Qwen manifest is reported as invalid rather than falling back to Codex checks.
-`entrypoint` checks only that the referenced launch files exist and never imports them. For Qwen it checks both the
-local proxy and the underlying MCP server. Metadata and entrypoint failures use
+`entrypoint` checks only that the referenced server file exists and never imports it. Metadata and entrypoint failures use
 the closed causes `missing`, `corrupt`, or `io_error`. Versions must use the bounded Node/npm release-version grammar;
-malformed values make their metadata check corrupt and are never copied to output. The installed command is valid only
-with the packaged `cwd:"."` and relative `mcp/src/server.mjs` entrypoint in Claude/Codex layout. Qwen configuration uses
-`cwd:"${extensionPath}"` and `${extensionPath}/qwen/browser-job-proxy.mjs`; emitted facts retain these fixed relative
-configuration values, never an installed absolute path. Package format is not proof of the calling host, authorization,
-hook enablement or hook execution.
+malformed values make their metadata check corrupt and are never copied to output. The packaged `.mcp.json` check
+requires `command:"node"`, `cwd:"."`, and the relative `mcp/src/server.mjs` entrypoint; these are file metadata,
+not observations of the calling host's actual command, arguments, or working directory. The DeepSeek npm bundle
+contains the same metadata, but its adapter independently launches the shared server with the host executable,
+`ELECTRON_RUN_AS_NODE`, and the handoff data directory as its working directory. Package format is not proof of the
+calling host, authorization, hook enablement, or hook execution.
 
 The doctor fact shapes are exact: `package_layout.facts.layout` is derived from the running doctor's location;
 `package_metadata.facts.name` and `.version` come from canonical npm metadata; `codex_manifest.facts.name` and
@@ -111,8 +109,10 @@ agent's host context and is not accepted through ordinary process environment or
 `safe_probes`). `operationHandle` is required only for `last_operation`. `probes` is an allowlisted array containing
 `storage_write`, `extension_snapshot`, `hook_permissions`, `extension_install`, and/or `codex_mcp_auth`; a probe runs only in `safe_probes` and only in its applicable scope.
 The response fields are `schemaVersion:1`, the echoed `scope` and `mode`, `checks: DiagnosticCheck[]`, and optional
-`operation`. Passive installation checks are the in-process doctor checks above. Passive runtime checks are the current
-status collectors; neither path starts lifecycle work. Missing or stale operation handles produce an
+`operation`. Passive installation checks are the in-process doctor checks above, with the same package-metadata and
+host-observation limitations even though this response does not repeat the doctor's `limitations` object. They do not
+establish the calling host's launch configuration. Passive runtime checks are the current status collectors; neither
+path starts lifecycle work. Missing or stale operation handles produce an
 `operation_receipt` check in state `unknown` and never substitute the latest operation.
 
 The installation `storage_write` probe operates separately on each configured target. Its `facts.target` names the
@@ -275,14 +275,14 @@ and `retryAt` times; and `browserContext.changedAt`. Runtime retains only the bo
 fields; listener retains only `bind_listener`, its closed state, and an allowlisted system code; route freshness retains
 only a valid observed timestamp; storage retains only path-free configuration targets. The client check retains the
 bounded name and version the host sent in MCP initialize with `client_reported` provenance: it names the Claude or
-Codex runtime, not a trusted host identity. The report's `## Host` section repeats it next to the preparation `route`,
+Codex runtime, or the DeepSeek adapter (`e-comet-deepseek-harness`, with the plugin package version, not the DeepSeek
+application version). This is not a trusted host identity. The report's `## Host` section repeats it next to the preparation `route`,
 `native` for the device dispatcher and `cloud` for the Cowork hook, which is what tells a Cowork archive from a Claude
 Code archive prepared on the same device.
 
 Preparation additionally collects, in parallel, one read-only `extension_snapshot`, recorded as `not_checked` with
-cause `unavailable` without any request when no extension route is connected; the passive installation checks the
-package format produces (`package_layout`, `package_metadata`, `codex_manifest` or `qwen_manifest`, `mcp_configuration`,
-and `entrypoint`); the `extension_install`
+cause `unavailable` without any request when no extension route is connected; the passive installation checks
+`package_layout`, `package_metadata` or `codex_manifest`, `mcp_configuration`, and `entrypoint`; the `extension_install`
 probe; and, only when the client name identifies Codex, the `hook_permissions` probe. Every probe is abandoned at the
 same five-second evidence deadline instead of the business deadline, so a stalled read or inspector can cost seconds
 but never the report; an abandoned snapshot request is the `unknown` observation with cause `unavailable` above. Each
@@ -309,4 +309,8 @@ Codex; prose is never parsed, so a hook denial recorded as text carries no outco
 MiB is skipped rather than parsed, so a result that carries no smaller JSON block contributes only the host flag. A
 call whose result carried no closed field renders `outcome unknown` rather than a line that reads like success. Codex calls are the `response_item` records of the rollout correlated by call id. When
 more calls exist, one line states how many earlier calls are omitted, and a partially read session says so before the
-list.
+list. DeepSeek native direct and programmatic tool events are correlated by their respective call IDs. For native
+errors, the extractor removes the exact `Error: ` wrapper and prefers the bridge's trailing
+`Structured MCP evidence: ` JSON object over rendered summaries and resource links. It bounds the whole text block
+before locating that delimiter and applies the same whole-object parsing and closed-field rules; malformed evidence
+contributes only the host error flag. Claude and Codex parsing is unchanged.

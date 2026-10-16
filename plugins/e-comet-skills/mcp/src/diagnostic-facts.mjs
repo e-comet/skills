@@ -1,17 +1,11 @@
 export const DIAGNOSTIC_STATES = Object.freeze(['passed', 'failed', 'unknown', 'not_checked', 'unsupported']);
+export const MCP_CONFIGURATION_FACTS = Object.freeze({ transport: 'stdio', command: 'node', cwd: '.', entrypoint: 'mcp/src/server.mjs' });
 export const DIAGNOSTIC_CAUSES = Object.freeze(['permission_denied', 'insecure_permissions', 'missing', 'directory_absent', 'corrupt', 'unsupported', 'io_error', 'address_in_use', 'listen_failed', 'unavailable', 'unknown']);
 
 const safeText = (value) => typeof value === 'string' && value.length > 0 && value.length <= 128 && !/[\u0000-\u001f\u007f]/u.test(value);
 
 export const sanitizeClientInfo = (value) => value && safeText(value.name) && safeText(value.version)
     ? Object.freeze({ name: value.name, version: value.version }) : null;
-
-// The fixed launch facts the doctor reports for each installed package format's `mcp_configuration`; the
-// feedback projection admits exactly these and nothing else.
-export const MCP_CONFIGURATION_FACTS = Object.freeze({
-    plugin: Object.freeze({ transport: 'stdio', command: 'node', cwd: '.', entrypoint: 'mcp/src/server.mjs' }),
-    qwen: Object.freeze({ transport: 'stdio', command: 'node', cwd: '${extensionPath}', entrypoint: 'qwen/browser-job-proxy.mjs' }),
-});
 
 export const diagnosticCheck = (/** @type {any} */ input) => {
     const { check, state, observedAt, source, executionPlane, facts, cause, evidenceRefs, nextCheck } = input;
