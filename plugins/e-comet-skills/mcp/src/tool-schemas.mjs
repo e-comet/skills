@@ -20,10 +20,18 @@ import {
     OZON_ANALYTICS_TERMINAL_CODE_STAGES,
     OZON_PROMOTION_CAPABILITY,
     OZON_PROMOTION_MIN_EXTENSION_VERSION,
+    OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES,
 } from './extension-vocabulary.mjs';
 import { OZON_EXTENSION_OUTDATED_REASON, OZON_PROMOTION_TERMINAL_CODE_STAGES } from './tool-errors.mjs';
 import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
 import { OZON_PACKAGE_STOP_REASONS } from './ozon-report-package-result.mjs';
+import {
+    MAX_OZON_SEARCH_POSITIONS_SKUS,
+    MAX_OZON_SEARCH_POSITIONS_TEXT_LENGTH,
+    OZON_SEARCH_POSITIONS_DEFAULT_REGION,
+    OZON_SEARCH_POSITIONS_PLATFORMS,
+} from './ozon-search-positions-domain.mjs';
+import { OZON_SEARCH_POSITIONS_STOP_REASONS } from './ozon-search-positions-job.mjs';
 import { DIAGNOSTIC_STATES, extensionInstallFactsSchema, hookPermissionsFactsSchema } from './diagnostic-facts.mjs';
 // The producers validate their facts against these; the feedback projection reads the same objects.
 export { extensionInstallFactsSchema, hookPermissionsFactsSchema };
@@ -453,7 +461,7 @@ const diagnosticBase = (check, facts, causes = ['unknown']) => object({
 const bridgeDiagnosticsSchema = object({
     snapshot: described(diagnosticBase('snapshot'), 'Timestamped production of the status snapshot; it is not a product-health verdict.'),
     runtime: described(diagnosticBase('runtime', object({ nodeVersion: described(string, 'Version of the Node.js process executing this MCP server.'), platform: described(string, 'Node.js platform identifier for the process executing this MCP server.'), arch: described(string, 'Node.js architecture identifier for the process executing this MCP server.'), bridgeVersion: described(string, 'Version of the local bridge build executing this check.'), mcpProtocolVersion: described(string, 'MCP protocol version negotiated with the current client; omitted when unavailable.') }, ['nodeVersion', 'platform', 'arch', 'bridgeVersion'])), 'Facts about the Node.js process running this MCP server.'),
-    client: described(diagnosticBase('client', object({ name: described(string, 'Bounded client name supplied in MCP initialize metadata.'), version: described(string, 'Bounded client version supplied in MCP initialize metadata.'), provenance: described({ const: 'client_reported' }, 'Marks these values as client-reported rather than trusted host identity.') }, ['name', 'version', 'provenance'])), 'Sanitized MCP initialize metadata; it does not prove host identity or hook support.'),
+    client: described(diagnosticBase('client', object({ name: described(string, 'Bounded client name supplied in MCP initialize metadata.'), version: described(string, 'Bounded client version supplied in MCP initialize metadata.'), provenance: described({ const: 'client_reported' }, 'Marks these values as client-reported rather than trusted host identity.'), hostRuntimeVersion: described(string, 'DeepSeek Harness runtime version the native adapter resolved its peers against; present only under that adapter.') }, ['name', 'version', 'provenance'])), 'Sanitized MCP initialize metadata; it does not prove host identity or hook support.'),
     listener: described(diagnosticBase('listener', object({ operation: described({ const: 'bind_listener' }, 'Names the already-observed listener bind operation; status does not retry it.'), listenerState: described({ type: 'string', enum: ['pending', 'listening', 'address_in_use', 'failed'] }, 'Last listener bind event observed by the bridge, not current port ownership.'), systemCode: described({ type: 'string', enum: ['EACCES', 'EPERM', 'EADDRINUSE', 'EADDRNOTAVAIL', 'EAFNOSUPPORT', 'EINVAL'] }, 'Allowlisted operating-system code from the bind observation; omitted when unavailable.') }, ['operation', 'listenerState']), ['address_in_use', 'listen_failed', 'unknown']), 'Existing listener-bind observation; a healthy secondary can report address_in_use as passed.'),
     pairingSource: described(diagnosticBase('pairing_source', undefined, ['permission_denied', 'insecure_permissions', 'missing', 'corrupt', 'unsupported', 'io_error']), 'Safe pairing-source classification with no token, path, owner, or raw exception.'),
     routeFreshness: described(diagnosticBase('route_freshness', object({ lastObservedAt: described(string, 'Timestamp of an actually observed route response; omitted when no producer supplies one.') }, ['lastObservedAt'])), 'Freshness of a real extension-route observation, never inferred from browser-context changes.'),
@@ -477,6 +485,7 @@ const bridgeStatusSchema = described(object({
         ozonSellerPromotionReportSupported: described(boolean, 'Capability reported for a single Ozon promotion report; omission means unobserved.'),
         ozonSellerPromotionReportsSupported: described(boolean, 'Capability reported for packaged Ozon promotion reports; omission means unobserved.'),
         ozonSellerAnalyticsReportSupported: described(boolean, 'Capability reported for an Ozon analytics report; omission means unobserved.'),
+        ozonSearchPositionsSupported: described(boolean, 'Capability reported for Ozon search positions; omission means unobserved.'),
     }, ['state', 'route']), 'Effective browser-extension observation from a direct or authenticated-peer route.'),
     peer: described(object({
         bridgeVersion: described(string, 'Bridge version reported by the authenticated primary peer.'),
@@ -500,6 +509,7 @@ const bridgeStatusSchema = described(object({
     ozonSellerPromotionReportSupported: described(boolean, 'Legacy copy of the single-promotion-report capability; omission means unobserved.'),
     ozonSellerPromotionReportsSupported: described(boolean, 'Legacy copy of the packaged-promotion-reports capability; omission means unobserved.'),
     ozonSellerAnalyticsReportSupported: described(boolean, 'Legacy copy of the analytics-report capability; omission means unobserved.'),
+    ozonSearchPositionsSupported: described(boolean, 'Legacy copy of the search-positions capability; omission means unobserved.'),
     peerRejection: described(peerRejectionSchema, 'Current continuous peer-rejection streak; omitted when none is active.'),
     bridgeVersion: described(string, 'Version of the local bridge build producing this status.'),
     bridgeGeneration: described(positiveInteger, 'Compatibility generation used for coordinated bridge replacement.'),
@@ -752,24 +762,6 @@ const packageResultSchema = (jobType, propertyName, itemSchemas) => {
         ],
     };
     const failedItems = array(itemSchemas.incomplete, { minItems: 1, maxItems: MAX_OZON_REPORT_PACKAGE_ITEMS });
-    const preflightFailure = object(
-        {
-            ok: { const: false },
-            status: { const: 'failed' },
-            jobType: { const: jobType },
-            stopReason: { type: 'null' },
-            error: object(
-                {
-                    code: { const: 'PREFLIGHT_FAILED' },
-                    message: { type: 'string', minLength: 1, maxLength: 500 },
-                    stage: { const: 'preflight' },
-                    retryable: { const: false },
-                },
-                ['code', 'message', 'stage', 'retryable']
-            ),
-        },
-        ['ok', 'status', 'jobType', 'error', 'stopReason']
-    );
     return objectUnion(
         result(true, 'complete', completeItems),
         result(true, 'partial', { ...partialItems, items: objectUnion(itemSchemas.complete, itemSchemas.failed) }),
@@ -777,9 +769,82 @@ const packageResultSchema = (jobType, propertyName, itemSchemas) => {
         result(false, 'failed', { ...failedItems, items: itemSchemas.failed }),
         result(false, 'failed', { ...failedItems, allOf: [{ contains: itemSchemas.skipped }, { contains: itemSchemas.failed }] }, true),
         result(false, 'failed', array(itemSchemas.skipped, { minItems: 1, maxItems: MAX_OZON_REPORT_PACKAGE_ITEMS }), true, true),
-        preflightFailure
+        preflightFailureSchema(jobType)
     );
 };
+
+// Invalid arguments are never echoed: the failure names only the broken rule.
+const preflightFailureSchema = (jobType) => object(
+    {
+        ok: { const: false },
+        status: { const: 'failed' },
+        jobType: { const: jobType },
+        stopReason: { type: 'null' },
+        error: object(
+            {
+                code: { const: 'PREFLIGHT_FAILED' },
+                message: { type: 'string', minLength: 1, maxLength: 500 },
+                stage: { const: 'preflight' },
+                retryable: { const: false },
+            },
+            ['code', 'message', 'stage', 'retryable']
+        ),
+    },
+    ['ok', 'status', 'jobType', 'error', 'stopReason']
+);
+
+const searchPositionsText = { type: 'string', minLength: 1, maxLength: MAX_OZON_SEARCH_POSITIONS_TEXT_LENGTH };
+// Query rows follow the signed order; a complete row has one cell per top-level SKU, an empty row none.
+const searchPositionsResultSchema = (() => {
+    const details = {
+        OZON_REGION_UNAVAILABLE: object({ candidates: array(searchPositionsText, { minItems: 1, maxItems: 5 }) }, ['candidates']),
+        OZON_SKU_LIMIT_EXCEEDED: object({ limit: positiveInteger }, ['limit']),
+        OZON_AUTHORIZATION_REJECTED: browserJobRejectionDetailsSchema,
+    };
+    const error = objectUnion(...Object.entries({ ...OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES, OZON_EXECUTION_INTERRUPTED: 'execution' })
+        .map(([code, stage]) => object({
+            code: { const: code },
+            message: { type: 'string', minLength: 1, maxLength: 500 },
+            stage: { const: stage },
+            retryable: { const: false },
+            ...(Object.hasOwn(details, code) ? { details: details[code] } : {}),
+        }, ['code', 'message', 'stage', 'retryable'])));
+    const row = (status, properties = {}) => object(
+        { itemIndex: { type: 'integer', minimum: 0, maximum: MAX_OZON_REPORT_PACKAGE_ITEMS - 1 }, query: searchPositionsText, status: { const: status }, ...properties },
+        ['itemIndex', 'query', 'status', ...Object.keys(properties)]
+    );
+    const checkedAt = { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$' };
+    const cell = { oneOf: [positiveInteger, { type: 'string', minLength: 1, maxLength: 32 }] };
+    const complete = row('complete', { checkedAt, positions: array(cell, { minItems: 1, maxItems: MAX_OZON_SEARCH_POSITIONS_SKUS }) });
+    const empty = row('empty', { checkedAt, positions: array(cell, { maxItems: 0 }) });
+    const failed = row('failed', { error });
+    const skipped = row('skipped');
+    const answered = objectUnion(complete, empty);
+    const rows = (items, extra = {}) => ({ ...array(items, { minItems: 1, maxItems: MAX_OZON_REPORT_PACKAGE_ITEMS }), ...extra });
+    const table = (ok, statusValue, queries, stopped) => object(
+        {
+            ok: { const: ok },
+            status: { const: statusValue },
+            jobType: { const: 'ozon_search_positions' },
+            marketplace: { const: 'ozon' },
+            region: searchPositionsText,
+            platform: { type: 'string', enum: [...OZON_SEARCH_POSITIONS_PLATFORMS] },
+            skus: array(positiveInteger, { minItems: 1, maxItems: MAX_OZON_SEARCH_POSITIONS_SKUS, uniqueItems: true }),
+            queries,
+            stopReason: stopped ? { type: 'string', enum: [...OZON_SEARCH_POSITIONS_STOP_REASONS] } : { type: 'null' },
+            ...(stopped ? { error } : {}),
+        },
+        ['ok', 'status', 'jobType', 'marketplace', 'region', 'platform', 'skus', 'queries', 'stopReason', ...(stopped ? ['error'] : [])]
+    );
+    return objectUnion(
+        table(true, 'complete', rows(answered), false),
+        table(true, 'partial', rows(objectUnion(complete, empty, failed), { allOf: [{ contains: answered }, { contains: failed }] }), false),
+        table(true, 'partial', rows(objectUnion(complete, empty, failed, skipped), { allOf: [{ contains: answered }, { contains: skipped }] }), true),
+        table(false, 'failed', rows(failed), false),
+        table(false, 'failed', rows(objectUnion(failed, skipped), { contains: skipped }), true),
+        preflightFailureSchema('ozon_search_positions')
+    );
+})();
 
 const projectionProperties = (limitName, scope) => ({
     [limitName]: {
@@ -998,6 +1063,21 @@ export const toolInputSchemas = {
         },
         ['reports']
     ),
+    // The canonicalizer checks trimming, uniqueness after trimming and the 128-character bound, as the signer does.
+    ozon_search_positions: object(
+        {
+            queries: described(array({ type: 'string', minLength: 1 }, { minItems: 1, maxItems: MAX_OZON_REPORT_PACKAGE_ITEMS }),
+                `Search queries in execution order, identical to the signed job: 1-${MAX_OZON_SEARCH_POSITIONS_TEXT_LENGTH} characters after trimming, unique.`),
+            skus: described(array(positiveInteger, { minItems: 1, maxItems: MAX_OZON_SEARCH_POSITIONS_SKUS, uniqueItems: true }),
+                'Ozon SKUs (own or competitors\') in result column order, identical to the signed job.'),
+            region: described({ type: 'string', minLength: 1, default: OZON_SEARCH_POSITIONS_DEFAULT_REGION },
+                'City or area name as Ozon lists it, identical to the signed job; never a word taken from a query.'),
+            platform: described({ type: 'string', enum: [...OZON_SEARCH_POSITIONS_PLATFORMS], default: 'ozon' },
+                'ozon is the main storefront; select is Ozon Select (brand storefront). Identical to the signed job.'),
+            triggerUrl: ozonTriggerUrlProperty,
+        },
+        ['queries', 'skus']
+    ),
     wb_product_images: object(
         {
             nmIds: {
@@ -1049,6 +1129,7 @@ export const toolOutputSchemas = {
         'reports',
         analyticsPackageItems
     )),
+    ozon_search_positions: withOperationDiagnostic(searchPositionsResultSchema),
 };
 
 export const schemaContractTerms = (schema = bridgeStatusSchema) => {

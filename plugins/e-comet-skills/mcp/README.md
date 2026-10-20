@@ -78,16 +78,20 @@ Local tools:
   authorization and one local call;
 - `ozon_seller_analytics_report` — exports 1–50 ordered general-analytics XLSX files through one `browser_job`
   authorization and one local call; the connected extension must advertise the analytics capability;
+- `ozon_search_positions` — returns the Ozon search places of 1–10 SKUs for 1–50 ordered queries as one inline JSON
+  table through one `browser_job` authorization and one local call; the connected extension must advertise the search
+  positions capability;
 - `local_bridge_status` — reports whether the extension is connected, and why the bridge cannot reach a primary
   peer when it cannot;
 - `wb_product_images` — public WB image-CDN lookup; this tool does not require the extension.
 
 ## Workflow contract lookup
 
-The short `tools/list` catalog routes by intent; `describe_e_comet_tool({name})` returns the full current contract for exactly these eight signed local tools:
+The short `tools/list` catalog routes by intent; `describe_e_comet_tool({name})` returns the full current contract for exactly these nine signed local tools:
 
 - `wb_product_card`, `wb_search_by_query`, `wb_check_by_query`, `wb_recommendations_by_product`, `wb_seller_reviews`;
-- `ozon_seller_promotion_report`, `ozon_seller_promotion_reports`, `ozon_seller_analytics_report`.
+- `ozon_seller_promotion_report`, `ozon_seller_promotion_reports`, `ozon_seller_analytics_report`,
+  `ozon_search_positions`.
 
 The same lookup also supports `prepare_e_comet_feedback` and `submit_e_comet_feedback`, which share one feedback contract. Successful `tools/call` output has `schemaVersion:1`, `type:"e_comet_tool_contract"`, `requestedTool` equal to the requested name, `appliesTo:["browser_job",name]` for a signed tool (or `["prepare_e_comet_feedback","report_issue","submit_e_comet_feedback"]` for either feedback name), and a nonempty `contract` string. The JSON text content mirrors `structuredContent`. The lookup is read-only: it does not start or contact the bridge, extension, signer, or marketplace, and needs no feedback consent for a signed tool. An unsupported name or failed lookup stops that tool's workflow before authorization; do not infer authorization from a catalog description alone.
 
@@ -112,10 +116,14 @@ not pass through e-Comet backend services.
 
 The plural promotion signer accepts exactly `periods:[{dateFrom,dateTo},...]`; the analytics signer accepts exactly
 `reports:[{dateFrom,dateTo,breakdown},...]`. Each signs one descriptor containing the complete caller-ordered array.
-Promotion and analytics are separate variants and are never mixed. Package streams and ACKs carry an item index under
+Promotion, analytics and search positions are separate variants and are never mixed. Package streams and ACKs carry an item index under
 one shared Ozon report owner and correlation. The create phase is never automatically retried after dispatch ambiguity.
 Completed artifacts remain available when later items fail, and a partial response lists every complete, failed, and
 skipped item.
+
+The search positions signer accepts exactly `queries`, `skus` and optional `region` and `platform`, and signs one
+descriptor with both defaults filled in. Each query is one package item with one terminal result: there is no create,
+stream or workbook, and a query is never automatically re-checked.
 
 `wb_seller_reviews` accepts the signed mixed export descriptor, expands an omitted `isAnswered` into separate answered and
 unanswered physical reports, and preserves successful work when another export fails. It returns compact status metadata plus
@@ -124,7 +132,7 @@ context; opening or summarizing a workbook is a separate explicit action. Artifa
 workbook is limited to 100 MiB and each job to 500 MiB; a completed workbook is never evicted by another export and is
 removed only once its retention has elapsed.
 
-Ozon tools likewise return the original XLSX workbooks as private `resource_link` entries rooted in the launching
+Ozon report tools likewise return the original XLSX workbooks as private `resource_link` entries rooted in the launching
 host's plugin data. The plugin does not add a workbook reader or converter; the originating agent may use its normal
 file and spreadsheet capabilities when the user asks to inspect a workbook. Files of older releases are left where
 they are; new payloads never fall back there.

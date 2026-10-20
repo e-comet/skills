@@ -7,6 +7,10 @@ const safeText = (value) => typeof value === 'string' && value.length > 0 && val
 export const sanitizeClientInfo = (value) => value && safeText(value.name) && safeText(value.version)
     ? Object.freeze({ name: value.name, version: value.version }) : null;
 
+// The DeepSeek Harness runtime version the native adapter passes to the local module: one bounded version grammar
+// shared by the adapter that reads it from the resolved peer manifest and the server that admits it into facts.
+export const isHostRuntimeVersion = (value) => typeof value === 'string' && /^[0-9A-Za-z.+-]{1,64}$/.test(value);
+
 export const diagnosticCheck = (/** @type {any} */ input) => {
     const { check, state, observedAt, source, executionPlane, facts, cause, evidenceRefs, nextCheck } = input;
     if (!DIAGNOSTIC_STATES.includes(state)) throw new TypeError(`Unrecognized diagnostic state: ${state}`);

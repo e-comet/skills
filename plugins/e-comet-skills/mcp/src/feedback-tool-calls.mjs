@@ -13,17 +13,19 @@ const FEEDBACK_TOOL_SUFFIXES = new Set([
     'report_issue',
     'submit_e_comet_feedback',
 ]);
-// A result is read only for its closed outcome fields, never copied: `ok`, `status`, and a `code` and
-// `stage` either at the top level of a failure envelope or nested under `error`, all in these identifier
-// grammars; any other value stays out, and prose is never parsed. The grammars describe our own
+// A result is read only for its closed outcome fields, never copied: `ok`, `status`, and a `code`,
+// `stage` and `cause` either at the top level of a failure envelope or nested under `error`, all in these
+// identifier grammars; any other value stays out, and prose is never parsed. The grammars describe our own
 // envelopes, so only our own tools are read for them. Another server's result can still say the call
 // failed through `ok` and the host's own flag, but a value this server never defined is not ours to put
 // in a support archive.
 const OUTCOME_LOWER = /^[a-z][a-z_]{1,31}$/;
+// The native cause classes include `http_4xx` and `http_5xx`, so the cause grammar admits digits.
+const OUTCOME_CAUSE = /^[a-z][a-z0-9_]{1,31}$/;
 const OUTCOME_CODE = /^[A-Z][A-Z0-9_]{2,63}$/;
-const OUTCOME_KEYS = new Set(['ok', 'status', 'code', 'stage', 'isError']);
+const OUTCOME_KEYS = new Set(['ok', 'status', 'code', 'stage', 'cause', 'isError']);
 // Bounded parse of one result text: a marketplace result can be large, and one absurd tool output must
-// not stall the single-threaded server while it looks for four small fields. Beyond this, only the
+// not stall the single-threaded server while it looks for five small fields. Beyond this, only the
 // host's own error flag is kept.
 const OUTCOME_TEXT_MAX_LENGTH = 1_048_576;
 // Shared with the DeepSeek renderer: compact JSON follows this exact trailing delimiter.
@@ -52,7 +54,7 @@ const E_COMET_TOOL_NAMES = new Set(tools.map((tool) => tool.name));
 export const REMOTE_E_COMET_TOOL_NAMES = Object.freeze([
     'browser_job', 'campaign_clusters_settings', 'campaign_settings', 'campaign_target_products_settings',
     'describe_metrics', 'info', 'list_entities', 'org_balance', 'query_forecast', 'query_metrics',
-    'query_phrase_frequency',
+    'query_phrase_frequency', 'search_phrases',
     'find_account', 'product_settings', 'stock_rebalancer_settings', 'stock_rebalancer_status',
     'update_campaign_settings', 'update_campaign_clusters_settings', 'update_campaign_target_products_settings',
     'update_product_settings', 'update_stock_rebalancer_settings',
@@ -83,6 +85,7 @@ export const isFeedbackToolOutcome = (value) => {
         && (value.status === undefined || (typeof value.status === 'string' && OUTCOME_LOWER.test(value.status)))
         && (value.code === undefined || (typeof value.code === 'string' && OUTCOME_CODE.test(value.code)))
         && (value.stage === undefined || (typeof value.stage === 'string' && OUTCOME_LOWER.test(value.stage)))
+        && (value.cause === undefined || (typeof value.cause === 'string' && OUTCOME_CAUSE.test(value.cause)))
         && (value.isError === undefined || value.isError === true);
 };
 
@@ -127,7 +130,7 @@ const closedField = (candidate, grammar) => (typeof candidate === 'string' && gr
 /**
  * Projects one tool result onto its closed outcome fields. The first text that parses as a JSON
  * object supplies them; free text, foreign shapes and out-of-grammar values contribute nothing.
- * `status`, `code` and `stage` are read only when the call names an e-Comet tool, local or remote; any
+ * `status`, `code`, `stage` and `cause` are read only when the call names an e-Comet tool, local or remote; any
  * other tool contributes `ok` and the host's error flag, which cannot carry a value we did not define.
  */
 export const projectFeedbackToolOutcome = (content, isError = false, toolName = undefined) => {
@@ -146,6 +149,9 @@ export const projectFeedbackToolOutcome = (content, isError = false, toolName = 
             if (code) outcome.code = code;
             const stage = closedField(value.stage, OUTCOME_LOWER) ?? closedField(error?.stage, OUTCOME_LOWER);
             if (stage) outcome.stage = stage;
+            // The native DeepSeek adapter classifies a failed call (network, timeout, http_4xx, http_5xx, protocol, unknown).
+            const cause = closedField(value.cause, OUTCOME_CAUSE) ?? closedField(error?.cause, OUTCOME_CAUSE);
+            if (cause) outcome.cause = cause;
         }
         if (envelopeError) outcome.isError = true;
         break;
@@ -253,7 +259,7 @@ const deepseekToolEvent = (record, pending) => {
  * Payloads are never searched recursively because transcript content is untrusted diagnostic input.
  *
  * @param {Buffer} jsonlBytes
- * @returns {Array<{ name: string, at?: string, outcome?: { ok?: boolean, status?: string, code?: string, stage?: string, isError?: true } }>}
+ * @returns {Array<{ name: string, at?: string, outcome?: { ok?: boolean, status?: string, code?: string, stage?: string, cause?: string, isError?: true } }>}
  */
 export const extractFeedbackToolCalls = (jsonlBytes) => {
     if (!Buffer.isBuffer(jsonlBytes)) return [];

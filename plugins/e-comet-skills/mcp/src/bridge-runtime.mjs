@@ -768,6 +768,9 @@ export const createBridgeRuntime = ({
             ...(connections.effectiveOzonAnalyticsSupportKnown
                 ? { ozonSellerAnalyticsReportSupported: connections.effectiveOzonAnalyticsReady === true }
                 : {}),
+            ...(connections.effectiveOzonSearchPositionsSupportKnown
+                ? { ozonSearchPositionsSupported: connections.effectiveOzonSearchPositionsReady === true }
+                : {}),
             ...(connections.peerReady && connections.authenticatedPrimaryMetadata
                 ? { peer: connections.authenticatedPrimaryMetadata }
                 : {}),

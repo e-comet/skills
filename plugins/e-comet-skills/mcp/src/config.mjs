@@ -44,7 +44,8 @@ export const SUPPORTED_MCP_PROTOCOL_VERSIONS = ['2025-06-18'];
 export const LATEST_MCP_PROTOCOL_VERSION = SUPPORTED_MCP_PROTOCOL_VERSIONS[0];
 // 6: diagnostic forwarding and reviewed rejection evidence require replacing an older primary that cannot
 // negotiate those frames. Existing drain-and-takeover semantics preserve already admitted business work.
-const DEFAULT_BRIDGE_GENERATION = 6;
+// 8: an older primary cannot relay the Ozon search positions package family (7 is taken by test builds).
+const DEFAULT_BRIDGE_GENERATION = 8;
 export const resolveBridgeGeneration = ({ env = process.env } = {}) => {
     const mode = env.NODE_ENV;
     if (mode !== 'test' && mode !== 'development') return DEFAULT_BRIDGE_GENERATION;
@@ -205,8 +206,9 @@ export const FEEDBACK_CLOUD_MAX_BYTES = 256 * 1024;
 // and a report is never lost to the evidence gathered for it.
 export const FEEDBACK_EVIDENCE_TIMEOUT_MS = 5000;
 // Only e-Comet's own storage may receive a device-side cloud upload; the device cannot verify hook provenance.
+// The server signs for S3 and hands the URL out under the app's storage proxy, which forwards the raw path.
 export const FEEDBACK_CLOUD_UPLOAD_DESTINATIONS = Object.freeze([
-    Object.freeze({ hostname: 'storage.yandexcloud.net', pathPrefix: '/e-comet-mcp-feedback/' }),
+    Object.freeze({ hostname: 'app.e-comet.io', pathPrefix: '/storage/e-comet-prod-mcp-feedback-732537603439/' }),
 ]);
 export const FEEDBACK_ARTIFACT_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const SESSION_NONCE = randomUUID();

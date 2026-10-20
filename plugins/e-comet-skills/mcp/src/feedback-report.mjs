@@ -91,6 +91,7 @@ const renderOutcome = (outcome) => {
     if (outcome.isError) parts.push('is_error');
     if (outcome.code !== undefined) parts.push(`code=${outcome.code}`);
     if (outcome.stage !== undefined) parts.push(`stage=${outcome.stage}`);
+    if (outcome.cause !== undefined) parts.push(`cause=${outcome.cause}`);
     return `: ${parts.join(', ')}`;
 };
 
@@ -108,21 +109,22 @@ const renderToolCalls = (toolCalls, toolCallsTruncated) => {
     ];
 };
 
-// The client name and version are host-authored text entering the archive: they pass the same
-// redaction as every authored string, before the diagnostics block and the host line alike.
+// The client name, version and host runtime version are host-authored text entering the archive: they
+// pass the same redaction as every authored string, before the diagnostics block and the host line alike.
 const redactClientFacts = (selectedDiagnostics) => {
     const facts = selectedDiagnostics.diagnostics?.client?.facts;
     if (!facts) return selectedDiagnostics;
     const client = { ...selectedDiagnostics.diagnostics.client, facts: { ...facts,
         ...(facts.name === undefined ? {} : { name: redactFeedbackText(facts.name) }),
-        ...(facts.version === undefined ? {} : { version: redactFeedbackText(facts.version) }) } };
+        ...(facts.version === undefined ? {} : { version: redactFeedbackText(facts.version) }),
+        ...(facts.hostRuntimeVersion === undefined ? {} : { hostRuntimeVersion: redactFeedbackText(facts.hostRuntimeVersion) }) } };
     return { ...selectedDiagnostics, diagnostics: { ...selectedDiagnostics.diagnostics, client } };
 };
 
 const renderClient = (selectedDiagnostics) => {
     const facts = selectedDiagnostics.diagnostics?.client?.facts;
     if (!facts?.name) return 'client: unknown';
-    return `client: ${facts.name}${facts.version ? ` ${facts.version}` : ''}`;
+    return `client: ${facts.name}${facts.version ? ` ${facts.version}` : ''}${facts.hostRuntimeVersion ? ` (host runtime ${facts.hostRuntimeVersion})` : ''}`;
 };
 
 /** @param {{ kind?: string, summary?: string, details?: string, diagnostics?: unknown, includeTranscript?: boolean, route?: 'native' | 'cloud', toolCalls?: Array<string | { name: string, at?: string, outcome?: object }>, toolCallsTruncated?: boolean }} input */

@@ -1,6 +1,6 @@
 import { FEEDBACK_EVIDENCE_TIMEOUT_MS } from './config.mjs';
 import { diagnosticCheck } from './diagnostic-facts.mjs';
-import { collectExtensionSnapshotCheck, extensionSnapshotFailure } from './diagnose.mjs';
+import { collectExtensionSnapshotCheck, extensionSnapshotFailure, isCodexClientName } from './diagnose.mjs';
 import { collectDoctorReport } from './doctor.mjs';
 import { probeBrowserExtensionInstall } from './browser-extension-install.mjs';
 import { collectCodexHookPermissions } from './codex-hook-permissions.mjs';
@@ -16,13 +16,8 @@ const INSTALLATION_SLOTS = Object.freeze({
 });
 
 const record = (/** @type {unknown} */ value) => value !== null && typeof value === 'object' && !Array.isArray(value);
-// The Codex configuration inspector describes Codex hook trust; under any other client it would report
-// another host's state as this session's. The client name from MCP initialize is the only host signal
-// the device holds.
-const isCodexClient = (/** @type {any} */ status) => {
-    const facts = status?.diagnostics?.client?.facts;
-    return record(facts) && typeof facts.name === 'string' && /codex/i.test(facts.name);
-};
+// The same host gate as scoped diagnosis: the Codex inspector runs only for a Codex client.
+const isCodexClient = (/** @type {any} */ status) => isCodexClientName(status?.diagnostics?.client?.facts?.name);
 // Every probe is read-only and best effort. A thrown probe contributes nothing; a probe that observes a
 // failure contributes that closed observation. A hang is abandoned at the deadline, because settle cannot
 // cancel a stalled read of a network profile or a cold inspector and a report must never be lost to the

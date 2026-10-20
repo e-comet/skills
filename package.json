@@ -1,6 +1,6 @@
 {
   "name": "dsh-e-comet-skills",
-  "version": "2026.10.2",
+  "version": "2026.10.3",
   "description": "Аналитика своих товаров, настройки рекламы, живые данные Wildberries и отчёты Ozon",
   "icon": "./plugins/e-comet-skills/assets/logo.png",
   "type": "module",

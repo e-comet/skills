@@ -29,10 +29,12 @@ export const createDiagnosticSnapshotRoute = ({ connections, sendExtension = sen
  *     extensionOzonPromotionReady: boolean,
  *     extensionOzonPromotionPackageReady?: boolean,
  *     extensionOzonAnalyticsReady?: boolean,
+ *     extensionOzonSearchPositionsReady?: boolean,
  *     extensionSocket?: unknown,
  *     peerExtensionOzonPromotionReady?: boolean,
  *     peerExtensionOzonPromotionPackageReady?: boolean,
  *     peerExtensionOzonAnalyticsReady?: boolean,
+ *     peerExtensionOzonSearchPositionsReady?: boolean,
  *     peerSocket?: {readyState: number, send(message: string): void} | null,
  *     effectiveExtensionVersion?: string,
  *     effectiveOzonPromotionReady?: boolean,
@@ -41,6 +43,7 @@ export const createDiagnosticSnapshotRoute = ({ connections, sendExtension = sen
  *     effectiveOzonPromotionPackageSupportKnown?: boolean,
  *     effectiveOzonAnalyticsReady?: boolean,
  *     effectiveOzonAnalyticsSupportKnown?: boolean,
+ *     effectiveOzonSearchPositionsSupportKnown?: boolean,
  *   },
  *   sendExtension?: (socket: unknown, message: object) => void,
  * }} options
@@ -48,30 +51,50 @@ export const createDiagnosticSnapshotRoute = ({ connections, sendExtension = sen
 export const createOzonPromotionRoute = ({ connections, sendExtension = sendWs }) => {
     if (!connections) throw new TypeError('Ozon promotion routing requires connection state.');
     return ({ requestId, authorizationId, authorizationScopeId, dateFrom, dateTo, deadlineAt, timeout, family, items }) => {
-        if (family === 'promotion' || family === 'analytics') {
-            const directReady =
-                family === 'promotion' ? connections.extensionOzonPromotionPackageReady : connections.extensionOzonAnalyticsReady;
-            const peerReady =
-                family === 'promotion'
-                    ? connections.peerExtensionOzonPromotionPackageReady
-                    : connections.peerExtensionOzonAnalyticsReady;
-            const operationType =
-                family === 'promotion' ? MESSAGE_TYPES.ozonPromotionPackageOperation : MESSAGE_TYPES.ozonAnalyticsOperation;
-            const businessPayload = family === 'promotion' ? { periods: items } : { reports: items };
-            if (directReady) {
+        const route =
+            family === 'promotion'
+                ? {
+                      directReady: connections.extensionOzonPromotionPackageReady,
+                      peerReady: connections.peerExtensionOzonPromotionPackageReady,
+                      supportKnown: connections.effectiveOzonPromotionPackageSupportKnown,
+                      operationType: MESSAGE_TYPES.ozonPromotionPackageOperation,
+                      peerOperationType: 'peer_ozon_promotion_reports_operation',
+                      businessPayload: { periods: items },
+                      name: 'promotion report packages',
+                  }
+                : family === 'analytics'
+                  ? {
+                        directReady: connections.extensionOzonAnalyticsReady,
+                        peerReady: connections.peerExtensionOzonAnalyticsReady,
+                        supportKnown: connections.effectiveOzonAnalyticsSupportKnown,
+                        operationType: MESSAGE_TYPES.ozonAnalyticsOperation,
+                        peerOperationType: 'peer_ozon_analytics_report_operation',
+                        businessPayload: { reports: items },
+                        name: 'analytics report packages',
+                    }
+                  : family === 'positions'
+                    ? {
+                          directReady: connections.extensionOzonSearchPositionsReady,
+                          peerReady: connections.peerExtensionOzonSearchPositionsReady,
+                          supportKnown: connections.effectiveOzonSearchPositionsSupportKnown,
+                          operationType: MESSAGE_TYPES.ozonSearchPositionsOperation,
+                          peerOperationType: 'peer_ozon_search_positions_operation',
+                          businessPayload: { queries: items },
+                          name: 'search positions',
+                      }
+                    : undefined;
+        if (route) {
+            if (route.directReady) {
                 sendExtension(
                     connections.extensionSocket,
-                    localMessage(requestId, operationType, { authorizationId, ...businessPayload, deadlineAt })
+                    localMessage(requestId, route.operationType, { authorizationId, ...route.businessPayload, deadlineAt })
                 );
                 return;
             }
-            if (peerReady && connections.peerSocket?.readyState === WS_OPEN) {
+            if (route.peerReady && connections.peerSocket?.readyState === WS_OPEN) {
                 connections.peerSocket.send(
                     JSON.stringify({
-                        type:
-                            family === 'promotion'
-                                ? 'peer_ozon_promotion_reports_operation'
-                                : 'peer_ozon_analytics_report_operation',
+                        type: route.peerOperationType,
                         requestId,
                         authorizationScopeId,
                         authorizationId,
@@ -81,21 +104,17 @@ export const createOzonPromotionRoute = ({ connections, sendExtension = sendWs }
                 );
                 return;
             }
-            const supportKnown =
-                family === 'promotion'
-                    ? connections.effectiveOzonPromotionPackageSupportKnown
-                    : connections.effectiveOzonAnalyticsSupportKnown;
-            if (supportKnown) {
+            if (route.supportKnown) {
                 throw markOzonPackageNotStarted(new ToolExecutionError(
                     'OZON_ROUTE_NOT_READY',
-                    `The connected extension cannot run Ozon ${family} report packages.`,
+                    `The connected extension cannot run Ozon ${route.name}.`,
                     'route',
                     false
                 ));
             }
             throw markOzonPackageNotStarted(new ToolExecutionError(
                 'OZON_ROUTE_NOT_READY',
-                `The Ozon Seller ${family} report package route is not available.`,
+                `The Ozon Seller ${route.name} route is not available.`,
                 'route',
                 false
             ));

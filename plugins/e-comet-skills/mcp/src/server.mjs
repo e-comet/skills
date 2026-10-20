@@ -24,7 +24,7 @@ import {
 } from './config.mjs';
 import { ConnectionState } from './connection-state.mjs';
 import { deriveBridgeDiagnostics } from './bridge-diagnostics.mjs';
-import { collectStaticFacts, diagnosticCheck } from './diagnostic-facts.mjs';
+import { collectStaticFacts, diagnosticCheck, isHostRuntimeVersion } from './diagnostic-facts.mjs';
 import { createExtensionProtocol } from './extension-protocol.mjs';
 import { maintainFeedbackArtifacts } from './feedback-artifact-store.mjs';
 import { localMessage, MESSAGE_TYPES } from './extension-vocabulary.mjs';
@@ -257,6 +257,11 @@ runtime = createBridgeRuntime({
 
 const requestBrowserJobAuthorization = (...args) => requestBroker.requestAuthorization(...args);
 const shutdownController = new AbortController();
+// Only the native DeepSeek adapter sets this: the Harness runtime version it resolved its own peers against.
+// Anything outside the version grammar is dropped here rather than carried into a report. A foreign parent environment
+// that sets it is "Native DeepSeek host runtime version from the environment" in docs/local-agent-architecture.md#accepted-residuals.
+const hostRuntimeVersion = isHostRuntimeVersion(process.env.ECOMET_HOST_RUNTIME_VERSION) ? process.env.ECOMET_HOST_RUNTIME_VERSION : undefined;
+
 const handleMcpMessage = createMcpMessageHandler({
     reportOutputDirectory: process.env.CLAUDE_PROJECT_DIR,
     getBridgeStatus: (/** @type {any} */ metadata = {}) => {
@@ -285,7 +290,8 @@ const handleMcpMessage = createMcpMessageHandler({
             ...derived.diagnostics,
             runtime: staticChecks.runtime,
             client: diagnosticCheck({ check: 'client', state: clientInfo ? 'passed' : 'not_checked', observedAt: clientObservedAt ?? observedAt,
-                source: 'mcp_initialize', executionPlane: 'client', ...(clientInfo ? { facts: { ...clientInfo, provenance: 'client_reported' } } : {}) }),
+                source: 'mcp_initialize', executionPlane: 'client',
+                ...(clientInfo ? { facts: { ...clientInfo, provenance: 'client_reported', ...(hostRuntimeVersion ? { hostRuntimeVersion } : {}) } } : {}) }),
             storage: staticChecks.storage,
         },
     });},

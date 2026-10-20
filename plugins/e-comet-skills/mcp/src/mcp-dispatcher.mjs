@@ -23,7 +23,12 @@ import { executeAuthorizedBrowserJob, executeSellerReviewsJob, extractBrowserJob
 import { mcpError, mcpResult, resourceLinkResult, textResult } from './mcp-protocol.mjs';
 import { createJobWriter } from './result-store.mjs';
 import { requireStorageTarget, resolveStorageLayout, StorageUnavailableError } from './storage-layout.mjs';
-import { EXTENSION_UPDATE_URL, OZON_ANALYTICS_CAPABILITY, OZON_PROMOTION_PACKAGE_CAPABILITY } from './extension-vocabulary.mjs';
+import {
+    EXTENSION_UPDATE_URL,
+    OZON_ANALYTICS_CAPABILITY,
+    OZON_PROMOTION_PACKAGE_CAPABILITY,
+    OZON_SEARCH_POSITIONS_CAPABILITY,
+} from './extension-vocabulary.mjs';
 import {
     executeOzonPromotionJob,
     executeOzonPromotionPackageJob,
@@ -33,9 +38,11 @@ import { executeOzonAnalyticsJob, safeOzonAnalyticsToolError } from './ozon-anal
 import { getOzonReportPackageArtifactResources } from './ozon-report-package-job.mjs';
 import { rejectedOzonPackage } from './ozon-report-package-result.mjs';
 import { parsePromotionPeriods } from './ozon-report-package-domain.mjs';
+import { canonicalSearchPositionsRequest, maxSearchPositionsQueries } from './ozon-search-positions-domain.mjs';
+import { executeOzonSearchPositionsJob, rejectedOzonSearchPositions } from './ozon-search-positions-job.mjs';
 import { parseAnalyticsDateRange } from './ozon-analytics-domain.mjs';
 import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
-import { serverInstructions, tools, validateToolArguments } from './tool-catalog.mjs';
+import { serverInstructions, toolsForClient, validateToolArguments } from './tool-catalog.mjs';
 import {
     ozonExtensionOutdatedError,
     browserJobRejectionDetails,
@@ -99,18 +106,26 @@ const resultCreationFailure = (cause) => {
 // Package capability floor, also enforced by scripts/extension_gate.py for publication.
 // The released singular @1 tool intentionally retains its independent 1.5.6 floor.
 const OZON_PACKAGE_MIN_EXTENSION_VERSION = '1.5.7';
+const OZON_PACKAGE_FAMILIES = Object.freeze({
+    promotion: { name: 'Ozon promotion report package', minVersion: OZON_PACKAGE_MIN_EXTENSION_VERSION,
+        supportField: 'ozonSellerPromotionReportsSupported', capability: OZON_PROMOTION_PACKAGE_CAPABILITY, code: 'OZON_ROUTE_NOT_READY', stage: 'route' },
+    analytics: { name: 'Ozon analytics report package', minVersion: OZON_PACKAGE_MIN_EXTENSION_VERSION,
+        supportField: 'ozonSellerAnalyticsReportSupported', capability: OZON_ANALYTICS_CAPABILITY, code: 'OZON_ANALYTICS_CAPABILITY_UNAVAILABLE', stage: 'context' },
+    // The first extension release announcing this capability is not served yet: its version is set here at release.
+    positions: { name: 'Ozon search positions operation', minVersion: '1.5.13',
+        supportField: 'ozonSearchPositionsSupported', capability: OZON_SEARCH_POSITIONS_CAPABILITY, code: 'OZON_SEARCH_POSITIONS_CAPABILITY_UNAVAILABLE', stage: 'context' },
+});
 // Only this dispatcher can attest a missing capability from bridge status.
 // Remote error fields and message text cannot select the public stop reason.
 const ozonPackageCapabilityErrors = new WeakSet();
 const ozonPackageCapabilityFailure = (family, status) => {
-    const supportField = family === 'analytics' ? 'ozonSellerAnalyticsReportSupported' : 'ozonSellerPromotionReportsSupported';
+    const { name, minVersion, supportField, capability, code, stage } = OZON_PACKAGE_FAMILIES[family];
     if (status?.extensionConnected !== true || status[supportField] !== false) return undefined;
-    const capability = family === 'analytics' ? OZON_ANALYTICS_CAPABILITY : OZON_PROMOTION_PACKAGE_CAPABILITY;
     const error = new ToolExecutionError(
-        family === 'analytics' ? 'OZON_ANALYTICS_CAPABILITY_UNAVAILABLE' : 'OZON_ROUTE_NOT_READY',
-        `The connected extension does not announce ${capability} and cannot run this Ozon ${family} report package. ` +
-            `Update the e-Comet extension to ${OZON_PACKAGE_MIN_EXTENSION_VERSION} or newer at ${EXTENSION_UPDATE_URL}, then request a new report authorization and retry.`,
-        family === 'analytics' ? 'context' : 'route',
+        code,
+        `The connected extension does not announce ${capability} and cannot run this ${name}. ` +
+            `Update the e-Comet extension${minVersion ? ` to ${minVersion} or newer` : ''} at ${EXTENSION_UPDATE_URL}, then request a new authorization and retry.`,
+        stage,
         false
     );
     ozonPackageCapabilityErrors.add(error);
@@ -118,6 +133,7 @@ const ozonPackageCapabilityFailure = (family, status) => {
 };
 
 export const classifyOzonAuthorizationFailure = (error, status, packageFamily) => {
+    const familySpec = packageFamily === undefined ? undefined : OZON_PACKAGE_FAMILIES[packageFamily];
     if (packageFamily !== undefined) {
         const capabilityFailure = ozonPackageCapabilityFailure(packageFamily, status);
         if (capabilityFailure) return capabilityFailure;
@@ -142,12 +158,12 @@ export const classifyOzonAuthorizationFailure = (error, status, packageFamily) =
             'authorization', false, { cause: error });
     }
     if (error instanceof ToolExecutionError && OZON_AUTHORIZATION_ROUTE_CODES.has(error.code)) {
-        if (packageFamily !== undefined) {
+        if (familySpec !== undefined) {
             return new ToolExecutionError(
                 'OZON_ROUTE_NOT_READY',
                 (error.code === 'EXTENSION_DISCONNECTED' ? 'The e-Comet extension is not connected to the local bridge. '
                     : 'The Ozon report authorization route did not complete; its cause is not established. ') +
-                    `Ensure e-Comet extension ${OZON_PACKAGE_MIN_EXTENSION_VERSION} or newer is enabled in the same browser profile, refresh an authenticated Ozon Seller page, then request a new report authorization and retry.`,
+                    `Ensure e-Comet extension ${familySpec.minVersion ? `${familySpec.minVersion} or newer ` : ''}is enabled in the same browser profile, refresh an authenticated Ozon Seller page, then request a new authorization and retry.`,
                 'route', false
             );
         }
@@ -157,8 +173,8 @@ export const classifyOzonAuthorizationFailure = (error, status, packageFamily) =
         return ozonRouteUnavailableError(error.code === 'EXTENSION_DISCONNECTED' ? 'disconnected'
             : error.code === 'BROWSER_JOB_AUTHORIZATION_TIMEOUT' ? 'timeout' : 'unavailable');
     }
-    let message = packageFamily === undefined ? 'The Ozon promotion report authorization was rejected.'
-        : `The Ozon ${packageFamily} report package authorization was rejected.`;
+    let message = familySpec === undefined ? 'The Ozon promotion report authorization was rejected.'
+        : `The ${familySpec.name} authorization was rejected.`;
     if (error instanceof ToolExecutionError && error.code === 'BROWSER_JOB_REJECTED'
         && error.message === 'Extension is not authenticated with e-Comet') {
         message = 'The e-Comet extension is not signed in. Open the e-Comet extension and sign in to the same e-Comet account used for this request.';
@@ -890,6 +906,43 @@ export const createMcpMessageHandler = ({
         sendOperationResult(id, 'ozon_seller_promotion_report', await deliverReportResult(terminalResult, reportArtifacts, reportOutputDirectory));
     };
 
+    // Every Ozon package family refuses an unannounced capability before and after readiness, so an older
+    // extension never spends the one-use signed authorization; the caller's own preflight runs in between.
+    const authorizeOzonPackage = async (family, triggerUrl, beforeWait = () => undefined) => {
+        if (typeof triggerUrl !== 'string' || !triggerUrl) {
+            throw new ToolExecutionError(
+                'OZON_AUTHORIZATION_REJECTED',
+                'The trusted browser-job hook did not provide Ozon authorization.',
+                'authorization',
+                false
+            );
+        }
+        const unavailableBeforeWait = ozonPackageCapabilityFailure(family, currentOzonStatus());
+        beforeWait();
+        if (unavailableBeforeWait) throw unavailableBeforeWait;
+        if (!(await waitForExtensionReady())) {
+            throw classifyOzonAuthorizationFailure(new ToolExecutionError('EXTENSION_DISCONNECTED', 'disconnected', 'extension'), currentOzonStatus(), family);
+        }
+        const unavailableAfterWait = ozonPackageCapabilityFailure(family, currentOzonStatus());
+        if (unavailableAfterWait) throw unavailableAfterWait;
+        let lease;
+        try {
+            lease = await requestBrowserJobAuthorization(extractBrowserJobToken(triggerUrl));
+        } catch (error) {
+            throw classifyOzonAuthorizationFailure(error, currentOzonStatus(), family);
+        }
+        if (!lease || typeof lease.requestOzonReportPackage !== 'function' || typeof lease.release !== 'function') {
+            releaseAuthorizationInBackground(lease, `after an invalid ${OZON_PACKAGE_FAMILIES[family].name} authorization`);
+            throw new ToolExecutionError(
+                'OZON_AUTHORIZATION_REJECTED',
+                `The extension returned an invalid ${OZON_PACKAGE_FAMILIES[family].name} authorization.`,
+                'authorization',
+                false
+            );
+        }
+        return lease;
+    };
+
     // Keep package admission/result shaping distinct from the released singular contract:
     // valid pre-execution failures preserve item order/cardinality and a package stopReason,
     // while singular errors retain their legacy details schema and extension version floor.
@@ -941,9 +994,6 @@ export const createMcpMessageHandler = ({
             if (ozonPackageCapabilityErrors.has(error)) result.stopReason = 'capability_unavailable';
             return result;
         };
-        const capabilityFailure = () => {
-            return ozonPackageCapabilityFailure(family, currentOzonStatus());
-        };
         try {
             if (!validateToolArguments(toolName, args)) {
                 throw new ToolExecutionError('PREFLIGHT_FAILED', `The Ozon ${family} report package is invalid.`, 'preflight', false);
@@ -955,39 +1005,8 @@ export const createMcpMessageHandler = ({
                 throw new ToolExecutionError('PREFLIGHT_FAILED', `The Ozon ${family} report package is invalid.`, 'preflight', false);
             }
             argumentsValid = true;
-            if (typeof args.triggerUrl !== 'string' || !args.triggerUrl) {
-                throw new ToolExecutionError(
-                    'OZON_AUTHORIZATION_REJECTED',
-                    'The trusted browser-job hook did not provide Ozon authorization.',
-                    'authorization',
-                    false
-                );
-            }
-            const unavailableBeforeWait = capabilityFailure();
-            requireStorageTarget(artifactStorageTarget, 'marketplace-artifacts');
-            if (unavailableBeforeWait) throw unavailableBeforeWait;
-            if (!(await waitForExtensionReady())) {
-                throw classifyOzonAuthorizationFailure(new ToolExecutionError('EXTENSION_DISCONNECTED', 'disconnected', 'extension'), currentOzonStatus(), family);
-            }
-            const unavailableAfterWait = capabilityFailure();
-            if (unavailableAfterWait) throw unavailableAfterWait;
-            try {
-                authorizationLease = await requestBrowserJobAuthorization(extractBrowserJobToken(args.triggerUrl));
-            } catch (error) {
-                throw classifyOzonAuthorizationFailure(error, currentOzonStatus(), family);
-            }
-            if (
-                !authorizationLease ||
-                typeof authorizationLease.requestOzonReportPackage !== 'function' ||
-                typeof authorizationLease.release !== 'function'
-            ) {
-                throw new ToolExecutionError(
-                    'OZON_AUTHORIZATION_REJECTED',
-                    `The extension returned an invalid Ozon ${family} report package authorization.`,
-                    'authorization',
-                    false
-                );
-            }
+            authorizationLease = await authorizeOzonPackage(family, args.triggerUrl,
+                () => requireStorageTarget(artifactStorageTarget, 'marketplace-artifacts'));
             const sharedExecution = {
                 authorization: authorizationLease.authorization,
                 requestOzonReportPackage: authorizationLease.requestOzonReportPackage,
@@ -1017,6 +1036,39 @@ export const createMcpMessageHandler = ({
         sendOperationResult(id, toolName, await deliverReportResult(terminalResult, reportArtifacts, reportOutputDirectory));
     };
 
+    // The package path without artifact storage: the table is small enough to return inline.
+    const handleOzonSearchPositions = async (id, args = {}) => {
+        const toolName = 'ozon_search_positions';
+        let request;
+        let result;
+        try {
+            if (!validateToolArguments(toolName, args)) throw new TypeError('The Ozon search positions arguments are invalid.');
+            const { queries, skus, region, platform } = args;
+            request = canonicalSearchPositionsRequest({ queries, skus, region, platform }, maxSearchPositionsQueries(clientInfo?.name));
+        } catch (error) {
+            // Domain messages name the broken rule, never the rejected values.
+            result = { ok: false, status: 'failed', jobType: toolName,
+                error: { code: 'PREFLIGHT_FAILED', message: error.message, stage: 'preflight', retryable: false }, stopReason: null };
+        }
+        if (request) {
+            let authorizationLease;
+            try {
+                authorizationLease = await authorizeOzonPackage('positions', args.triggerUrl);
+                result = await executeOzonSearchPositionsJob({
+                    authorization: authorizationLease.authorization,
+                    request,
+                    requestOzonReportPackage: authorizationLease.requestOzonReportPackage,
+                    now,
+                });
+            } catch (error) {
+                result = rejectedOzonSearchPositions(request, error);
+            } finally {
+                releaseAuthorizationInBackground(authorizationLease, 'after Ozon search positions completion');
+            }
+        }
+        sendOperationResult(id, toolName, textResult(result, !result.ok));
+    };
+
     // `needsBridge` declares which operational tools depend on the bridge, so the wake-up is applied once at
     // the dispatch point below instead of being remembered inside each handler. A tool added without the flag
     // never nudges; a tool added with it cannot forget to. `local_bridge_status` is deliberately false because
@@ -1036,7 +1088,7 @@ export const createMcpMessageHandler = ({
                     return;
                 }
                 const diagnosis = await collectDiagnosis({ ...args, operationDiagnostics, getBridgeStatus: currentBridgeStatus,
-                    requestExtensionDiagnosticSnapshot, storageLayout, now,
+                    requestExtensionDiagnosticSnapshot, storageLayout, now, clientName: clientInfo?.name,
                     randomUUID: createUuid, ...(collectInstallation ? { collectInstallation } : {}),
                     ...(probeExtensionInstall ? { probeExtensionInstall } : {}),
                     ...(collectHookPermissions ? { collectHookPermissions } : {}) });
@@ -1055,7 +1107,7 @@ export const createMcpMessageHandler = ({
                     )), true));
                     return;
                 }
-                sendResult(id, textResult(describeToolContract(args.name)));
+                sendResult(id, textResult(describeToolContract(args.name, { clientName: clientInfo?.name })));
             } },
         ],
         [
@@ -1087,6 +1139,7 @@ export const createMcpMessageHandler = ({
             'ozon_seller_analytics_report',
             { needsBridge: true, run: (id, args) => handleOzonReportPackage(id, 'ozon_seller_analytics_report', 'analytics', args) },
         ],
+        ['ozon_search_positions', { needsBridge: true, run: (id, args) => handleOzonSearchPositions(id, args) }],
         ['prepare_e_comet_feedback', { needsBridge: false, run: (id, args) => handleFeedbackPrepare(id, args) }],
         ['submit_e_comet_feedback', { needsBridge: false, run: (id, args) => handleFeedbackSubmit(id, args) }],
         ['wb_product_images', { needsBridge: false, run: (id, args) => handleProductImages(id, args) }],
@@ -1119,7 +1172,7 @@ export const createMcpMessageHandler = ({
             return;
         }
         if (method === 'tools/list') {
-            sendResult(id, { tools });
+            sendResult(id, { tools: toolsForClient(clientInfo?.name) });
             return;
         }
         if (method !== 'tools/call') {

@@ -25,6 +25,13 @@ export const extensionSnapshotFailure = (code) => EXTENSION_SNAPSHOT_FAILURES[co
     ?? (typeof code === 'string' ? { state: 'failed', source: 'extension', cause: 'unknown' } : { state: 'unknown', source: 'device_process', cause: 'unknown' });
 const step = (operation, state, systemCode, reason) => ({ operation, state, ...(systemCode ? { systemCode } : {}), ...(reason ? { reason } : {}) });
 
+// The Codex configuration inspectors describe Codex hook trust and sign-in state; under any other client
+// they would report a foreign host's state as this session's. The client name from MCP initialize is
+// the only host signal the device holds: only the identity Codex sends (openai/codex,
+// codex-rs/codex-mcp/src/rmcp_client.rs) is Codex, never an absent name or one that merely contains the word.
+const CODEX_CLIENT_NAMES = new Set(['codex-mcp-client']);
+export const isCodexClientName = (name) => CODEX_CLIENT_NAMES.has(name);
+
 /**
  * One capability-negotiated, read-only extension snapshot as a closed check. Shared by the runtime
  * diagnosis probe and by feedback preparation, which passes its own shorter deadline.
@@ -103,7 +110,7 @@ const probeStorageTarget = async (name, target, { observedAt, randomUUID, fileSy
 };
 
 export const collectDiagnosis = async (/** @type {any} */ { scope, mode, operationHandle, operationDiagnostics, getBridgeStatus,
-    requestExtensionDiagnosticSnapshot,
+    requestExtensionDiagnosticSnapshot, clientName,
     storageLayout = {}, probes = [], now = Date.now, randomUUID = () => globalThis.crypto.randomUUID(), collectInstallation = collectDoctorReport,
     collectHookPermissions = collectCodexHookPermissions,
     collectMcpAuth = collectCodexMcpAuth,
@@ -122,8 +129,11 @@ export const collectDiagnosis = async (/** @type {any} */ { scope, mode, operati
     }
     if (mode === 'safe_probes') {
         if (scope === 'installation' && probes.includes('storage_write')) for (const [name, target] of Object.entries(storageLayout)) checks.push(await probeStorageTarget(name, target, { observedAt, randomUUID, fileSystem }));
-        if (scope === 'installation' && probes.includes('hook_permissions')) checks.push(await collectHookPermissions({ now }));
-        if (scope === 'installation' && probes.includes('codex_mcp_auth')) checks.push(await collectMcpAuth({ now }));
+        // Not a probe this host offers: the answer is the closed unsupported check, never another host's configuration.
+        const codexOnly = (check, collect) => (isCodexClientName(clientName) ? collect({ now })
+            : diagnosticCheck({ check, state: 'unsupported', observedAt, source: 'device_process', executionPlane: 'device', cause: 'unsupported' }));
+        if (scope === 'installation' && probes.includes('hook_permissions')) checks.push(await codexOnly('hook_permissions', collectHookPermissions));
+        if (scope === 'installation' && probes.includes('codex_mcp_auth')) checks.push(await codexOnly('codex_mcp_auth', collectMcpAuth));
         if (scope === 'installation' && probes.includes('extension_install')) checks.push(await probeExtensionInstall({ now }));
         if (scope === 'runtime' && probes.includes('extension_snapshot')) {
             checks.push(await collectExtensionSnapshotCheck({ requestExtensionDiagnosticSnapshot, observedAt }));

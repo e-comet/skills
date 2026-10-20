@@ -31,10 +31,11 @@ export const operationFactsFromResult = (toolName, result) => {
         return { stage, outcome: 'uncertain', retryDisposition: 'forbidden' };
     }
     if (error?.recommendedAction === 'RETRY_FEEDBACK_ONCE') return { stage, outcome: 'failed', retryDisposition: 'allowed' };
+    // An answered result stays partial even when a stop error explains why its remaining items were skipped.
+    if (value.ok === true) return { stage, outcome: value.status === 'partial' ? 'partial' : 'succeeded', retryDisposition: 'forbidden' };
     if (['OZON_ROUTE_NOT_READY', 'EXTENSION_UPDATE_REQUIRED', 'BROWSER_JOB_REAUTHORIZATION_REQUIRED'].includes(code)) {
         return { stage, outcome: 'failed', retryDisposition: 'requires_new_authorization' };
     }
-    if (value.ok === true) return { stage, outcome: value.status === 'partial' ? 'partial' : 'succeeded', retryDisposition: 'forbidden' };
     if (value.ok === false && typeof value.status === 'string' && code === undefined) {
         return { stage, outcome: value.status === 'partial' ? 'partial' : 'failed', retryDisposition: 'forbidden' };
     }

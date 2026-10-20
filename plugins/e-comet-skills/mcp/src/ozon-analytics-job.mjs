@@ -1,12 +1,10 @@
 import { validateAuthorizedJobLimits } from './browser-job.mjs';
-import { SELLER_AUTHORIZATION_SCOPE_MAX_MS } from './config.mjs';
 import { ozonAnalyticsArtifactName, parseAnalyticsReports } from './ozon-analytics-domain.mjs';
 import { executeOzonReportPackage } from './ozon-report-package-job.mjs';
+import { ozonPackageDeadline } from './ozon-report-package-result.mjs';
 import { StorageUnavailableError } from './storage-layout.mjs';
 import { browserJobRejectionDetails, ToolExecutionError } from './tool-errors.mjs';
 import { OZON_ANALYTICS_TERMINAL_CODE_STAGES, isOzonAnalyticsTerminalDetails, isOzonExecutionInterruptionDetails } from './extension-vocabulary.mjs';
-
-const SIGNED_EXPIRY_SAFETY_RESERVE_MS = 1000;
 
 const authorizationRejected = (cause) =>
     new ToolExecutionError(
@@ -64,17 +62,11 @@ export const executeOzonAnalyticsJob = async ({
     } catch (error) {
         throw authorizationRejected(error);
     }
-    const startedAt = now();
-    const signedDeadline =
-        typeof authorization?.expiresAt === 'number' && Number.isFinite(authorization.expiresAt)
-            ? Math.floor(authorization.expiresAt * 1000 - SIGNED_EXPIRY_SAFETY_RESERVE_MS)
-            : Infinity;
-    const packageDeadline = Math.min(startedAt + SELLER_AUTHORIZATION_SCOPE_MAX_MS, signedDeadline);
     return executeOzonReportPackage({
         family: 'analytics',
         jobType: 'ozon_seller_analytics_report',
         items: reports,
-        packageDeadline,
+        packageDeadline: ozonPackageDeadline(authorization, now()),
         requestOzonReportPackage,
         createArtifactWriter,
         jobBudget,

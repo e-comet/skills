@@ -39,8 +39,9 @@ const timeout = () => Object.assign(new Error('Feedback upload deadline elapsed.
  * percent-encoded ones (`%2e`, `%2E`) included, but it decodes nothing else: an escaped separator such as `%2f`
  * stays inside its segment here and becomes one only where the storage service itself decodes it. So this test is
  * not a general proof that a path stays below its prefix. It is sufficient here only because every allowed prefix
- * is bucket-level — the first path segment — so whatever follows, an accepted URL still addresses the pinned
- * bucket. A deeper prefix would need the escaped separators resolved the way the service resolves them.
+ * is bucket-level — the bucket segment of S3 path style, behind the storage proxy's fixed `/storage` mount, which
+ * forwards the raw request path rather than a decoded one — so whatever follows, an accepted URL still addresses
+ * the pinned bucket. A deeper prefix would need the escaped separators resolved the way the service resolves them.
  * @param {string} uploadUrl
  * @param {ReadonlyArray<{ hostname: string, pathPrefix: string }>} destinations
  * @param {Record<string, string>} requiredHeaders

@@ -9,6 +9,8 @@ export class AccountService extends TypertRemoteService {
     this.connections = connections;
     this.localStatus = localStatus;
     this.updates = updates;
+    // The fixed gateway name assumes one live plugin instance: see "Native DeepSeek registrations assume one live
+    // plugin instance" in docs/local-agent-architecture.md#accepted-residuals.
     ctx.effect(() => ctx.typert.register(ACCOUNT_HOST));
   }
   async getStatus() {

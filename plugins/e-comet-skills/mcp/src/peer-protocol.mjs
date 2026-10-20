@@ -166,9 +166,19 @@ const OZON_PACKAGE_PEER_TYPES = Object.freeze({
         directEnd: MESSAGE_TYPES.ozonAnalyticsStreamEnd,
         directResult: MESSAGE_TYPES.ozonAnalyticsResult,
     }),
+    // Result-only: no phases, streams or stream acknowledgements, so those fields are absent.
+    positions: Object.freeze({
+        operation: 'peer_ozon_search_positions_operation',
+        resultAck: 'peer_ozon_search_positions_result_ack',
+        result: 'peer_ozon_search_positions_result',
+        directResult: MESSAGE_TYPES.ozonSearchPositionsResult,
+    }),
 });
-const packageFamilyForType = (type, field) =>
-    Object.entries(OZON_PACKAGE_PEER_TYPES).find(([, types]) => types[field] === type)?.[0];
+// A family without a field must not match a frame that has no type.
+const packageFamilyForType = (type, ...fields) =>
+    typeof type === 'string'
+        ? Object.entries(OZON_PACKAGE_PEER_TYPES).find(([, types]) => fields.some((field) => types[field] === type))?.[0]
+        : undefined;
 const isValidPeerOzonPackageOperation = (message) => {
     const family = packageFamilyForType(message?.type, 'operation');
     return (
@@ -185,31 +195,30 @@ const isValidPeerOzonPackageOperation = (message) => {
     );
 };
 const parsePeerOzonPackageStream = (message) => {
-    for (const [family, types] of Object.entries(OZON_PACKAGE_PEER_TYPES)) {
-        const kind = ['start', 'chunk', 'end'].find((field) => types[field] === message?.type);
-        if (!kind) continue;
-        const commonKeys = ['type', 'requestId', 'ackId', 'itemIndex'];
-        const keys = kind === 'chunk' ? [...commonKeys, 'index', 'data'] : [...commonKeys, 'metadata'];
-        // Nested fields must not give validation, broker dispatch, and the ACK different identities.
-        if (
-            !hasOnlyKeys(message, keys) ||
-            !isValidPeerRequestId(message.requestId) ||
-            !isValidPeerRequestId(message.ackId) ||
-            !Number.isSafeInteger(message.itemIndex) ||
-            message.itemIndex < 0 ||
-            (kind !== 'chunk' && !hasOnlyKeys(message.metadata,
-                kind === 'start' ? ['name', 'mimeType', 'declaredSize'] : ['size', 'sha256']))
-        ) {
-            return null;
-        }
-        const payload =
-            kind === 'chunk'
-                ? { frameId: message.ackId, itemIndex: message.itemIndex, index: message.index, data: message.data }
-                : { ...message.metadata, frameId: message.ackId, itemIndex: message.itemIndex };
-        if (!isValidPeerOzonPayload(message.requestId, types[`direct${kind[0].toUpperCase()}${kind.slice(1)}`], payload)) return null;
-        return { family, kind, payload };
+    const family = packageFamilyForType(message?.type, 'start', 'chunk', 'end');
+    if (!family) return null;
+    const types = OZON_PACKAGE_PEER_TYPES[family];
+    const kind = ['start', 'chunk', 'end'].find((field) => types[field] === message.type);
+    const commonKeys = ['type', 'requestId', 'ackId', 'itemIndex'];
+    const keys = kind === 'chunk' ? [...commonKeys, 'index', 'data'] : [...commonKeys, 'metadata'];
+    // Nested fields must not give validation, broker dispatch, and the ACK different identities.
+    if (
+        !hasOnlyKeys(message, keys) ||
+        !isValidPeerRequestId(message.requestId) ||
+        !isValidPeerRequestId(message.ackId) ||
+        !Number.isSafeInteger(message.itemIndex) ||
+        message.itemIndex < 0 ||
+        (kind !== 'chunk' && !hasOnlyKeys(message.metadata,
+            kind === 'start' ? ['name', 'mimeType', 'declaredSize'] : ['size', 'sha256']))
+    ) {
+        return null;
     }
-    return null;
+    const payload =
+        kind === 'chunk'
+            ? { frameId: message.ackId, itemIndex: message.itemIndex, index: message.index, data: message.data }
+            : { ...message.metadata, frameId: message.ackId, itemIndex: message.itemIndex };
+    if (!isValidPeerOzonPayload(message.requestId, types[`direct${kind[0].toUpperCase()}${kind.slice(1)}`], payload)) return null;
+    return { family, kind, payload };
 };
 const parsePeerOzonPackageResult = (message) => {
     const family = packageFamilyForType(message?.type, 'result');
@@ -221,7 +230,8 @@ const parsePeerOzonPackageResult = (message) => {
             !isValidPeerRequestId(message.ackId) ||
             !Number.isSafeInteger(message.itemIndex) ||
             message.itemIndex < 0 ||
-            !hasOnlyKeys(message.response, ['ok', 'status', 'error']) ||
+            // The index travels beside the response; the family validator below checks the response's own keys.
+            !hasOnlyKeys(message.response, ['ok', 'status', 'error', 'checkedAt', 'positions']) ||
             !isValidPeerOzonPayload(message.requestId, types.directResult, { ...message.response, itemIndex: message.itemIndex })
         ) {
             return null;
@@ -401,6 +411,9 @@ export const createPeerProtocol = ({
             ...(connections.extensionOzonAnalyticsReady === undefined
                 ? {}
                 : { ozonSellerAnalyticsReportSupported: connections.extensionOzonAnalyticsReady === true }),
+            ...(connections.extensionOzonSearchPositionsReady === undefined
+                ? {}
+                : { ozonSearchPositionsSupported: connections.extensionOzonSearchPositionsReady === true }),
             ...(connections.extensionLastConnectedAtMs === null ? {} : { extensionLastConnectedAtMs: connections.extensionLastConnectedAtMs }),
             ...(connections.extensionLastDisconnectedAtMs === null ? {} : { extensionLastDisconnectedAtMs: connections.extensionLastDisconnectedAtMs }),
             // Тот же набор, что и в `peer_status`: иначе пир до первого пуша считает,
@@ -841,10 +854,7 @@ export const createPeerProtocol = ({
             }
             return;
         }
-        const packageAck = Object.entries(OZON_PACKAGE_PEER_TYPES).find(
-            ([, types]) => types.ack === message?.type || types.resultAck === message?.type
-        );
-        const packageAckFamily = packageAck?.[0];
+        const packageAckFamily = packageFamilyForType(message?.type, 'ack', 'resultAck');
         if (
             packageAckFamily &&
             isValidPeerRequestId(message.requestId) &&

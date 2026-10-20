@@ -15,12 +15,15 @@ import {
     OZON_PROMOTION_CAPABILITY,
     OZON_PROMOTION_PACKAGE_CAPABILITY,
     OZON_PROMOTION_SERVER_MESSAGE_TYPES,
+    OZON_SEARCH_POSITIONS_CAPABILITY,
+    OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES,
     RETRYABLE_FETCH_ERROR_CODES,
     SELLER_OPERATION_STAGES,
     UNCLASSIFIED_FETCH_ERROR_CODE,
 } from './extension-vocabulary.mjs';
 import { parseAnalyticsDateRange } from './ozon-analytics-domain.mjs';
 import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
+import { isSearchPositionsSkuList, MAX_OZON_SEARCH_POSITIONS_TEXT_LENGTH } from './ozon-search-positions-domain.mjs';
 import { ToolExecutionError, parseBrowserJobRejection, safeExternalToolError, safeOzonPromotionToolError } from './tool-errors.mjs';
 import { encodeFrame } from './websocket.mjs';
 
@@ -119,11 +122,13 @@ export const isValidOzonReportPackageRequest = (value) => {
         !Array.isArray(value.items) ||
         value.items.length < 1 ||
         value.items.length > MAX_OZON_REPORT_PACKAGE_ITEMS ||
-        (value.family !== 'promotion' && value.family !== 'analytics')
+        (value.family !== 'promotion' && value.family !== 'analytics' && value.family !== 'positions')
     ) {
         return false;
     }
     return value.items.every((item) => {
+        // Queries are bounded here; the broker admits only the exact signed queries.
+        if (value.family === 'positions') return isBoundedString(item, MAX_OZON_SEARCH_POSITIONS_TEXT_LENGTH);
         if (!isRecord(item)) return false;
         if (value.family === 'promotion') {
             if (!hasOnlyKeys(item, ['dateFrom', 'dateTo']) || Object.keys(item).length !== 2) return false;
@@ -217,6 +222,52 @@ const isValidIndexedOzonResult = (value, family) => {
         error.message.length <= MAX_SAFE_MESSAGE_LENGTH
     );
 };
+const MAX_OZON_SEARCH_POSITIONS_LABEL_LENGTH = 32;
+const MAX_OZON_REGION_CANDIDATES = 5;
+const isValidOzonSearchPositionsCell = (cell) =>
+    isRecord(cell) && Object.keys(cell).length === 2 && Number.isSafeInteger(cell.sku) && cell.sku > 0 &&
+    ((Number.isSafeInteger(cell.position) && cell.position > 0) || cell.found === false || cell.returned === false ||
+        isBoundedString(cell.label, MAX_OZON_SEARCH_POSITIONS_LABEL_LENGTH));
+// Only a failed item that actually ran may explain its preflight stop; a skipped item carries no details.
+export const isValidOzonSearchPositionsDetails = (code, details) =>
+    isRecord(details) && Object.keys(details).length === 1 &&
+    ((code === 'OZON_REGION_UNAVAILABLE' && Array.isArray(details.candidates) && details.candidates.length >= 1 &&
+        details.candidates.length <= MAX_OZON_REGION_CANDIDATES &&
+        details.candidates.every((candidate) => isBoundedString(candidate, MAX_OZON_SEARCH_POSITIONS_TEXT_LENGTH))) ||
+        (code === 'OZON_SKU_LIMIT_EXCEEDED' && Number.isSafeInteger(details.limit) && details.limit > 0));
+// `skus` is the signed SKU list: cells are exactly one per SKU in that order. Without it (the wire
+// parser, before correlation) the cell SKUs must still form a valid signed list. EMPTY has no cells:
+// «no data for this query» must never read as «not found» for every SKU.
+export const isValidOzonSearchPositionsResult = (payload, skus) => {
+    if (!isRecord(payload) || !isNonNegativeSafeInteger(payload.itemIndex) || payload.itemIndex >= MAX_OZON_REPORT_PACKAGE_ITEMS) {
+        return false;
+    }
+    if (payload.ok === true) {
+        if (
+            !hasOnlyKeys(payload, ['itemIndex', 'ok', 'status', 'checkedAt', 'positions']) || Object.keys(payload).length !== 5 ||
+            // The last millisecond of year 9999: toISOString() keeps the four-digit year the output schema requires.
+            !Number.isSafeInteger(payload.checkedAt) || payload.checkedAt <= 0 || payload.checkedAt > 253402300799999 || !Array.isArray(payload.positions)
+        ) return false;
+        if (payload.status === 'empty') return payload.positions.length === 0;
+        if (payload.status !== 'complete' || !payload.positions.every(isValidOzonSearchPositionsCell)) return false;
+        const cellSkus = payload.positions.map(({ sku }) => sku);
+        return skus === undefined
+            ? isSearchPositionsSkuList(cellSkus)
+            : cellSkus.length === skus.length && cellSkus.every((sku, index) => sku === skus[index]);
+    }
+    if (payload.ok !== false || !hasOnlyKeys(payload, ['itemIndex', 'ok', 'status', 'error']) || !isRecord(payload.error)) return false;
+    const skipped = payload.status === 'skipped';
+    if (!skipped && Object.hasOwn(payload, 'status')) return false;
+    const { error } = payload;
+    return (
+        hasOnlyKeys(error, ['code', 'stage', 'retryable', 'message', 'details']) &&
+        Object.hasOwn(OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES, error.code) &&
+        OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES[error.code] === error.stage &&
+        error.retryable === false &&
+        isBoundedString(error.message, MAX_SAFE_MESSAGE_LENGTH) &&
+        (!Object.hasOwn(error, 'details') || (!skipped && isValidOzonSearchPositionsDetails(error.code, error.details)))
+    );
+};
 export const parseExtensionServerMessage = (value) => {
     if (
         !isRecord(value) ||
@@ -226,7 +277,8 @@ export const parseExtensionServerMessage = (value) => {
         typeof value.type !== 'string' ||
         (!EXTENSION_TO_CLIENT_MESSAGE_TYPES.includes(value.type) &&
             !OZON_PROMOTION_SERVER_MESSAGE_TYPES.includes(value.type) &&
-            !OZON_ANALYTICS_SERVER_MESSAGE_TYPES.includes(value.type) && value.type !== MESSAGE_TYPES.ozonReportPhase) ||
+            !OZON_ANALYTICS_SERVER_MESSAGE_TYPES.includes(value.type) && value.type !== MESSAGE_TYPES.ozonReportPhase &&
+            value.type !== MESSAGE_TYPES.ozonSearchPositionsResult) ||
         !isRecord(value.payload)
     ) {
         return { ok: false };
@@ -280,6 +332,7 @@ export const parseExtensionServerMessage = (value) => {
     if (type === MESSAGE_TYPES.ozonAnalyticsStreamChunk && !isValidOzonStreamChunk(payload, true)) return { ok: false };
     if (type === MESSAGE_TYPES.ozonAnalyticsStreamEnd && !isValidOzonStreamEnd(payload, true)) return { ok: false };
     if (type === MESSAGE_TYPES.ozonAnalyticsResult && !isValidIndexedOzonResult(payload, 'analytics')) return { ok: false };
+    if (type === MESSAGE_TYPES.ozonSearchPositionsResult && !isValidOzonSearchPositionsResult(payload)) return { ok: false };
 
     return { ok: true, message: value };
 };
@@ -349,6 +402,8 @@ export const createExtensionProtocol = ({
                         Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_PROMOTION_PACKAGE_CAPABILITY),
                     ozonSellerAnalyticsReportSupported:
                         Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_ANALYTICS_CAPABILITY),
+                    ozonSearchPositionsSupported:
+                        Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_SEARCH_POSITIONS_CAPABILITY),
                     diagnosticSnapshotSupported:
                         Array.isArray(payload.capabilities) && payload.capabilities.includes(DIAGNOSTIC_SNAPSHOT_CAPABILITY),
                     version: payload.extensionVersion,
@@ -529,9 +584,10 @@ export const createExtensionProtocol = ({
             return;
         }
 
-        if (type === MESSAGE_TYPES.ozonAnalyticsResult) {
+        if (type === MESSAGE_TYPES.ozonAnalyticsResult || type === MESSAGE_TYPES.ozonSearchPositionsResult) {
             const { itemIndex, ...result } = payload;
-            await requestBroker.resolveOzonReportPackageItem(message.id, 'analytics', itemIndex, result);
+            const family = type === MESSAGE_TYPES.ozonAnalyticsResult ? 'analytics' : 'positions';
+            await requestBroker.resolveOzonReportPackageItem(message.id, family, itemIndex, result);
             return;
         }
 

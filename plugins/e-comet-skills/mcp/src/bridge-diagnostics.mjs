@@ -62,6 +62,8 @@ export const deriveBridgeDiagnostics = (raw) => {
                 ? { ozonSellerPromotionReportsSupported: raw.ozonSellerPromotionReportsSupported } : {}),
             ...(typeof raw.ozonSellerAnalyticsReportSupported === 'boolean'
                 ? { ozonSellerAnalyticsReportSupported: raw.ozonSellerAnalyticsReportSupported } : {}),
+            ...(typeof raw.ozonSearchPositionsSupported === 'boolean'
+                ? { ozonSearchPositionsSupported: raw.ozonSearchPositionsSupported } : {}),
         },
         ...(raw.peer ? { peer: raw.peer } : {}),
         browserContext: raw.browserContext ?? { state: 'unknown' },

@@ -9,7 +9,7 @@ Use these actions only after the corresponding Claude surface is observed.
 
 Current official documentation verifies Cowork → Customize → Plugins for installation and Claude Code's commands above. Exact update-card labels remain a UI acceptance gap. If the exact installed build has not been exercised on the observed Claude surface, state that verification gap. Accepted local observations establish split cloud/device execution and hook dispatch for earlier builds only.
 
-The `hook_permissions` safe probe reads local Codex configuration. Do not use its result as Claude Code or Cowork hook evidence; use the host-specific checks above.
+Under Claude Code and Cowork the `hook_permissions` and `codex_mcp_auth` probes answer `unsupported` without reading the local Codex configuration; use the host-specific checks above.
 
 - Tool discovery: `ToolSearch` exists in Cowork and the Code tab. A fresh Cowork task's start list may hold no e-Comet tools; search with a large limit or by exact name before reporting absence.
 - Connector state: Cowork `ListConnectors` (`list_connectors` in the Code tab) reports `installState`, `connected`, and `enabledInChat` for the remote connector. The plugin's local server does not appear there. In the Code tab a session's `connected` status before a call proves little; `needs_auth` can appear only after the first failed call. A host authorization error on the call is stronger evidence. Connected connector tokens normally refresh automatically. The per-chat enable control for `enabledInChat:false` has no verified label; describe the action without naming a control.

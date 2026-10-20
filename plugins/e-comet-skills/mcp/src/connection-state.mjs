@@ -60,6 +60,7 @@ export class ConnectionState {
     extensionOzonPromotionReady = false;
     extensionOzonPromotionPackageReady = false;
     extensionOzonAnalyticsReady = false;
+    extensionOzonSearchPositionsReady = false;
     extensionDiagnosticSnapshotReady = false;
     peerSocket = null;
     peerReady = false;
@@ -68,6 +69,7 @@ export class ConnectionState {
     peerExtensionOzonPromotionReady = false;
     peerExtensionOzonPromotionPackageReady = false;
     peerExtensionOzonAnalyticsReady = false;
+    peerExtensionOzonSearchPositionsReady = false;
     peerExtensionDiagnosticSnapshotReady = false;
     // Старая первичная сборка поле про возможность Ozon в peer_status не присылает вовсе, и её
     // молчание нельзя читать как «расширение не умеет»: иначе вторичный агент посоветует обновить
@@ -75,6 +77,7 @@ export class ConnectionState {
     peerOzonPromotionSupportReported = false;
     peerOzonPromotionPackageSupportReported = false;
     peerOzonAnalyticsSupportReported = false;
+    peerOzonSearchPositionsSupportReported = false;
     peerBrowserContext = { state: 'unknown' };
     peerExtensionLastConnectedAtMs = null;
     peerExtensionLastDisconnectedAtMs = null;
@@ -125,6 +128,10 @@ export class ConnectionState {
         return this.extensionOzonAnalyticsReady || (this.peerReady && this.peerExtensionOzonAnalyticsReady);
     }
 
+    get effectiveOzonSearchPositionsReady() {
+        return this.extensionOzonSearchPositionsReady || (this.peerReady && this.peerExtensionOzonSearchPositionsReady);
+    }
+
     get effectiveDiagnosticSnapshotReady() {
         return this.extensionDiagnosticSnapshotReady || (this.peerReady && this.peerExtensionDiagnosticSnapshotReady);
     }
@@ -145,6 +152,11 @@ export class ConnectionState {
     get effectiveOzonAnalyticsSupportKnown() {
         if (this.extensionReady) return true;
         return this.peerReady && this.peerExtensionReady && this.peerOzonAnalyticsSupportReported;
+    }
+
+    get effectiveOzonSearchPositionsSupportKnown() {
+        if (this.extensionReady) return true;
+        return this.peerReady && this.peerExtensionReady && this.peerOzonSearchPositionsSupportReported;
     }
 
     get effectiveBrowserContext() {
@@ -193,6 +205,7 @@ export class ConnectionState {
             typeof options === 'object' && options.ozonSellerPromotionReportsSupported === true;
         const ozonSellerAnalyticsReportSupported =
             typeof options === 'object' && options.ozonSellerAnalyticsReportSupported === true;
+        const ozonSearchPositionsSupported = typeof options === 'object' && options.ozonSearchPositionsSupported === true;
         const diagnosticSnapshotSupported = typeof options === 'object' && options.diagnosticSnapshotSupported === true;
         const previousSocket = this.extensionSocket;
         const evicted = Boolean(previousSocket) && previousSocket !== socket;
@@ -215,6 +228,7 @@ export class ConnectionState {
         this.extensionOzonPromotionReady = ozonSellerPromotionReportSupported;
         this.extensionOzonPromotionPackageReady = ozonSellerPromotionReportsSupported;
         this.extensionOzonAnalyticsReady = ozonSellerAnalyticsReportSupported;
+        this.extensionOzonSearchPositionsReady = ozonSearchPositionsSupported;
         this.extensionDiagnosticSnapshotReady = diagnosticSnapshotSupported;
         this.extensionVersion = typeof options === 'object' ? options.version : undefined;
         this.extensionLastConnectedAtMs = this.#now();
@@ -230,6 +244,7 @@ export class ConnectionState {
         this.extensionOzonPromotionReady = false;
         this.extensionOzonPromotionPackageReady = false;
         this.extensionOzonAnalyticsReady = false;
+        this.extensionOzonSearchPositionsReady = false;
         this.extensionDiagnosticSnapshotReady = false;
         this.extensionLastDisconnectedAtMs = this.#now();
         this.browserContext = { state: 'unknown' };
@@ -259,10 +274,12 @@ export class ConnectionState {
         this.peerExtensionOzonPromotionReady = message.ozonSellerPromotionReportSupported === true;
         this.peerExtensionOzonPromotionPackageReady = message.ozonSellerPromotionReportsSupported === true;
         this.peerExtensionOzonAnalyticsReady = message.ozonSellerAnalyticsReportSupported === true;
+        this.peerExtensionOzonSearchPositionsReady = message.ozonSearchPositionsSupported === true;
         this.peerExtensionDiagnosticSnapshotReady = message.diagnosticSnapshotSupported === true;
         this.peerOzonPromotionSupportReported = typeof message.ozonSellerPromotionReportSupported === 'boolean';
         this.peerOzonPromotionPackageSupportReported = typeof message.ozonSellerPromotionReportsSupported === 'boolean';
         this.peerOzonAnalyticsSupportReported = typeof message.ozonSellerAnalyticsReportSupported === 'boolean';
+        this.peerOzonSearchPositionsSupportReported = typeof message.ozonSearchPositionsSupported === 'boolean';
         this.peerBrowserContext = message.browserContext?.state === 'known' ? { ...message.browserContext } : { state: 'unknown' };
         this.peerExtensionLastConnectedAtMs = Number.isFinite(message.extensionLastConnectedAtMs) ? message.extensionLastConnectedAtMs : null;
         this.peerExtensionLastDisconnectedAtMs = Number.isFinite(message.extensionLastDisconnectedAtMs) ? message.extensionLastDisconnectedAtMs : null;
@@ -316,11 +333,13 @@ export class ConnectionState {
         this.peerExtensionOzonPromotionReady = false;
         this.peerExtensionOzonPromotionPackageReady = false;
         this.peerExtensionOzonAnalyticsReady = false;
+        this.peerExtensionOzonSearchPositionsReady = false;
         this.peerExtensionDiagnosticSnapshotReady = false;
         this.peerExtensionDiagnosticSnapshotReady = false;
         this.peerOzonPromotionSupportReported = false;
         this.peerOzonPromotionPackageSupportReported = false;
         this.peerOzonAnalyticsSupportReported = false;
+        this.peerOzonSearchPositionsSupportReported = false;
         this.peerBrowserContext = { state: 'unknown' };
         this.authenticatedPrimaryMetadata = undefined;
         return true;
@@ -335,9 +354,11 @@ export class ConnectionState {
         this.peerExtensionOzonPromotionReady = false;
         this.peerExtensionOzonPromotionPackageReady = false;
         this.peerExtensionOzonAnalyticsReady = false;
+        this.peerExtensionOzonSearchPositionsReady = false;
         this.peerOzonPromotionSupportReported = false;
         this.peerOzonPromotionPackageSupportReported = false;
         this.peerOzonAnalyticsSupportReported = false;
+        this.peerOzonSearchPositionsSupportReported = false;
         this.peerBrowserContext = { state: 'unknown' };
         this.authenticatedPrimaryMetadata = undefined;
         this.resetPeerReconnect();

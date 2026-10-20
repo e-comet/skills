@@ -1,4 +1,6 @@
 import { OZON_PROMOTION_MIN_EXTENSION_VERSION } from './extension-vocabulary.mjs';
+import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
+import { maxSearchPositionsQueries } from './ozon-search-positions-domain.mjs';
 
 const authorizationWorkflow =
     'This typed local tool owns the workflow: select it based on user intent, then call the remote e-Comet browser_job exactly once with the matching typed job and immediately invoke this tool. ' +
@@ -6,14 +8,21 @@ const authorizationWorkflow =
     'Never decode, print, edit, copy, or expose the authorization. Do not infer an authorization failure from client status: attempt the actual remote call and report only the confirmed error in user-friendly language. If a tool is missing from the catalog, repeat the host tool search up to three times; never repeat browser_job or this tool to make an error disappear. ';
 
 const ozonScopeGuard =
-    'e-Comet provides exactly two Ozon Seller report families: promotion analytics and general analytics. ' +
+    'e-Comet Ozon tools cover exactly three needs: Ozon Seller promotion analytics reports, Ozon Seller general analytics reports, and Ozon search places of given SKUs for given queries. ' +
     'When the user asks for any other Ozon report or data (returns, finance, products, traffic, campaigns, orders), no e-Comet Ozon tool applies: ' +
-    'do not call browser_job, do not substitute the nearest report, and do not run any Ozon tool as a probe; say that only these two families exist and ask what the user wants. ';
+    'do not call browser_job, do not substitute the nearest tool, and do not run any Ozon tool as a probe; say that only these three exist and ask what the user wants. ';
+
+const ozonHookInjection =
+    'The trusted Claude or Codex host hook injects the opaque transport-only triggerUrl; model-authored arguments must omit both triggerUrl and trigger_url. Never decode, print, edit, copy, or expose that authorization. ';
+
+const ozonPackageContext =
+    'The extension automatically uses the first ready Seller context and pins its company for this package; never ask the user to focus a tab. A fresh authorization uses the then-current context and does not guarantee the previous company. ' +
+    'Do not use local_bridge_status to pre-approve or skip the signed operation; the family capability and typed operation result are authoritative. ';
 
 const ozonAuthorizationWorkflow =
     ozonScopeGuard +
     'This typed local tool owns the Ozon workflow. First call the remote browser_job({job:{type:"ozon_seller_promotion_report",dateFrom,dateTo}}) exactly once, then immediately invoke this tool with the same dates. ' +
-    'The trusted Claude or Codex host hook injects the opaque transport-only triggerUrl; model-authored arguments must omit both triggerUrl and trigger_url. Never decode, print, edit, copy, or expose that authorization. ' +
+    ozonHookInjection +
     'local_bridge_status reports legacy WB browser context and must not be used to gate this Ozon tool; the Ozon capability and typed operation result are authoritative. ' +
     'Its extension version and Ozon capability fields are informational only: use them to explain a failure, never to skip or pre-approve this call. ';
 
@@ -23,7 +32,7 @@ const ozonHandoffGuidance =
 const ozonPackageAuthorizationWorkflow = (browserJobType, businessArguments) =>
     ozonScopeGuard +
     `Call the remote browser_job exactly once with job {type:"${browserJobType}",${businessArguments}}, then invoke this local tool exactly once with the identical business array. ` +
-    'The trusted Claude or Codex host hook injects the opaque transport-only triggerUrl; model-authored arguments must omit both triggerUrl and trigger_url. Never decode, print, edit, copy, or expose that authorization. ' +
+    ozonHookInjection +
     'Never automatically retry browser_job or the local report call; a fresh authorization requires an explicit user-directed retry. ' +
     'Caller order is execution priority; acceptance does not guarantee that every item will finish. ' +
     'For a user-directed continuation, include only the selected skipped items in a fresh package. Do not silently include completed or failed items. ' +
@@ -32,8 +41,7 @@ const ozonPackageAuthorizationWorkflow = (browserJobType, businessArguments) =>
     'Use itemIndex to correlate the ordered results and stopReason to explain skipped work; a null stopReason means nothing was skipped, not that every item succeeded. ' +
     'OZON_EXECUTION_INTERRUPTED identifies an internal phase-delivery failure, not a Seller login or route diagnosis. ' +
     'Use its safe phase/createOutcome evidence: confirmed creation must not be repeated automatically; skipped work has not run. Offer an e-Comet bug report for persistent internal failures. ' +
-    'The extension automatically uses the first ready Seller context and pins its company for this package; never ask the user to focus a tab. A fresh authorization uses the then-current context and does not guarantee the previous company. ' +
-    'Do not use local_bridge_status to pre-approve or skip the signed operation; the family capability and typed operation result are authoritative. ' +
+    ozonPackageContext +
     ozonHandoffGuidance;
 
 const resultPathGuidance =
@@ -47,8 +55,11 @@ const reportDeliveryGuidance =
     'When the file exists, recover delivery through the host file capability using the same workbook; if a copy is needed, preserve the original and verify the copy against the returned size and SHA-256. ' +
     'Do not recreate a completed report because opening or reading its downloaded workbook failed. If the exact file cannot be checked from this host, report that verification gap without claiming the file is missing. ';
 
+const localBridgeGuidance =
+    'LOCAL_BRIDGE_* failures describe observed local pairing or listener problems, not marketplace login failures. Use the returned cause and local_bridge_status; do not prescribe opening a WB tab or obtaining repeated authorizations for a local permissions/bind failure. ';
+
 const localBridgeFailureGuidance =
-    'LOCAL_BRIDGE_* failures describe observed local pairing or listener problems, not marketplace login failures. Use the returned cause and local_bridge_status; do not prescribe opening a WB tab or obtaining repeated authorizations for a local permissions/bind failure. ' +
+    localBridgeGuidance +
     'For LOCAL_STORAGE_FAILED, use details.systemCode and the message when supplied to distinguish access, space/quota and path conflicts; do not infer the cause from the generic code alone. ';
 
 const rejectionAndHandoffGuidance =
@@ -178,6 +189,42 @@ const analyticsPackageContract =
             'Promotion analytics remains a separate Ozon workflow. The operation may create saved reports in Ozon, but it does not change products, campaigns, budgets, or seller settings. ' +
             'Returns compact metadata and one private resource_link per completed workbook. The resource_link contains a local file URI; workbook bytes, base64, company context, report identifiers, and request details are not included in model content.';
 
+// Cowork's one-minute call deadline caps a job's queries there; every other host gets the package cap.
+const searchPositionsQueryLimit = (maxQueries) => (maxQueries < MAX_OZON_REPORT_PACKAGE_ITEMS
+    ? `More than 10 SKUs need several jobs, only on the user's decision. This app ends a tool call after about a minute, so one job checks at most ${maxQueries} queries: run a longer list as consecutive jobs of up to ${maxQueries} queries, each with its own browser_job. `
+    : `More than ${maxQueries} queries or 10 SKUs need several jobs, only on the user's decision. `);
+
+const searchPositionsContract = (maxQueries) =>
+            'Get Ozon search places of given Ozon SKUs (own or competitors\') for given search queries as one JSON table: rows are queries, columns are the SKUs. Use for Russian requests about позиции/места товаров в поиске Ozon по фразам. ' +
+            ozonScopeGuard +
+            `Call the remote browser_job exactly once with job {type:"ozon_search_positions",queries:[1-${maxQueries} strings],skus:[1-10 integers],region?:string default "Москва",platform?:"ozon"|"select"}, then invoke this local tool exactly once with the identical queries, skus, region and platform. ` +
+            ozonHookInjection +
+            'Never automatically retry browser_job or this local call, including rate-limited work; a fresh authorization requires an explicit user-directed retry. ' +
+            'Queries are trimmed, 1-128 characters and unique after trimming; their order is execution priority. SKUs are unique positive integers. ' +
+            searchPositionsQueryLimit(maxQueries) +
+            'region is a city or area name as Ozon lists it; a word such as «беларусь» inside a query is part of the query, never a region. ' +
+            'platform "ozon" is the main Ozon storefront; "select" is Ozon Селект (brand storefront), where empty usually means the goods are not sold in Селект. ' +
+            'Read queries[] by itemIndex; each positions[] follows the top-level skus order. A cell is an integer place; "not_found" means Ozon reports no such product for this query, which may also mean a wrong SKU; ' +
+            '"not_returned" means the SKU was absent from Ozon\'s answer and the cause is not established; any other text is Ozon\'s own label (for example "499+"), kept as is: never convert it to a number. ' +
+            'A place is Ozon\'s own figure; whether it includes paid promotion is not established, so never call it organic or paid. ' +
+            'Query status "empty" means Ozon has no data for this query on this platform; it is not "not found" for every SKU. "failed" carries the query error. ' +
+            '"skipped" means no result; the query in progress when the package stopped may already have reached Ozon. ' +
+            'stopReason and the top-level error explain why queries were skipped; a null stopReason means nothing was skipped, not that every query has places. ' +
+            'Places change within hours, so report checkedAt with them. To track history, keep the JSON of each run; build Excel or other files yourself only if the user asks. ' +
+            'On the user\'s decision, a fresh job may include the selected skipped or failed queries; no automatic retry. ' +
+            'OZON_REGION_UNAVAILABLE: the region matched no Ozon location or several; show details.candidates and ask the user for a precise city, then a new job on the user\'s decision. ' +
+            'OZON_SKU_LIMIT_EXCEEDED: more SKUs than Ozon allows for this seller (details.limit); split them into several jobs only on the user\'s decision. ' +
+            'OZON_SEARCH_FAILED: Ozon failed this query; report the query as failed, no automatic retry. ' +
+            'OZON_RATE_LIMITED: Ozon limited the requests; the package stopped and the remaining queries are skipped; no automatic retry. Ozon counts per minute, so a new job for the skipped queries waits at least a minute, on the user\'s decision. ' +
+            'OZON_SEARCH_POSITIONS_CAPABILITY_UNAVAILABLE: the connected extension cannot run this tool; the user updates the e-Comet extension, then a new authorization on the user\'s decision; opening an Ozon page does not help. ' +
+            'OZON_ROUTE_NOT_READY: no ready Ozon Seller route was reachable and its cause is not established; ask the user to check the extension in the same browser profile and refresh any authenticated Ozon Seller page under https://seller.ozon.ru/app, then a new authorization on the user\'s decision. Never use WB-tab recovery for Ozon. ' +
+            'OZON_CONTEXT_CHANGED: the Seller company changed during the run, so the remaining queries are skipped; a new job on the user\'s decision pins the then-current company. ' +
+            'OZON_EXECUTION_INTERRUPTED: the extension\'s results could not be accepted; an internal e-Comet failure, not a Seller login or route problem; offer an e-Comet bug report. ' +
+            ozonPackageContext +
+            localBridgeGuidance +
+            rejectionAndHandoffGuidance +
+            ozonHandoffGuidance;
+
 export const feedbackToolContract = String.raw`# Send feedback to e-Comet
 
 Use the remote \`report_issue\` tool together with the local \`prepare_e_comet_feedback\` and \`submit_e_comet_feedback\` tools. This is an externally mutating workflow: preserve the user's consent and resolved history choice through every recovery step.
@@ -238,7 +285,7 @@ const signedNames = [
     'wb_product_card', 'wb_search_by_query', 'wb_check_by_query',
     'wb_recommendations_by_product', 'wb_seller_reviews',
     'ozon_seller_promotion_report', 'ozon_seller_promotion_reports',
-    'ozon_seller_analytics_report',
+    'ozon_seller_analytics_report', 'ozon_search_positions',
 ];
 
 export const SIGNED_CONTRACT_TOOL_NAMES = Object.freeze(signedNames);
@@ -253,6 +300,7 @@ const signedContracts = Object.freeze({
     ozon_seller_promotion_report: promotionContract,
     ozon_seller_promotion_reports: promotionPackageContract,
     ozon_seller_analytics_report: analyticsPackageContract,
+    ozon_search_positions: searchPositionsContract(MAX_OZON_REPORT_PACKAGE_ITEMS),
 });
 
 const feedbackContractAppliesTo = Object.freeze([
@@ -271,14 +319,18 @@ const feedbackResult = (name) => {
     };
 };
 
-export const describeToolContract = (name) => {
+/** @param {string} name @param {{ clientName?: string }} [options] */
+export const describeToolContract = (name, { clientName } = {}) => {
     if (FEEDBACK_CONTRACT_TOOL_NAMES.includes(name)) return feedbackResult(name);
     if (!Object.hasOwn(signedContracts, name)) return null;
+    const contract = name === 'ozon_search_positions'
+        ? searchPositionsContract(maxSearchPositionsQueries(clientName))
+        : signedContracts[name];
     return {
         schemaVersion: FEEDBACK_CONTRACT_SCHEMA_VERSION,
         type: 'e_comet_tool_contract',
         requestedTool: name,
         appliesTo: ['browser_job', name],
-        contract: signedContracts[name],
+        contract,
     };
 };

@@ -15,6 +15,7 @@ export const MESSAGE_TYPES = Object.freeze({
     ozonPromotionStreamAck: 'ozon_seller_promotion_report_stream_ack',
     ozonAnalyticsOperation: 'ozon_seller_analytics_report_operation',
     ozonAnalyticsStreamAck: 'ozon_seller_analytics_report_stream_ack',
+    ozonSearchPositionsOperation: 'ozon_search_positions_operation',
     // расширение -> local MCP
     helloAck: 'hello_ack',
     wbFetchResult: 'wb_fetch_result',
@@ -33,6 +34,7 @@ export const MESSAGE_TYPES = Object.freeze({
     ozonAnalyticsStreamChunk: 'ozon_seller_analytics_report_stream_chunk',
     ozonAnalyticsStreamEnd: 'ozon_seller_analytics_report_stream_end',
     ozonAnalyticsResult: 'ozon_seller_analytics_report_result',
+    ozonSearchPositionsResult: 'ozon_search_positions_result',
     error: 'error',
     // в обе стороны (heartbeat)
     ping: 'ping',
@@ -73,6 +75,9 @@ export const peerStatusMessage = ({
     ...(connections.extensionOzonAnalyticsReady === undefined
         ? {}
         : { ozonSellerAnalyticsReportSupported: connections.extensionOzonAnalyticsReady === true }),
+    ...(connections.extensionOzonSearchPositionsReady === undefined
+        ? {}
+        : { ozonSearchPositionsSupported: connections.extensionOzonSearchPositionsReady === true }),
     ...(connections.extensionLastConnectedAtMs === null ? {} : { extensionLastConnectedAtMs: connections.extensionLastConnectedAtMs }),
     ...(connections.extensionLastDisconnectedAtMs === null ? {} : { extensionLastDisconnectedAtMs: connections.extensionLastDisconnectedAtMs }),
     // Вторичный процесс сам расширение не видит, поэтому без этого поля конкуренция
@@ -155,6 +160,24 @@ export const OZON_ANALYTICS_TERMINAL_CODE_STAGES = Object.freeze({
     OZON_RATE_LIMITED: 'rate_limit',
     ARTIFACT_REJECTED: 'artifact',
     OZON_EXECUTION_INTERRUPTED: 'execution',
+    OPERATION_CANCELLED: 'cancelled',
+    OPERATION_DEADLINE_EXCEEDED: 'deadline',
+});
+// Позиции — пакет без create, фаз и потоков: только терминальный результат на каждый запрос.
+export const OZON_SEARCH_POSITIONS_CAPABILITY = 'ozon_search_positions@1';
+export const OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES = Object.freeze({
+    OZON_AUTHORIZATION_REJECTED: 'authorization',
+    OZON_ADMISSION_CAPACITY_EXHAUSTED: 'extension',
+    OZON_ROUTE_NOT_READY: 'route',
+    OZON_SEARCH_POSITIONS_CAPABILITY_UNAVAILABLE: 'context',
+    OZON_CONTEXT_CHANGED: 'context',
+    PREFLIGHT_FAILED: 'preflight',
+    OZON_REGION_UNAVAILABLE: 'preflight',
+    OZON_SKU_LIMIT_EXCEEDED: 'preflight',
+    POLL_FAILED: 'poll',
+    POLL_EXHAUSTED: 'poll',
+    OZON_SEARCH_FAILED: 'poll',
+    OZON_RATE_LIMITED: 'rate_limit',
     OPERATION_CANCELLED: 'cancelled',
     OPERATION_DEADLINE_EXCEEDED: 'deadline',
 });

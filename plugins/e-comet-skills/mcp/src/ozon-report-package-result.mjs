@@ -1,3 +1,15 @@
+import { SELLER_AUTHORIZATION_SCOPE_MAX_MS } from './config.mjs';
+
+const SIGNED_EXPIRY_SAFETY_RESERVE_MS = 1000;
+
+// The extension refuses a package deadline after the signed expiry, so one second of it is held back.
+export const ozonPackageDeadline = (authorization, startedAt) => Math.min(
+    startedAt + SELLER_AUTHORIZATION_SCOPE_MAX_MS,
+    typeof authorization?.expiresAt === 'number' && Number.isFinite(authorization.expiresAt)
+        ? Math.floor(authorization.expiresAt * 1000 - SIGNED_EXPIRY_SAFETY_RESERVE_MS)
+        : Infinity
+);
+
 export const OZON_PACKAGE_STOP_REASONS = Object.freeze([
     'authorization_unavailable',
     'capability_unavailable',

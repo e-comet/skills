@@ -32,6 +32,7 @@ import { FETCH_ERROR_CODES, SELLER_OPERATION_STAGES } from './extension-vocabula
 import { parseAnalyticsReports } from './ozon-analytics-domain.mjs';
 import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
 import { parsePromotionPeriods } from './ozon-report-package-domain.mjs';
+import { canonicalSearchPositionsRequest, sameSearchPositionsRequest } from './ozon-search-positions-domain.mjs';
 import { ToolExecutionError } from './tool-errors.mjs';
 import {
     isSuccessfulWbResponse,
@@ -346,6 +347,25 @@ export const validateAuthorizedJobLimits = (authorization) => {
                 throw new Error('Invalid Ozon analytics descriptor');
             }
             parseAnalyticsReports(job.reports, authorization.issuedAt);
+            return;
+        }
+
+        if (authorization.jobType === 'ozon_search_positions') {
+            const keys = Object.keys(job);
+            if (
+                keys.length !== 6 ||
+                !keys.every((key) => ['jobId', 'type', 'queries', 'skus', 'region', 'platform'].includes(key)) ||
+                job.type !== 'ozon-search-positions'
+            ) {
+                throw new Error('Invalid Ozon search positions descriptor');
+            }
+            // The signer materializes defaults and trims, so a signed descriptor is already canonical. A signer trimming
+            // other whitespace than ECMAScript fails closed here: accepted residual, see
+            // docs/local-agent-architecture.md#accepted-residuals.
+            const { queries, skus, region, platform } = job;
+            if (!sameSearchPositionsRequest(canonicalSearchPositionsRequest({ queries, skus, region, platform }), job)) {
+                throw new Error('Ozon search positions descriptor is not canonical');
+            }
             return;
         }
 

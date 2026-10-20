@@ -24,6 +24,7 @@ window.__ModuleLoader__.load({
       extension_offline: 'Расширение не на связи', localOfflineBefore: 'Откройте любую страницу ', localOfflineAfter: ' в браузере с расширением e-Comet — оно подключится само.',
       localDoctorHint: 'Не помогло? Напишите агенту «Диагностируй e-Comet»',
       bridge_unavailable: 'Мост e-Comet недоступен', localBridgeHint: 'Попросите агента проверить подключение e-Comet — напишите ему «Диагностируй e-Comet»',
+      localUnavailableBefore: 'Локальный модуль e-Comet не запущен; плагин перезапускает его сам. Если через несколько минут статус не изменился, перезапустите DeepSeek, а если не помогло — напишите в поддержку через виджет на ', localUnavailableAfter: '.',
       updateChecking: 'Проверка обновлений', updateCurrent: 'Доступных обновлений нет',
       updateAvailable: 'Доступно обновление e-Comet:', updateInstalling: 'Обновление e-Comet',
       updateRestart: 'Обновление установлено. Перезапустите DeepSeek, чтобы использовать версию',
@@ -344,7 +345,10 @@ window.__ModuleLoader__.load({
               const tip = current==='extension_offline' ? h('div',{className:'ec-tip-box'},
                   t('localOfflineBefore'), h('a',{href:'https://www.wildberries.ru/',target:'_blank',rel:'noopener noreferrer'},'wildberries.ru',externalIcon()), t('localOfflineAfter'),
                   h('br'), h('span',{style:{opacity:.7}},t('localDoctorHint')))
-                : current==='bridge_unavailable' ? h('div',{className:'ec-tip-box'},t('localBridgeHint')) : null;
+                : current==='bridge_unavailable' ? h('div',{className:'ec-tip-box'},t('localBridgeHint'))
+                // The local module is not running and the adapter keeps restarting it: the row names the wait and the two user steps itself.
+                : kind==='local' && current==='unavailable' ? h('div',{className:'ec-tip-box'},
+                  t('localUnavailableBefore'), h('a',{href:'https://app.e-comet.io/',target:'_blank',rel:'noopener noreferrer'},'app.e-comet.io',externalIcon()), t('localUnavailableAfter')) : null;
               const status = tip
                 ? h('span',{className:'ec-tip'},h('span',{className:'ec-status ec-tip-term',tabIndex:0},t(statusKey)),h('div',{className:'ec-tip-bubble','data-align':'end',role:'tooltip'},tip))
                 // Words only where the row differs from the badge: a reconnecting row repeats the badge, so it keeps the icon alone.

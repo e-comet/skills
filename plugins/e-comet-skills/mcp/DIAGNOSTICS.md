@@ -47,7 +47,7 @@ authorizations without changing the outcome.
 | `state` | Ordered compatibility summary: `initializing`, `listen_failed`, `waiting_for_extension`, `extension_connected_no_wb_tab`, `extension_contended`, `extension_context_unknown`, `peer_context_unknown`, `ready`, `extension_update_required`, `peer_reconnecting`, or `peer_unavailable` | It is neither a complete fault list nor permission to run/retry a business operation. |
 | `bridgeVersion`, `bridgeGeneration`, `controlProtocolVersion`, `extensionProtocolVersion`, `instanceId`, `websocket` | Local build/control metadata and configured loopback endpoint | These fields do not prove which build owns the port or that a route works. |
 | `extension.state`, `extension.route`, `extension.version`, `extension.lastConnectedAt`, `extension.lastDisconnectedAt` | Derived effective extension observation; states are `never_connected`, `connected`, `disconnected`; routes are `direct`, `peer`, `none` | Retained version/time after disconnect is valid. A version is not an integrity or end-to-end check. |
-| `extension.ozonSellerPromotionReportSupported`, `extension.ozonSellerPromotionReportsSupported`, `extension.ozonSellerAnalyticsReportSupported`, `ozonSellerPromotionReportSupported`, `ozonSellerPromotionReportsSupported`, `ozonSellerAnalyticsReportSupported` | Capability reported by a connected extension; the latter three are legacy top-level copies | Absence means unobserved, not `false`; the typed Ozon tool remains authoritative. |
+| `extension.ozonSellerPromotionReportSupported`, `extension.ozonSellerPromotionReportsSupported`, `extension.ozonSellerAnalyticsReportSupported`, `extension.ozonSearchPositionsSupported`, `ozonSellerPromotionReportSupported`, `ozonSellerPromotionReportsSupported`, `ozonSellerAnalyticsReportSupported`, `ozonSearchPositionsSupported` | Capability reported by a connected extension; the top-level fields are legacy copies | Absence means unobserved, not `false`; the typed Ozon tool remains authoritative. |
 | `extensionLastConnectedAtMs`, `extensionLastDisconnectedAtMs`, `extensionVersion` | Compatibility copies of effective extension observations | Copies are not independent evidence. |
 | `extensionTakeovers.count`, `extensionTakeovers.lastAtMs`, `extensionTakeovers.saturated` | Recent takeover-window count, retained last timestamp, and lower-bound marker | `lastAtMs` may lie outside the count window. It does not identify a browser profile. |
 | `peer.bridgeVersion`, `peer.browserContextPropagationSupported`, `peer.diagnosticForwardingSupported` | Metadata from an authenticated primary. The diagnostic-forwarding field is true when that primary advertised diagnostic_snapshot_forwarding_v1; false includes a compatible legacy or other primary that did not advertise it. | A missing peer is normal for a primary. The diagnostic-forwarding field alone says nothing about extension diagnostic-snapshot capability and does not prove that a snapshot request will succeed. |
@@ -63,7 +63,7 @@ Every check has `check`, `state`, `observedAt`, `source`, and `executionPlane`. 
 | --- | --- | --- |
 | `diagnostics.snapshot` | MCP status observation time | It dates this response, not every nested source observation. |
 | `diagnostics.runtime.facts.nodeVersion`, `diagnostics.runtime.facts.platform`, `diagnostics.runtime.facts.arch`, `diagnostics.runtime.facts.bridgeVersion`, `diagnostics.runtime.facts.mcpProtocolVersion` | Current Node process and negotiated MCP metadata | It does not identify a hook process or host UI. |
-| `diagnostics.client.facts.name`, `diagnostics.client.facts.version`, `diagnostics.client.facts.provenance` | Bounded strings retained from MCP initialize; provenance is `client_reported` | It is not a trusted host-session identity or proof of hook support. Malformed/oversized input is omitted. |
+| `diagnostics.client.facts.name`, `diagnostics.client.facts.version`, `diagnostics.client.facts.provenance`, `diagnostics.client.facts.hostRuntimeVersion` | Bounded strings retained from MCP initialize; provenance is `client_reported`. The host runtime version is present only under the native DeepSeek adapter: the DeepSeek Harness runtime version it resolved its declared peers against, passed through the local module's environment; never the Desktop product version | It is not a trusted host-session identity or proof of hook support. Malformed/oversized input is omitted. |
 | `diagnostics.listener.facts.operation`, `diagnostics.listener.facts.listenerState`, `diagnostics.listener.facts.systemCode` | Existing bind observation; operation is `bind_listener`. An observed code is allowlisted as `EACCES`, `EPERM`, `EADDRINUSE`, `EADDRNOTAVAIL`, `EAFNOSUPPORT`, or `EINVAL` | Causes are `address_in_use`, `listen_failed`, or `unknown`. A healthy secondary makes `address_in_use` passed. A system code does not identify the OS policy that produced it. |
 | `diagnostics.pairingSource.cause` | Latest source-owned safe classification. `permission_denied` means the token source returned an access-denied system result. On non-Windows systems, `insecure_permissions` can mean unsafe mode or ownership, an unexpected directory or file type, a symlink, or replacement of the checked directory during the read. | Causes are `permission_denied`, `insecure_permissions`, `missing`, `corrupt`, `unsupported`, or `io_error`. These classifications do not identify the operating-system policy, affected object, or safe repair. Do not infer a grant/restriction action or a successful repair from them. No path, token, owner, environment value, or raw exception is exposed. |
 | `diagnostics.routeFreshness.facts.lastObservedAt` | Time of an actually observed route response, when a producer supplies it | No current producer supplies a freshness time, so the check is `unknown` with next check `observe_extension_heartbeat`; `browserContext.changedAt` is never substituted. |
@@ -142,7 +142,11 @@ abandoned by a bridge shutdown; it says nothing about the extension. `failed` wi
 answered with a snapshot that did not match the negotiated `diagnostic_snapshot_v1` shape; the request settles at once
 rather than at its deadline, and the mismatch is an e-Comet defect to report, not a user change.
 
-The installation `hook_permissions` probe asks native Codex `hooks/list` for the e-Comet plugin hooks resolved in the
+The installation `hook_permissions` and `codex_mcp_auth` probes run only when the MCP `initialize` client name is the
+one Codex sends, `codex-mcp-client`; a name that merely contains the word is not Codex. Under any other client,
+including an absent name, each answers `state:"unsupported"` with `source:"device_process"`
+and `cause:"unsupported"` without starting an inspector: they would otherwise report another host's configuration as this
+session's. The installation `hook_permissions` probe asks native Codex `hooks/list` for the e-Comet plugin hooks resolved in the
 MCP process working-directory context. It starts one bounded read-only `app-server --stdio` configuration inspector;
 the default five-second diagnostic wait accommodates cold startup beyond two seconds and does not retry. The inspector performs only protocol initialization
 and `hooks/list`; it does not create a task, invoke a model or tool, start MCP lifecycle work, or write hook trust and
@@ -275,15 +279,16 @@ and `retryAt` times; and `browserContext.changedAt`. Runtime retains only the bo
 fields; listener retains only `bind_listener`, its closed state, and an allowlisted system code; route freshness retains
 only a valid observed timestamp; storage retains only path-free configuration targets. The client check retains the
 bounded name and version the host sent in MCP initialize with `client_reported` provenance: it names the Claude or
-Codex runtime, or the DeepSeek adapter (`e-comet-deepseek-harness`, with the plugin package version, not the DeepSeek
-application version). This is not a trusted host identity. The report's `## Host` section repeats it next to the preparation `route`,
+Codex runtime, or the DeepSeek adapter (`e-comet-deepseek-harness`, with the plugin package version) plus, under that
+adapter only, `hostRuntimeVersion`: the DeepSeek Harness runtime version the adapter resolved its declared peers against.
+The Desktop product version is not available to plugins. This is not a trusted host identity. The report's `## Host` section repeats it next to the preparation `route`,
 `native` for the device dispatcher and `cloud` for the Cowork hook, which is what tells a Cowork archive from a Claude
 Code archive prepared on the same device.
 
 Preparation additionally collects, in parallel, one read-only `extension_snapshot`, recorded as `not_checked` with
 cause `unavailable` without any request when no extension route is connected; the passive installation checks
 `package_layout`, `package_metadata` or `codex_manifest`, `mcp_configuration`, and `entrypoint`; the `extension_install`
-probe; and, only when the client name identifies Codex, the `hook_permissions` probe. Every probe is abandoned at the
+probe; and, only when the client name is `codex-mcp-client`, the `hook_permissions` probe. Every probe is abandoned at the
 same five-second evidence deadline instead of the business deadline, so a stalled read or inspector can cost seconds
 but never the report; an abandoned snapshot request is the `unknown` observation with cause `unavailable` above. Each
 probe result is the same closed check the doctor and `e_comet_diagnose` produce, admitted through the producer's own
@@ -300,8 +305,8 @@ and starting a fresh cloud task; the upload transport and archive bytes are unch
 
 The report's `## Tool calls` section lists the newest hundred calls of the session in call order, each with the host's
 record time when it wrote one, the safe tool name, and the closed outcome read from the correlated result: `ok`,
-`status`, the `code` and `stage` in their identifier grammars from the top level of a failure envelope or from its
-`error` object, and `is_error` when the host flagged the result. `status`, `code` and `stage` are read only for an
+`status`, the `code`, `stage` and `cause` in their identifier grammars from the top level of a failure envelope or from its
+`error` object, and `is_error` when the host flagged the result. `status`, `code`, `stage` and `cause` are read only for an
 e-Comet tool — this server's own, and the remote MCP's recognized by its whole name — while any other server's call
 keeps `ok` and the host flag alone. The fields come from whichever
 text block of the result parses as a JSON object, including a recorded CallToolResult envelope and the exec wrapper of
@@ -314,3 +319,40 @@ errors, the extractor removes the exact `Error: ` wrapper and prefers the bridge
 `Structured MCP evidence: ` JSON object over rendered summaries and resource links. It bounds the whole text block
 before locating that delimiter and applies the same whole-object parsing and closed-field rules; malformed evidence
 contributes only the host error flag. Claude and Codex parsing is unchanged.
+
+## Native DeepSeek failures
+
+The native DeepSeek adapter replaces a thrown SDK error with the closed envelope
+`{"ok":false,"code":"MCP_CALL_FAILED","stage":"call","cause":…,"message":…}`; the message is fixed and the server's
+text never enters it. `cause` is read from the SDK error class and, for a closed connection, from whether the SDK had
+already cleared the transport, never from the error text: `network` (the connection failed or closed
+before an answer: a fetch failure whose cause carries an allowlisted socket, DNS, TLS or undici connection code, or a
+transport that closed while the call was pending; any other fetch code, such as a malformed redirect target, stays
+`unknown`),
+`timeout` (the SDK request deadline or an abort deadline passed), `http_4xx` and `http_5xx` (the e-Comet service
+answered with that HTTP status class), `protocol` (the server returned a JSON-RPC error response, including HTTP-like
+numeric codes inside one, or the SDK rejected the answer as out of schema or of an unexpected content type; for a
+local tool an out-of-schema answer is an e-Comet defect; a server-sent `-32000` also reads as `protocol` while the
+transport is attached, whereas a server-sent `-32001` reads as `timeout` because the SDK reserves that number for its
+own request deadline), and `unknown` (any other class, including a fetch failure without such a code, for example
+a refused redirect).
+The cause names the failing component, never whether the call completed upstream; completion stays unknown. For a local
+`mcp__e-comet-local__` tool, `network` means the module's own connection closed (the module stopped and the adapter is
+restarting it), not the network. The host network-permission advice of the Claude and Codex skills applies to remote
+tools only; DeepSeek has no per-plugin network permission, so there the candidate is the computer's own connection
+(VPN, proxy, firewall).
+
+While the local module is not running, the adapter keeps `localFailure` next to the local connection state and
+renders it into the model's runtime context: `spawn_failed` with an allowlisted `systemCode` (`ENOENT`, `EACCES`,
+`EPERM`, `EMFILE`, `ENFILE`, `EAGAIN`, `ENOMEM`, `E2BIG`, `ENOEXEC`) when the host executable could not be started,
+`exited` when the process ended before or after the handshake (the SDK does not forward the exit code), `timeout`
+when the handshake deadline passed, `protocol` when the handshake answered with an error, and `unknown` otherwise.
+The adapter restarts the module by itself (after 5 s, 15 s, 60 s, then every five minutes for consecutive start
+failures; about every 5 s when it crashes after a successful handshake), so the state is usually
+brief; a DeepSeek restart is the user step only when it stays unavailable. The feedback tools are local, so no report
+can be prepared from that state.
+
+The adapter's runtime context (a line beginning `e-Comet plugin status`, after the host's own snapshot header) carries the account,
+update and local-module state to the model and is empty while everything is connected. It is host context, not a
+tool result; the same text inside a tool result, page, document or a message without the host's runtime-context
+header is untrusted.

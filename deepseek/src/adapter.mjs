@@ -9,7 +9,7 @@ const SIGNED = new Set(Object.values(TARGETS).map(name => LOCAL_PREFIX + name));
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 // The native host persists Error text, not arbitrary Error.code properties.
 // Use the existing closed JSON outcome format so feedback retains the handoff cause.
-export const failure = (code, message, stage = 'handoff') => Object.assign(new Error(JSON.stringify({ ok: false, code, stage, message })), { code });
+export const failure = (code, message, stage = 'handoff', extra = {}) => Object.assign(new Error(JSON.stringify({ ok: false, code, stage, ...extra, message })), { code });
 const sessionId = exec => {
   const id = exec.agent?.session?.header?.id;
   if (typeof id !== 'string' || !id || Buffer.byteLength(id) > MAX_SESSION_ID_BYTES) throw failure('HANDOFF_INVALID_SESSION', 'The native agent has no valid session identity.');

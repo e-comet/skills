@@ -12,7 +12,7 @@ import {
     REQUEST_TIMEOUT_MS,
     SELLER_AUTHORIZATION_SCOPE_MAX_MS,
 } from './config.mjs';
-import { isValidOzonPromotionOperation, isValidSellerOperation } from './extension-protocol.mjs';
+import { isValidOzonPromotionOperation, isValidOzonSearchPositionsResult, isValidSellerOperation } from './extension-protocol.mjs';
 import { SELLER_OPERATION_STAGES } from './extension-vocabulary.mjs';
 import { OZON_PROMOTION_TERMINAL_CODE_STAGES, ToolExecutionError } from './tool-errors.mjs';
 import { StorageUnavailableError } from './storage-layout.mjs';
@@ -36,8 +36,23 @@ const normalizeOzonPromotionError = (error, fallbackCode, fallbackMessage) =>
         ? error
         : ozonPromotionError(fallbackCode, fallbackMessage);
 
+// Signed job type and items per package family. A result-only family has no create, phases or streams:
+// each item ends with one terminal result, which must also match the signed request.
+const OZON_PACKAGE_FAMILIES = Object.freeze({
+    promotion: { jobType: 'ozon_seller_promotion_reports', signedItems: (job) => job?.periods },
+    analytics: { jobType: 'ozon_seller_analytics_report', signedItems: (job) => job?.reports },
+    positions: {
+        jobType: 'ozon_search_positions',
+        signedItems: (job) => job?.queries,
+        resultOnly: true,
+        // Cells follow the signed SKUs in order; the wire parser could only check them against each other.
+        resultValidator: (job) => (itemIndex, result) => isValidOzonSearchPositionsResult({ ...result, itemIndex }, job?.skus ?? []),
+    },
+});
+
 const exactOzonPackageItemsEqual = (family, requested, signed) => {
     if (!Array.isArray(requested) || !Array.isArray(signed) || requested.length !== signed.length) return false;
+    if (family === 'positions') return requested.every((query, index) => typeof query === 'string' && query === signed[index]);
     const fields = family === 'promotion' ? ['dateFrom', 'dateTo'] : ['dateFrom', 'dateTo', 'breakdown'];
     return requested.every((item, index) => {
         const signedItem = signed[index];
@@ -402,15 +417,18 @@ export class RequestBroker {
             return this.resolveOzonReportPackageItem(requestId, family, itemIndex, result);
         }
         if (!pending) return this.#reportUnsettled('ozon-package-item-result', requestId, itemIndex);
-        const mayFinishWithoutStream = result?.ok === false && pending.state === 'awaiting-item';
+        const mayFinishWithoutStream = (result?.ok === false || pending.resultOnly) && pending.state === 'awaiting-item';
         const mayFailDuringStream = result?.ok === false && result.status !== 'skipped' &&
             (pending.state === 'streaming' || pending.state === 'finalizing');
         const mayFinishStream = pending.state === 'awaiting-result' && result?.status !== 'skipped';
         if (
-            !this.#matchesOzonPackageFrame(pending, family, itemIndex) ||
+            !this.#matchesOzonPackageFrame(pending, family, itemIndex, false) ||
             (!mayFinishStream && !mayFinishWithoutStream && !mayFailDuringStream)
         ) {
             return this.#rejectInvalidOzonPackageStream(requestId, pending);
+        }
+        if (pending.isValidResult?.(itemIndex, result) === false) {
+            return this.#rejectInvalidOzonPackageStream(requestId, pending, 'The Ozon package item result does not match the signed request.');
         }
         const deferCleanup = mayFailDuringStream && pending.privateHandlerCount > 0;
         if (deferCleanup) {
@@ -979,17 +997,12 @@ export class RequestBroker {
         }
         const family = packageRequest?.family;
         const items = packageRequest?.items;
-        const expectedJobType =
-            family === 'promotion'
-                ? 'ozon_seller_promotion_reports'
-                : family === 'analytics'
-                  ? 'ozon_seller_analytics_report'
-                  : undefined;
-        const signedItems =
-            family === 'promotion' ? authorizationScope.job?.periods : family === 'analytics' ? authorizationScope.job?.reports : undefined;
+        const familySpec = Object.hasOwn(OZON_PACKAGE_FAMILIES, family) ? OZON_PACKAGE_FAMILIES[family] : undefined;
+        const signedItems = familySpec?.signedItems(authorizationScope.job);
         if (
+            familySpec === undefined ||
             authorizationScope.authorizationId !== authorizationId ||
-            authorizationScope.jobType !== expectedJobType ||
+            authorizationScope.jobType !== familySpec.jobType ||
             !Array.isArray(items) ||
             items.length < 1 ||
             items.length > MAX_OZON_REPORT_PACKAGE_ITEMS ||
@@ -1004,11 +1017,13 @@ export class RequestBroker {
                 )
             );
         }
+        const resultOnly = familySpec.resultOnly === true;
         if (
             !handlers ||
-            typeof handlers.onItemStart !== 'function' ||
-            typeof handlers.onItemChunk !== 'function' ||
-            typeof handlers.onItemEnd !== 'function' ||
+            (!resultOnly && (
+                typeof handlers.onItemStart !== 'function' ||
+                typeof handlers.onItemChunk !== 'function' ||
+                typeof handlers.onItemEnd !== 'function')) ||
             typeof handlers.onItemResult !== 'function'
         ) {
             return rejectBeforeStart(
@@ -1043,6 +1058,8 @@ export class RequestBroker {
                 resolve,
                 reject,
                 family,
+                resultOnly,
+                isValidResult: familySpec.resultValidator?.(authorizationScope.job),
                 items,
                 deadlineAt: packageRequest.deadlineAt,
                 authorizationExpiresAtMs,
@@ -1111,7 +1128,7 @@ export class RequestBroker {
     }
 
     #authorizationScopeCeiling(authorization) {
-        return ['seller_reviews', 'ozon_seller_promotion_reports', 'ozon_seller_analytics_report'].includes(authorization?.jobType)
+        return ['seller_reviews', 'ozon_seller_promotion_reports', 'ozon_seller_analytics_report', 'ozon_search_positions'].includes(authorization?.jobType)
             ? this.sellerAuthorizationScopeMaxMs
             : this.authorizationScopeMaxMs;
     }
@@ -1397,8 +1414,10 @@ export class RequestBroker {
         }
     }
 
-    #matchesOzonPackageFrame(pending, family, itemIndex) {
-        return pending.family === family && Number.isSafeInteger(itemIndex) && itemIndex === pending.nextItemIndex;
+    // Phase and stream frames have no place in a result-only family; only its item result may match.
+    #matchesOzonPackageFrame(pending, family, itemIndex, streamFrame = true) {
+        return pending.family === family && !(streamFrame && pending.resultOnly) &&
+            Number.isSafeInteger(itemIndex) && itemIndex === pending.nextItemIndex;
     }
 
     #takeOzonReportPackage(requestId, pending) {
@@ -1471,12 +1490,8 @@ export class RequestBroker {
         );
     }
 
-    #rejectInvalidOzonPackageStream(requestId, pending) {
-        this.#cancelOzonReportPackage(
-            requestId,
-            pending,
-            ozonPromotionError('ARTIFACT_REJECTED', 'Ozon report package frames arrived out of order or for the wrong family.')
-        );
+    #rejectInvalidOzonPackageStream(requestId, pending, message = 'Ozon report package frames arrived out of order or for the wrong family.') {
+        this.#cancelOzonReportPackage(requestId, pending, ozonPromotionError('ARTIFACT_REJECTED', message));
         return false;
     }
 
