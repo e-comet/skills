@@ -5,14 +5,14 @@ dependencies; all required source modules are included in this directory. Node.j
 
 From the installed plugin root, run `node mcp/src/doctor.mjs --json` to inspect bootstrap metadata and storage
 configuration without starting the MCP server. The command always prints one JSON document when collection completes;
-failed checks still exit with status 0. It does not bind the bridge port, create pairing state, remove retained files, or
+failed checks still exit with status 0. It does not register or contact the browser bridge, remove retained files, or
 contact the extension, e-Comet, or a marketplace. The output identifies only the Node process that ran the doctor. A
 successful result does not prove that the desktop host installed or enabled this plugin, launches this copy, or runs its
 trusted hooks.
 
-The `secondary` bridge role is a normal proxy role. `peer.bridgeVersion` and `extension.version`
-identify different components; version skew alone does not establish a failure cause.
-`extensionConnected:false` means there is no effective extension route, not why it is absent.
+`brokerVersion` and `extension.version` identify different components; version skew alone does not
+establish a failure cause. `extensionConnected:false` means there is no effective extension route; the
+status `code` names the cause observed, not proof of it.
 The released singular Ozon promotion report requires e-Comet extension 1.5.6+ and any authenticated Ozon Seller `/app` page,
 not a Wildberries tab or a specific promotion-overview page. Ozon company context comes only from the
 `sc_company_id` cookie; the extension does not depend on Vue, Vuex, Axios defaults, or a visible company label.
@@ -29,23 +29,24 @@ direction and never automatically repeat submission or restart the flow. On succ
 the report was sent to e-Comet. The archive has a 32 MiB aggregate limit; the chosen history option
 is never silently changed and truncation markers are not inserted.
 
-`local_bridge_status` distinguishes bridge startup, extension waiting, Wildberries-tab readiness,
-update needs, and pairing failures. It reports facts, not a global next action: recovery depends on
-the user's task and the selected typed tool's result. It also reports the
-connected extension's version and family-specific Ozon capability verdicts; these observations
-are informational and never replace the typed tool's own capability gate. Peer-token storage affects pairing only;
-`peerRejection.code` identifies the observed pairing failure. Storage-dependent calls return the typed
-`LOCAL_STORAGE_UNAVAILABLE` outcome when no valid host plugin-data root or explicit store override exists.
-The peer token and the feedback hook secret remain in shared profile state, outside host-specific
-plugin-data output, so concurrently running supported hosts can coordinate the same local lifecycle.
+`local_bridge_status` reports one closed `code`: `connected`, `connecting`, or the cause observed when
+the browser bridge does not answer (see [DIAGNOSTICS.md](DIAGNOSTICS.md)), plus Wildberries-tab readiness.
+It reports facts, not a global next action: recovery depends on the user's task and the selected typed
+tool's result. It also reports the connected extension's version and family-specific Ozon capability
+verdicts; these observations are informational and never replace the typed tool's own capability gate.
+Storage-dependent calls return the typed `LOCAL_STORAGE_UNAVAILABLE` outcome when no valid host
+plugin-data root or explicit store override exists. The browser bridge files and the feedback hook secret
+remain in shared profile state, outside host-specific plugin-data output, so concurrently running
+supported hosts find the same bridge and verify the same signatures.
 
 The canonical source and tests live under `e-comet-local-mcp/` in the private skills repository. This plugin contains a
 release snapshot of its `src/` directory.
 
-The MCP listens only on `127.0.0.1:17361`, and the extension connects automatically while local access is enabled.
-There is no pairing flow in the MVP. Full WB responses and artifacts are stored below the host plugin-data root; MCP
-tool results contain only compact summaries and local paths.
-The extension WebSocket accepts only the official e-Comet Chrome Web Store origin by default.
+The MCP never listens on a network port. After it starts, it registers a small native messaging host for the
+browsers; the e-Comet extension starts that host through the browser, and every MCP process connects to it through a
+per-user local channel. Chrome lets only the official e-Comet Chrome Web Store extension start the host. The extension
+asks once for its permission to connect to the local app, in Chrome's own alert. Full WB responses and artifacts are
+stored below the host plugin-data root; MCP tool results contain only compact summaries and local paths.
 
 Each result file is UTF-8 NDJSON with one fetched unit per line:
 
@@ -69,6 +70,8 @@ Local tools:
 - `wb_product_card` — discovers and executes signed live product-card requests;
 - `wb_search_by_query` — discovers and executes signed live WB search requests;
 - `wb_check_by_query` — checks whether one article appears in search for up to 100 phrases, without reporting a position;
+- `wb_filters_by_query` — returns the search-filter characteristics and categories, with complete value lists, for up
+  to 50 phrases, merged by filter; the connected extension must support the job type;
 - `wb_recommendations_by_product` — discovers and executes signed recommendation-shelf requests;
 - `wb_seller_reviews` — exports original WB seller-review XLSX reports through the authenticated seller portal;
 - `prepare_e_comet_feedback` — prepares one local e-Comet issue-report archive after explicit user consent;
@@ -81,15 +84,15 @@ Local tools:
 - `ozon_search_positions` — returns the Ozon search places of 1–10 SKUs for 1–50 ordered queries as one inline JSON
   table through one `browser_job` authorization and one local call; the connected extension must advertise the search
   positions capability;
-- `local_bridge_status` — reports whether the extension is connected, and why the bridge cannot reach a primary
-  peer when it cannot;
+- `local_bridge_status` — reports whether the extension is connected, and the observed cause when it is not;
 - `wb_product_images` — public WB image-CDN lookup; this tool does not require the extension.
 
 ## Workflow contract lookup
 
-The short `tools/list` catalog routes by intent; `describe_e_comet_tool({name})` returns the full current contract for exactly these nine signed local tools:
+The short `tools/list` catalog routes by intent; `describe_e_comet_tool({name})` returns the full current contract for exactly these ten signed local tools:
 
-- `wb_product_card`, `wb_search_by_query`, `wb_check_by_query`, `wb_recommendations_by_product`, `wb_seller_reviews`;
+- `wb_product_card`, `wb_search_by_query`, `wb_check_by_query`, `wb_filters_by_query`, `wb_recommendations_by_product`,
+  `wb_seller_reviews`;
 - `ozon_seller_promotion_report`, `ozon_seller_promotion_reports`, `ozon_seller_analytics_report`,
   `ozon_search_positions`.
 
@@ -143,12 +146,8 @@ installed version, the minimum supported one, and the update page, instead of as
 opened. The same code without that diagnosis says only that no ready Ozon route was reachable; it does not
 establish why. Extension 1.5.6+ can use any authenticated Ozon Seller `/app` page, not only the promotion page.
 
-Multiple Codex tasks can use the fixed bridge port at the same time in MVP mode. The first MCP process owns the
-extension WebSocket; later bundled MCP processes connect to it over the loopback-only `/mcp-peer` channel and proxy
-their bounded WB fetches through that primary process. If the primary task closes, a remaining process retries the port
-and takes ownership.
-
-Processes also exchange a control-protocol version, bridge generation, build version, and instance ID. A newer
-generation waits for active WB requests to finish, receives an explicit takeover grant, claims the same port, and becomes
-the primary. The old primary and all other conversations reconnect as peers, while the extension reconnects
-automatically. Releases must increment `BRIDGE_GENERATION` whenever the active primary needs replacement.
+Multiple tasks and hosts can use the browser bridge at the same time. Each MCP process is an independent client of
+the host the browser started, which keeps every client's answers and authorizations apart and releases a closed
+client's authorizations at once. Closing one task does not affect the others. A plugin update registers its own host
+version; the browser starts it the next time the extension restarts, and the running host keeps serving every task
+until then.

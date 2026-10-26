@@ -27,13 +27,18 @@ const BRIDGE_STATUS_TTL_MS = 4_000;
 const BRIDGE_STATUS_TIMEOUT_MS = 3_000;
 const LONG_TOOL_TIMEOUT_MS = 7_200_000;
 
-/** The extension route as `local_bridge_status` observes it; anything unreadable keeps the process status. */
+/**
+ * The extension route as `local_bridge_status` observes it, read from its closed cause `code`. Anything unreadable, an
+ * error result and a status without a code keep the process status.
+ */
 function extensionRoute(result) {
   try {
     const status = JSON.parse(result.content.find(block => block?.type === 'text').text);
-    if (result.isError === true || status?.ok !== true || status.extensionConnected === true) return 'connected';
-    if (['listen_failed', 'peer_unavailable', 'peer_reconnecting'].includes(status.state)) return 'bridge_unavailable';
-    return status?.listenerState === 'pending' || status?.bridgeTransitioning === true ? 'checking' : 'extension_offline';
+    if (result.isError === true || status?.ok !== true || status.extensionConnected === true || status.code === 'connected') return 'connected';
+    if (status.code === 'connecting') return 'checking';
+    // Their user step is the offline card's: open the browser, or click the e-Comet icon in the one that runs.
+    if (['BRIDGE_NO_BROWSER', 'BRIDGE_HOST_NOT_STARTED', 'BRIDGE_PERMISSION_REQUIRED'].includes(status.code)) return 'extension_offline';
+    return typeof status.code === 'string' ? 'bridge_unavailable' : 'connected';
   } catch { return 'connected'; }
 }
 

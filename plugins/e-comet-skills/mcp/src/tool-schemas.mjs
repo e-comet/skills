@@ -10,7 +10,7 @@ import {
     MAX_PRODUCT_ARTICLES,
     MAX_RETURNED_PRODUCTS,
 } from './config.mjs';
-import { PEER_REJECTION_CODES } from './connection-state.mjs';
+import { BRIDGE_CODES, BRIDGE_REGISTRATION_STATES, BRIDGE_RUNTIMES, BRIDGE_STATUS_CODES } from './bridge-codes.mjs';
 import { FEEDBACK_DIAGNOSTIC_OPERATIONS, FEEDBACK_DIAGNOSTIC_ERROR_TYPES, FEEDBACK_DIAGNOSTIC_SYSTEM_CODES, FEEDBACK_DIAGNOSTIC_MODULES, FEEDBACK_DIAGNOSTIC_REASONS } from './feedback-diagnostics.mjs';
 import { CONTRACT_TOOL_NAMES } from './tool-contracts.mjs';
 import { feedbackCloudTransportSchema, feedbackHostAdapterMarkerSchema } from './feedback-host-adapter.mjs';
@@ -24,15 +24,14 @@ import {
 } from './extension-vocabulary.mjs';
 import { OZON_EXTENSION_OUTDATED_REASON, OZON_PROMOTION_TERMINAL_CODE_STAGES } from './tool-errors.mjs';
 import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
-import { OZON_PACKAGE_STOP_REASONS } from './ozon-report-package-result.mjs';
+import { OZON_PACKAGE_STOP_REASONS, OZON_SEARCH_POSITIONS_STOP_REASONS } from './ozon-report-package-result.mjs';
 import {
     MAX_OZON_SEARCH_POSITIONS_SKUS,
     MAX_OZON_SEARCH_POSITIONS_TEXT_LENGTH,
     OZON_SEARCH_POSITIONS_DEFAULT_REGION,
     OZON_SEARCH_POSITIONS_PLATFORMS,
 } from './ozon-search-positions-domain.mjs';
-import { OZON_SEARCH_POSITIONS_STOP_REASONS } from './ozon-search-positions-job.mjs';
-import { DIAGNOSTIC_STATES, extensionInstallFactsSchema, hookPermissionsFactsSchema } from './diagnostic-facts.mjs';
+import { DIAGNOSTIC_STATES, EXTENSION_INSTALL_VOCABULARY, extensionInstallFactsSchema, hookPermissionsFactsSchema } from './diagnostic-facts.mjs';
 // The producers validate their facts against these; the feedback projection reads the same objects.
 export { extensionInstallFactsSchema, hookPermissionsFactsSchema };
 import { feedbackDeviceSnapshotSchema } from './feedback-device-diagnostics.mjs';
@@ -57,6 +56,7 @@ const object = (properties, required = [], additionalProperties = false) => ({
 const array = (items, extra = {}) => ({ type: 'array', items, ...extra });
 const objectUnion = (...schemas) => ({ type: 'object', oneOf: schemas });
 const described = (schema, description) => ({ ...schema, description });
+const nullable = (schema, nullDescription) => ({ oneOf: [schema, described({ type: 'null' }, nullDescription)] });
 const liveAggregateSchemas = (schema) => [
     {
         ...schema,
@@ -200,6 +200,9 @@ const browserJobRejectionSchema = objectUnion(
         .map((reason) => object({ schemaVersion: { const: 1 }, reason: { const: reason } }, ['schemaVersion', 'reason']))
 );
 const browserJobRejectionDetailsSchema = object({ browserJobRejection: browserJobRejectionSchema }, ['browserJobRejection']);
+// An Ozon authorization failure carries either the extension's rejection or, when no broker answered, the bridge cause.
+const ozonAuthorizationRejectedDetailsSchema = objectUnion(browserJobRejectionDetailsSchema,
+    object({ bridgeCode: { type: 'string', enum: [...BRIDGE_CODES] } }, ['bridgeCode']));
 
 export const toolErrorSchema = object({
     ok: { const: false },
@@ -295,6 +298,42 @@ const checkSuccessSchema = object({
     requestsMade: positiveInteger,
     queries: array(checkQuerySchema),
 }, ['ok', 'status', 'jobType', 'jobId', 'resultPath', 'complete', 'product_id', 'requestsMade', 'queries']);
+
+const filtersQuerySchema = object({
+    skipped: boolean,
+    errorDetails: object({
+        code: {
+            type: 'string',
+            enum: [...Object.values(FETCH_ERROR_CODES), 'WB_FETCH_FAILED', 'WB_RATE_LIMITED', 'WB_REQUEST_FAILED',
+                'WB_UNRELIABLE_RESPONSE', 'WB_FULL_LISTS_INCOMPLETE'],
+        },
+        stage: { const: 'execution' },
+        retryable: boolean,
+    }, ['code', 'stage', 'retryable']),
+    query: string,
+    status: { type: 'string', enum: ['ok', 'partial', 'empty', 'request_failed', 'rate_limited'] },
+    filterKeys: array(string),
+    error: string,
+}, ['query', 'status']);
+
+const filterSchema = object({
+    kind: { type: 'string', enum: ['characteristic', 'category'] },
+    name: string,
+    key: string,
+    complete: boolean,
+    values: array(string),
+    queryCount: positiveInteger,
+}, ['kind', 'name', 'key', 'complete', 'values', 'queryCount']);
+
+const filtersSuccessSchema = object({
+    stopReason: { const: 'rate_limited' },
+    ...liveBaseProperties,
+    jobType: { const: 'filters_by_query' },
+    complete: boolean,
+    requestsMade: nonNegativeInteger,
+    queries: array(filtersQuerySchema),
+    filters: array(filterSchema),
+}, ['ok', 'status', 'jobType', 'jobId', 'resultPath', 'complete', 'requestsMade', 'queries', 'filters']);
 
 const recommendationArticleSchema = object({
     sourceNmId: positiveInteger,
@@ -410,25 +449,6 @@ const imagesSuccessSchema = object({
     storageWarnings,
 }, ['ok', 'status', 'jobId', 'total', 'succeeded', 'failed', 'size', 'products', 'resultPath']);
 
-// Present only while the bridge cannot reach a primary peer or bind its own listener: a healthy status omits
-// it entirely rather than carrying a null-filled object into the agent's context. `code` is the closed local
-// vocabulary from PEER_REJECTION_CODES, never text received over the socket.
-//
-// Only `code` is required. Both timestamps are best-effort by design: `retryAt` is absent whenever no retry is
-// armed, and `peerRejectionStatus` omits either one rather than throwing on a clock value Date cannot
-// represent. Requiring `since` here would turn that deliberate omission into a schema violation in the one
-// tool an operator reaches for when the bridge is already wedged.
-const peerRejectionSchema = object(
-    {
-        // Derived, never restated: a hand-copied list would let a new rejection code ship as tool output that
-        // fails this very schema, in the one tool an operator reads when the bridge is already wedged.
-        code: described({ type: 'string', enum: Object.values(PEER_REJECTION_CODES) }, 'Current safe classification of the continuous authenticated-peer rejection streak.'),
-        since: described(string, 'ISO timestamp when the current continuous peer-rejection streak began; omitted when no safe time is available.'),
-        retryAt: described(string, 'ISO timestamp of the scheduled peer reconnect; omitted when no retry is armed.'),
-    },
-    ['code']
-);
-
 const storageTargetStatusSchema = objectUnion(
     described(object({ state: described({ const: 'ready' }, 'Configuration resolved a target; this does not prove the target is writable.'), backend: described({ type: 'string', enum: ['plugin_data', 'application_data', 'override'] }, 'Configuration source that resolved this target, without exposing its filesystem path.') }, ['state', 'backend']), 'A configured target resolved successfully; no write was attempted.'),
     described(object(
@@ -462,23 +482,19 @@ const bridgeDiagnosticsSchema = object({
     snapshot: described(diagnosticBase('snapshot'), 'Timestamped production of the status snapshot; it is not a product-health verdict.'),
     runtime: described(diagnosticBase('runtime', object({ nodeVersion: described(string, 'Version of the Node.js process executing this MCP server.'), platform: described(string, 'Node.js platform identifier for the process executing this MCP server.'), arch: described(string, 'Node.js architecture identifier for the process executing this MCP server.'), bridgeVersion: described(string, 'Version of the local bridge build executing this check.'), mcpProtocolVersion: described(string, 'MCP protocol version negotiated with the current client; omitted when unavailable.') }, ['nodeVersion', 'platform', 'arch', 'bridgeVersion'])), 'Facts about the Node.js process running this MCP server.'),
     client: described(diagnosticBase('client', object({ name: described(string, 'Bounded client name supplied in MCP initialize metadata.'), version: described(string, 'Bounded client version supplied in MCP initialize metadata.'), provenance: described({ const: 'client_reported' }, 'Marks these values as client-reported rather than trusted host identity.'), hostRuntimeVersion: described(string, 'DeepSeek Harness runtime version the native adapter resolved its peers against; present only under that adapter.') }, ['name', 'version', 'provenance'])), 'Sanitized MCP initialize metadata; it does not prove host identity or hook support.'),
-    listener: described(diagnosticBase('listener', object({ operation: described({ const: 'bind_listener' }, 'Names the already-observed listener bind operation; status does not retry it.'), listenerState: described({ type: 'string', enum: ['pending', 'listening', 'address_in_use', 'failed'] }, 'Last listener bind event observed by the bridge, not current port ownership.'), systemCode: described({ type: 'string', enum: ['EACCES', 'EPERM', 'EADDRINUSE', 'EADDRNOTAVAIL', 'EAFNOSUPPORT', 'EINVAL'] }, 'Allowlisted operating-system code from the bind observation; omitted when unavailable.') }, ['operation', 'listenerState']), ['address_in_use', 'listen_failed', 'unknown']), 'Existing listener-bind observation; a healthy secondary can report address_in_use as passed.'),
-    pairingSource: described(diagnosticBase('pairing_source', undefined, ['permission_denied', 'insecure_permissions', 'missing', 'corrupt', 'unsupported', 'io_error']), 'Safe pairing-source classification with no token, path, owner, or raw exception.'),
     routeFreshness: described(diagnosticBase('route_freshness', object({ lastObservedAt: described(string, 'Timestamp of an actually observed route response; omitted when no producer supplies one.') }, ['lastObservedAt'])), 'Freshness of a real extension-route observation, never inferred from browser-context changes.'),
     storage: described(diagnosticBase('storage', object({ scope: described({ const: 'configuration' }, 'Declares that these storage facts cover configuration resolution only.'), targets: described(storageStatusSchema, 'Sanitized configured storage targets without paths or write claims.') }, ['scope', 'targets'])), 'Read-only storage configuration observation; it does not test writability.'),
-}, ['snapshot', 'runtime', 'client', 'listener', 'pairingSource', 'routeFreshness', 'storage']);
+}, ['snapshot', 'runtime', 'client', 'routeFreshness', 'storage']);
 
 const bridgeStatusSchema = described(object({
     ok: described({ const: true }, 'Confirms that the status response was constructed; it is not a product-health result.'),
-    extensionConnected: described(boolean, 'Whether an effective direct or authenticated-peer extension route is currently observed.'),
+    code: described({ type: 'string', enum: [...BRIDGE_STATUS_CODES] }, 'Closed cause of the current bridge state, read first. connected and connecting are healthy states. A BRIDGE_* value names the one observed reason no extension route exists; BRIDGE_NO_BROWSER is the one used when nothing more specific was observed. A route lost mid-job is EXTENSION_DISCONNECTED on the failing tool call; status never returns it and names the cause found since. The other fields are the evidence behind it.'),
+    extensionConnected: described(boolean, 'Whether this process currently holds an extension session through a broker.'),
     browserJobSupported: described(boolean, 'Whether the effective route advertised browser-job support; it does not prove a particular operation will succeed.'),
-    bridgeRole: described({ type: 'string', enum: ['primary', 'secondary', 'disconnected'] }, 'Current local bridge role; secondary is a normal healthy role when another primary owns the listener.'),
-    bridgeTransitioning: described(boolean, 'Whether the bridge is currently changing role; it does not authorize waiting or retrying a business operation.'),
-    listenerState: described({ type: 'string', enum: ['pending', 'listening', 'address_in_use', 'failed'] }, 'Last listener bind event, which does not independently identify current port ownership.'),
-    state: described({ type: 'string', enum: ['initializing', 'listen_failed', 'waiting_for_extension', 'extension_connected_no_wb_tab', 'extension_contended', 'extension_context_unknown', 'peer_context_unknown', 'ready', 'extension_update_required', 'peer_reconnecting', 'peer_unavailable'] }, 'Ordered compatibility summary of observed bridge state, not a complete fault list or retry instruction.'),
+    state: described({ type: 'string', enum: ['initializing', 'waiting_for_extension', 'extension_connected_no_wb_tab', 'extension_context_unknown', 'ready', 'extension_update_required'] }, 'Ordered compatibility summary of observed bridge state, not a complete fault list or retry instruction.'),
     extension: described(object({
         state: described({ type: 'string', enum: ['never_connected', 'connected', 'disconnected'] }, 'Effective extension connection observation, including retained disconnected state.'),
-        route: described({ type: 'string', enum: ['direct', 'peer', 'none'] }, 'Route supplying the effective extension observation.'),
+        route: described({ type: 'string', enum: ['direct', 'none'] }, 'direct while this process holds an extension session through a broker, otherwise none.'),
         lastConnectedAt: described(string, 'ISO timestamp of the last observed effective extension connection; omitted if never observed.'),
         lastDisconnectedAt: described(string, 'ISO timestamp of the last observed effective extension disconnection; omitted if never observed.'),
         version: described(string, 'Version last reported by the effective extension route; retained after disconnect and omitted if unobserved.'),
@@ -486,12 +502,7 @@ const bridgeStatusSchema = described(object({
         ozonSellerPromotionReportsSupported: described(boolean, 'Capability reported for packaged Ozon promotion reports; omission means unobserved.'),
         ozonSellerAnalyticsReportSupported: described(boolean, 'Capability reported for an Ozon analytics report; omission means unobserved.'),
         ozonSearchPositionsSupported: described(boolean, 'Capability reported for Ozon search positions; omission means unobserved.'),
-    }, ['state', 'route']), 'Effective browser-extension observation from a direct or authenticated-peer route.'),
-    peer: described(object({
-        bridgeVersion: described(string, 'Bridge version reported by the authenticated primary peer.'),
-        browserContextPropagationSupported: described(boolean, 'Whether the authenticated primary advertises browser-context propagation.'),
-        diagnosticForwardingSupported: described(boolean, 'Whether the authenticated primary advertised diagnostic_snapshot_forwarding_v1. False includes legacy or other primaries that did not advertise it. This field alone says nothing about extension capability or whether a diagnostic snapshot request will succeed.'),
-    }), 'Authenticated primary-peer metadata; normally omitted on a primary.'),
+    }, ['state', 'route']), 'Browser-extension observation from this process\'s broker session.'),
     browserContext: described(object({
         state: described({ type: 'string', enum: ['unknown', 'known'] }, 'Whether registered WB browser-port facts were observed.'),
         wbTabConnected: described(boolean, 'Whether the extension reports a registered standalone WB page port; this does not prove login.'),
@@ -500,26 +511,49 @@ const bridgeStatusSchema = described(object({
     }, ['state']), 'Extension-reported WB and WB Seller port registration; it does not cover Ozon readiness.'),
     extensionLastConnectedAtMs: described({ oneOf: [described(number, 'Observed effective extension connection time as Unix epoch milliseconds.'), described({ type: 'null' }, 'No effective extension connection has ever been observed.')] }, 'Legacy millisecond copy of the effective extension connection time; null means never observed.'),
     extensionLastDisconnectedAtMs: described({ oneOf: [described(number, 'Observed effective extension disconnection time as Unix epoch milliseconds.'), described({ type: 'null' }, 'No effective extension disconnection has ever been observed.')] }, 'Legacy millisecond copy of the effective extension disconnection time; null means never observed.'),
-    extensionTakeovers: described(object({
-        count: described({ type: 'integer' }, 'Number of takeovers retained within the bounded recent observation window.'),
-        lastAtMs: described({ oneOf: [described(number, 'Last observed takeover time as Unix epoch milliseconds.'), described({ type: 'null' }, 'No extension takeover has ever been observed.')] }, 'Last observed takeover time in milliseconds; it can fall outside the count window.'),
-        saturated: described(boolean, 'Whether the bounded counter is a lower bound because more takeovers occurred than retained.'),
-    }, ['count', 'lastAtMs', 'saturated']), 'Bounded recent observations of extension socket takeovers without browser-profile identity.'),
     extensionVersion: described(string, 'Legacy copy of the effective extension version; it is not independent evidence.'),
     ozonSellerPromotionReportSupported: described(boolean, 'Legacy copy of the single-promotion-report capability; omission means unobserved.'),
     ozonSellerPromotionReportsSupported: described(boolean, 'Legacy copy of the packaged-promotion-reports capability; omission means unobserved.'),
     ozonSellerAnalyticsReportSupported: described(boolean, 'Legacy copy of the analytics-report capability; omission means unobserved.'),
     ozonSearchPositionsSupported: described(boolean, 'Legacy copy of the search-positions capability; omission means unobserved.'),
-    peerRejection: described(peerRejectionSchema, 'Current continuous peer-rejection streak; omitted when none is active.'),
     bridgeVersion: described(string, 'Version of the local bridge build producing this status.'),
-    bridgeGeneration: described(positiveInteger, 'Compatibility generation used for coordinated bridge replacement.'),
-    controlProtocolVersion: described(positiveInteger, 'Local authenticated peer-control protocol version.'),
     extensionProtocolVersion: described(positiveInteger, 'Extension protocol version supported by this bridge build.'),
+    registration: described(nullable(described(object({
+        state: described({ type: 'string', enum: [...BRIDGE_REGISTRATION_STATES] }, 'Outcome of the last registration check: registered wrote something, current found it up to date, disabled means this run registers nothing, failed means a step failed, denied means macOS refused a browser folder. Another refused browser folder fails it only when no folder holds the manifest; otherwise it stays registered or current with the refusal in error.'),
+        version: described(string, 'Plugin version the registration was made for.'),
+        runtime: described(nullable(described({ type: 'string', enum: [...BRIDGE_RUNTIMES] }, 'Runtime the launcher starts: path_node is Node found on PATH, host_executable is the host application own executable.'), 'No runtime was resolved.'), 'Runtime the launcher starts; null when none was resolved.'),
+        manifestWrittenAt: described(nullable(described(string, 'ISO timestamp of the newest host manifest.'), 'The manifest time is unknown.'), 'ISO timestamp of the newest host manifest; null when it is unknown.'),
+        error: described(nullable(described(object({
+            name: described(string, 'Name of the registration step that failed.'),
+            code: described(nullable(described(string, 'System or exit code of the failure.'), 'The failure carried no code.'), 'System or exit code of the failure; null when there was none. Never a message or a path.'),
+        }, ['name', 'code']), 'The registration step that failed, as a step name and a code.'), 'The last check had no failure.'), 'The failed registration step; null when the last check had no failure.'),
+    }, ['state', 'version', 'runtime', 'manifestWrittenAt', 'error']), 'Result of one registration check by this process.'), 'No registration check has run in this process.'), 'Last browser-host registration check made by this process; null before the broker client has run one.'),
+    userLevelHosts: described(array(described(object({
+        browser: described({ type: 'string', enum: [...EXTENSION_INSTALL_VOCABULARY.browsers] }, 'Browser the policy was read for.'),
+        allowed: described(nullable(described(boolean, 'The policy allows or forbids hosts registered per user.'), 'No policy is set for this browser.'), 'Whether the NativeMessagingUserLevelHosts policy allows hosts registered per user; null when no policy is set.'),
+        hostBlocked: described(nullable(described(boolean, 'true: the block list holds * or the e-Comet host and the allow list does not name it; false: the lists do not block it.'), 'No block list was read for this browser.'), 'Whether the NativeMessagingBlocklist and NativeMessagingAllowlist policies block the e-Comet host; null when no block list is set.'),
+    }, ['browser', 'allowed', 'hostBlocked']), 'The native messaging policies of one browser.')), 'Per browser, the native messaging policies that decide whether it may start the e-Comet host; empty when none was read.'),
+    extensionInstall: described(nullable(described({ type: 'object', additionalProperties: true }, 'Facts of the extension_install probe, defined in DIAGNOSTICS.md.'), 'No extension_install probe has run.'), 'Chromium profile facts from the extension_install probe, in the shape e_comet_diagnose reports them; null until a probe has run.'),
+    brokers: described(array(described(object({
+        pid: described(positiveInteger, 'Process id of the broker, as its entry names it.'),
+        browser: described(string, 'Browser brand the extension reported to that broker.'),
+        extensionVersion: described(string, 'Extension version that broker saw; omitted when the extension reported none.'),
+        brokerVersion: described(string, 'Plugin version of that broker.'),
+        startedAt: described(string, 'ISO timestamp at which that broker wrote its entry.'),
+        current: described(boolean, 'Whether this process is connected to that broker.'),
+    }, ['pid', 'browser', 'brokerVersion', 'startedAt', 'current']), 'One live broker entry without its nonce or endpoint.')), 'Live broker entries, newest first, without their nonce or endpoint; empty when none is running.'),
+    lastFailureRecord: described(nullable(described(object({
+        name: described(string, 'Error name a broker recorded when it failed.'),
+        code: described(nullable(described(string, 'Error code a broker recorded.'), 'The broker recorded no code.'), 'Error code a broker recorded; null when it recorded none.'),
+        at: described(string, 'ISO timestamp at which the broker recorded the failure.'),
+    }, ['name', 'code', 'at']), 'One broker failure record.'), 'No failure record applies.'), 'Newest broker failure record that is newer than every live entry and than this process last good session; null when there is none.'),
+    clientProtocolVersion: described(positiveInteger, 'Client protocol version this plugin speaks to a broker.'),
+    brokerProtocolVersion: described(nullable(described(positiveInteger, 'Client protocol version the broker reported.'), 'No broker session is open.'), 'Client protocol version the connected broker reported; null without a broker session.'),
+    brokerVersion: described(nullable(described(string, 'Plugin version of the connected broker.'), 'No broker session is open.'), 'Plugin version of the connected broker; null without a broker session.'),
     instanceId: described(string, 'Ephemeral identifier of this local bridge process; it is not a host or user identity.'),
-    websocket: described(string, 'Configured loopback WebSocket endpoint; it does not prove ownership or reachability.'),
     storage: described(storageStatusSchema, 'Read-only resolution status for the three configured storage targets.'),
     diagnostics: described(bridgeDiagnosticsSchema, 'Typed passive observations collected with this status response.'),
-}, ['ok', 'extensionConnected', 'bridgeRole', 'storage']), 'Passive local bridge status response; successful construction is distinct from product health.');
+}, ['ok', 'extensionConnected', 'code', 'storage']), 'Passive local bridge status response; successful construction is distinct from product health.');
 
 const operationDiagnosticSchema = described(object({
     schemaVersion: described({ const: 1 }, 'Version of the operation-diagnostic receipt contract.'), handle: described(string, 'Opaque handle for the latest real completion in this MCP process.'), stage: described(string, 'Last operation stage established by the producer.'), outcome: described({ type: 'string', enum: ['succeeded', 'partial', 'failed', 'uncertain'] }, 'Observed terminal outcome without converting uncertainty into failure.'),
@@ -616,7 +650,7 @@ const ozonPromotionErrorSchema = objectUnion(
                 stage: { const: stage },
                 retryable: { const: false },
                 ...(code === 'OZON_ROUTE_NOT_READY' ? { details: ozonExtensionOutdatedDetailsSchema } : {}),
-                ...(code === 'OZON_AUTHORIZATION_REJECTED' ? { details: browserJobRejectionDetailsSchema } : {}),
+                ...(code === 'OZON_AUTHORIZATION_REJECTED' ? { details: ozonAuthorizationRejectedDetailsSchema } : {}),
             },
             ['code', 'message', 'stage', 'retryable']
         )
@@ -696,7 +730,7 @@ const ozonPackageError = (codeStages, analytics = false) =>
                         marketplaceErrorCode: { type: 'integer', minimum: -2147483648, maximum: 2147483647 },
                     }, ['marketplaceErrorCode']) } : {}),
                     ...(code === 'OZON_EXECUTION_INTERRUPTED' ? { details: ozonExecutionInterruptionDetailsSchema } : {}),
-                    ...(code === 'OZON_AUTHORIZATION_REJECTED' ? { details: browserJobRejectionDetailsSchema } : {}),
+                    ...(code === 'OZON_AUTHORIZATION_REJECTED' ? { details: ozonAuthorizationRejectedDetailsSchema } : {}),
                 },
                 ['code', 'message', 'stage', 'retryable']
             )
@@ -799,7 +833,7 @@ const searchPositionsResultSchema = (() => {
     const details = {
         OZON_REGION_UNAVAILABLE: object({ candidates: array(searchPositionsText, { minItems: 1, maxItems: 5 }) }, ['candidates']),
         OZON_SKU_LIMIT_EXCEEDED: object({ limit: positiveInteger }, ['limit']),
-        OZON_AUTHORIZATION_REJECTED: browserJobRejectionDetailsSchema,
+        OZON_AUTHORIZATION_REJECTED: ozonAuthorizationRejectedDetailsSchema,
     };
     const error = objectUnion(...Object.entries({ ...OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES, OZON_EXECUTION_INTERRUPTED: 'execution' })
         .map(([code, stage]) => object({
@@ -1029,6 +1063,7 @@ export const toolInputSchemas = {
     wb_product_card: liveInputSchema(),
     wb_search_by_query: liveInputSchema('productLimitPerQuery', 'query'),
     wb_check_by_query: liveInputSchema(),
+    wb_filters_by_query: liveInputSchema(),
     wb_recommendations_by_product: liveInputSchema('productLimitPerSource', 'source product'),
     wb_seller_reviews: liveInputSchema(),
     prepare_e_comet_feedback: feedbackPrepareSchema,
@@ -1113,6 +1148,7 @@ export const toolOutputSchemas = {
     wb_product_card: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(productCardSuccessSchema), toolErrorSchema)),
     wb_search_by_query: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(searchSuccessSchema), toolErrorSchema)),
     wb_check_by_query: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(checkSuccessSchema), toolErrorSchema)),
+    wb_filters_by_query: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(filtersSuccessSchema), toolErrorSchema)),
     wb_recommendations_by_product: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(recommendationsSuccessSchema), toolErrorSchema)),
     wb_seller_reviews: withOperationDiagnostic(objectUnion(sellerReviewsSuccessSchema, toolErrorSchema)),
     prepare_e_comet_feedback: withOperationDiagnostic(objectUnion(feedbackPrepareSuccessSchema, feedbackPrepareFailureSchema, feedbackPrepareHostUnavailableSchema)),

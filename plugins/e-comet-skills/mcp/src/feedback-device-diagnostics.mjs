@@ -1,5 +1,5 @@
-import { PEER_REJECTION_CODES } from './connection-state.mjs';
-import { EXTENSION_SNAPSHOT_VOCABULARY, MCP_CONFIGURATION_FACTS as MCP_CONFIGURATION, extensionInstallFactsSchema, extensionSnapshotFactsSchema, hookPermissionsFactsSchema, isCanonicalTimestamp } from './diagnostic-facts.mjs';
+import { BRIDGE_REGISTRATION_STATES, BRIDGE_RUNTIMES, BRIDGE_STATUS_CODES } from './bridge-codes.mjs';
+import { EXTENSION_INSTALL_VOCABULARY, EXTENSION_SNAPSHOT_VOCABULARY, MCP_CONFIGURATION_FACTS as MCP_CONFIGURATION, extensionInstallFactsSchema, extensionSnapshotFactsSchema, hookPermissionsFactsSchema, isCanonicalTimestamp } from './diagnostic-facts.mjs';
 import { validateSchemaValue } from './schema-validation.mjs';
 
 const STATES = new Set(['passed', 'failed', 'unknown', 'not_checked', 'unsupported']);
@@ -16,13 +16,9 @@ const record = value => value !== null && typeof value === 'object' && !Array.is
 const text = value => typeof value === 'string' && value.length > 0 && Buffer.byteLength(value, 'utf8') <= MAX_TEXT_LENGTH
     && !/[\u0000-\u001f\u007f]/u.test(value) ? value : undefined;
 const iso = value => (isCanonicalTimestamp(value) ? value : undefined);
-// A millisecond mark past the four-digit-year range renders as an expanded 27-character year that no
-// consumer accepts, so it is dropped as one optional field rather than carried into the projection.
-const isoFromMs = value => iso(Number.isFinite(value) && Math.abs(value) <= 8.64e15 ? new Date(value).toISOString() : undefined);
 const compact = value => Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
 const bool = value => typeof value === 'boolean' ? value : undefined;
 const positiveInteger = value => Number.isSafeInteger(value) && value > 0 ? value : undefined;
-const nonNegativeInteger = value => Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 const onlyKeys = (value, keys) => Object.keys(value).every(key => keys.includes(key));
 const exactFacts = schema => value => (validateSchemaValue(value, schema) ? value : undefined);
 
@@ -76,13 +72,7 @@ const specs = {
     client: { check: 'client', sources: ['mcp_initialize'], planes: ['client'], causes: ['unknown'], facts: value =>
         record(value) && value.provenance === 'client_reported' ? compact({ name: text(value.name), version: text(value.version), provenance: 'client_reported',
             hostRuntimeVersion: text(value.hostRuntimeVersion) }) : undefined },
-    listener: { check: 'listener', sources: ['bridge_runtime'], planes: ['device'], causes: ['address_in_use', 'listen_failed', 'unknown'], facts: value => {
-        if (!record(value) || value.operation !== 'bind_listener' || !['pending', 'listening', 'address_in_use', 'failed'].includes(value.listenerState)) return undefined;
-        return compact({ operation: 'bind_listener', listenerState: value.listenerState,
-            systemCode: ['EACCES', 'EPERM', 'EADDRINUSE', 'EADDRNOTAVAIL', 'EAFNOSUPPORT', 'EINVAL'].includes(value.systemCode) ? value.systemCode : undefined });
-    } },
-    pairingSource: { check: 'pairing_source', sources: ['peer_token_source'], planes: ['device'], causes: ['permission_denied', 'insecure_permissions', 'missing', 'corrupt', 'unsupported', 'io_error'] },
-    routeFreshness: { check: 'route_freshness', sources: ['extension_heartbeat'], planes: ['device', 'peer'], causes: ['unknown'], facts: value => {
+    routeFreshness: { check: 'route_freshness', sources: ['extension_heartbeat'], planes: ['device'], causes: ['unknown'], facts: value => {
         const lastObservedAt = record(value) ? iso(value.lastObservedAt) : undefined;
         return lastObservedAt ? { lastObservedAt } : undefined;
     } },
@@ -143,39 +133,58 @@ export const selectFeedbackDeviceDiagnostics = value => {
     return Object.keys(selected).length ? selected : undefined;
 };
 
-const bridgeStates = new Set(['initializing', 'listen_failed', 'waiting_for_extension', 'extension_connected_no_wb_tab', 'extension_contended', 'extension_context_unknown', 'peer_context_unknown', 'ready', 'extension_update_required', 'peer_reconnecting', 'peer_unavailable']);
-const peerRejectionCodes = new Set(Object.values(PEER_REJECTION_CODES));
+const bridgeStates = new Set(['initializing', 'waiting_for_extension', 'extension_connected_no_wb_tab', 'extension_context_unknown', 'ready', 'extension_update_required']);
 const selectStorage = storage => {
     if (!record(storage)) return undefined;
     const selected = compact({ results: storageTarget(storage.results), marketplaceArtifacts: storageTarget(storage.marketplaceArtifacts),
         feedbackArtifacts: storageTarget(storage.feedbackArtifacts) });
     return Object.keys(selected).length ? selected : undefined;
 };
-// The device status carries the raw millisecond mark; the projection carries ISO time, so the cloud
-// re-projection accepts the already projected form as well.
-const selectTakeovers = value => {
-    if (!record(value)) return undefined;
-    const count = nonNegativeInteger(value.count);
-    const saturated = bool(value.saturated);
-    if (count === undefined || saturated === undefined) return undefined;
-    return compact({ count, saturated, lastAt: iso(value.lastAt) ?? isoFromMs(value.lastAtMs) });
+
+// The cause code and the registration and broker facts behind it, as closed values only. Error names and codes come
+// from the file system and from a broker's record, so only a short identifier is kept: anything longer or looser can
+// carry a path, a message or a user name. The broker nonce, endpoint, process ids and times are never copied.
+const BRIDGE_IDENTIFIER = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+const MAX_BRIDGE_BROWSERS = 8;
+// RegExp.test stringifies its argument, so a null or missing name would pass as "null" and sink the whole block at the
+// schema; only a string can be an identifier, and a record that is not one is dropped alone.
+const bridgeIdentifier = value => typeof value === 'string' && BRIDGE_IDENTIFIER.test(value);
+const selectBridgeFailure = value => (record(value) && bridgeIdentifier(value.name) && (value.code === null || value.code === undefined || bridgeIdentifier(value.code))
+    ? { name: value.name, code: value.code ?? null } : undefined);
+const selectBridge = value => {
+    // The already projected form is re-validated as it is, so the cloud half can accept what the device sent.
+    if (record(value.bridge)) return validateSchemaValue(value.bridge, bridgeBlockSchema) ? value.bridge : undefined;
+    if (!BRIDGE_STATUS_CODES.includes(value.code)) return undefined;
+    const registration = record(value.registration) ? value.registration : {};
+    const brokers = Array.isArray(value.brokers) ? value.brokers : [];
+    const hosts = Array.isArray(value.userLevelHosts) ? value.userLevelHosts : [];
+    // The browsers, from the closed list only, whose policy matches.
+    const policyBrowsers = matches => [...new Set(hosts.filter(host => record(host) && matches(host) && EXTENSION_INSTALL_VOCABULARY.browsers.includes(host.browser)).map(host => host.browser))];
+    const candidate = compact({
+        code: value.code,
+        registrationState: BRIDGE_REGISTRATION_STATES.includes(registration.state) ? registration.state : undefined,
+        registrationError: selectBridgeFailure(registration.error),
+        runtime: BRIDGE_RUNTIMES.includes(registration.runtime) ? registration.runtime : undefined,
+        brokerCount: brokers.length,
+        browsers: [...new Set(brokers.map(broker => (record(broker) ? text(broker.browser) : undefined)).filter(browser => browser !== undefined))].slice(0, MAX_BRIDGE_BROWSERS),
+        userLevelHostsDisabled: policyBrowsers(host => host.allowed === false),
+        nativeHostBlocked: policyBrowsers(host => host.hostBlocked === true),
+        lastFailureRecord: selectBridgeFailure(value.lastFailureRecord) ?? null,
+    });
+    return validateSchemaValue(candidate, bridgeBlockSchema) ? candidate : undefined;
 };
-const selectPeerRejection = value => (record(value) && peerRejectionCodes.has(value.code)
-    ? compact({ code: value.code, since: iso(value.since), retryAt: iso(value.retryAt) }) : undefined);
 
 export const selectFeedbackDeviceSnapshot = status => {
     if (!record(status)) return {};
     const extension = record(status.extension) ? compact({
             state: ['never_connected', 'connected', 'disconnected'].includes(status.extension.state) ? status.extension.state : undefined,
-            route: ['direct', 'peer', 'none'].includes(status.extension.route) ? status.extension.route : undefined, version: text(status.extension.version),
+            route: ['direct', 'none'].includes(status.extension.route) ? status.extension.route : undefined, version: text(status.extension.version),
             lastConnectedAt: iso(status.extension.lastConnectedAt), lastDisconnectedAt: iso(status.extension.lastDisconnectedAt),
             ozonSellerPromotionReportSupported: bool(status.extension.ozonSellerPromotionReportSupported),
             ozonSellerPromotionReportsSupported: bool(status.extension.ozonSellerPromotionReportsSupported),
             ozonSellerAnalyticsReportSupported: bool(status.extension.ozonSellerAnalyticsReportSupported),
             ozonSearchPositionsSupported: bool(status.extension.ozonSearchPositionsSupported),
         }) : undefined;
-    const peer = record(status.peer) ? compact({ bridgeVersion: text(status.peer.bridgeVersion),
-        browserContextPropagationSupported: bool(status.peer.browserContextPropagationSupported) }) : undefined;
     const browserContext = record(status.browserContext) && ['unknown', 'known'].includes(status.browserContext.state) ? compact({
         state: status.browserContext.state, wbTabConnected: bool(status.browserContext.wbTabConnected),
         sellerTabConnected: bool(status.browserContext.sellerTabConnected), changedAt: iso(status.browserContext.changedAt),
@@ -183,12 +192,10 @@ export const selectFeedbackDeviceSnapshot = status => {
     return compact({
         bridgeStatusCollection: status.bridgeStatusCollection?.check === 'bridge_status_collection'
             ? selectCheck('bridgeStatusCollection', status.bridgeStatusCollection) : undefined,
-        bridgeVersion: text(status.bridgeVersion), bridgeGeneration: positiveInteger(status.bridgeGeneration),
-        controlProtocolVersion: positiveInteger(status.controlProtocolVersion), extensionProtocolVersion: positiveInteger(status.extensionProtocolVersion),
+        bridgeVersion: text(status.bridgeVersion), extensionProtocolVersion: positiveInteger(status.extensionProtocolVersion),
         state: bridgeStates.has(status.state) ? status.state : undefined,
-        extension: extension && Object.keys(extension).length ? extension : undefined, peer: peer && Object.keys(peer).length ? peer : undefined,
-        extensionTakeovers: selectTakeovers(status.extensionTakeovers),
-        peerRejection: selectPeerRejection(status.peerRejection),
+        bridge: selectBridge(status),
+        extension: extension && Object.keys(extension).length ? extension : undefined,
         browserContext, storage: selectStorage(status.storage), diagnostics: selectFeedbackDeviceDiagnostics(status.diagnostics),
     });
 };
@@ -238,11 +245,7 @@ export const feedbackDeviceDiagnosticsSchema = diagnosticObject({
         arch: diagnosticString, bridgeVersion: diagnosticString, mcpProtocolVersion: diagnosticString }, ['nodeVersion', 'platform', 'arch', 'bridgeVersion']), ['unknown']),
     client: checkSchema('client', ['mcp_initialize'], ['client'], diagnosticObject({ name: diagnosticString, version: diagnosticString, provenance: { const: 'client_reported' },
         hostRuntimeVersion: diagnosticString }, ['provenance']), ['unknown']),
-    listener: checkSchema('listener', ['bridge_runtime'], ['device'], diagnosticObject({ operation: { const: 'bind_listener' },
-        listenerState: { type: 'string', enum: ['pending', 'listening', 'address_in_use', 'failed'] },
-        systemCode: { type: 'string', enum: ['EACCES', 'EPERM', 'EADDRINUSE', 'EADDRNOTAVAIL', 'EAFNOSUPPORT', 'EINVAL'] } }, ['operation', 'listenerState']), ['address_in_use', 'listen_failed', 'unknown']),
-    pairingSource: checkSchema('pairing_source', ['peer_token_source'], ['device'], undefined, ['permission_denied', 'insecure_permissions', 'missing', 'corrupt', 'unsupported', 'io_error']),
-    routeFreshness: checkSchema('route_freshness', ['extension_heartbeat'], ['device', 'peer'], diagnosticObject({ lastObservedAt: diagnosticTimestamp }, ['lastObservedAt']), ['unknown']),
+    routeFreshness: checkSchema('route_freshness', ['extension_heartbeat'], ['device'], diagnosticObject({ lastObservedAt: diagnosticTimestamp }, ['lastObservedAt']), ['unknown']),
     storage: checkSchema('storage', ['resolved_configuration'], ['device'], diagnosticObject({ scope: { const: 'configuration' },
         targets: diagnosticObject({ results: storageTargetSchema, marketplaceArtifacts: storageTargetSchema, feedbackArtifacts: storageTargetSchema }, []) }, ['scope', 'targets']), ['unknown']),
     extensionSnapshot: checkSchema('extension_snapshot', ['extension', 'capability_negotiation', 'device_process'], ['device'], extensionSnapshotFactsSchema, ['unsupported', 'unavailable', 'corrupt', 'unknown']),
@@ -256,18 +259,30 @@ export const feedbackDeviceDiagnosticsSchema = diagnosticObject({
     hookPermissions: checkSchema('hook_permissions', ['codex_hooks_list', 'device_process'], ['device'], hookPermissionsFactsSchema, ['permission_denied', 'missing', 'unavailable', 'unsupported', 'unknown']),
 }, []);
 
+const bridgeFailureSchema = diagnosticObject({ name: { type: 'string', pattern: BRIDGE_IDENTIFIER.source }, code: { oneOf: [{ type: 'string', pattern: BRIDGE_IDENTIFIER.source }, { type: 'null' }] } }, ['name', 'code']);
+const policyBrowsersSchema = { type: 'array', items: { type: 'string', enum: [...EXTENSION_INSTALL_VOCABULARY.browsers] }, uniqueItems: true, maxItems: EXTENSION_INSTALL_VOCABULARY.browsers.length };
+const bridgeBlockSchema = diagnosticObject({
+    code: { type: 'string', enum: [...BRIDGE_STATUS_CODES] },
+    registrationState: { type: 'string', enum: [...BRIDGE_REGISTRATION_STATES] },
+    registrationError: bridgeFailureSchema,
+    runtime: { type: 'string', enum: [...BRIDGE_RUNTIMES] },
+    brokerCount: nonNegativeIntegerSchema,
+    browsers: { type: 'array', items: { type: 'string', pattern: '^[^\\u0000-\\u001f\\u007f]{1,128}$' }, uniqueItems: true, maxItems: MAX_BRIDGE_BROWSERS },
+    userLevelHostsDisabled: policyBrowsersSchema,
+    nativeHostBlocked: policyBrowsersSchema,
+    lastFailureRecord: { oneOf: [bridgeFailureSchema, { type: 'null' }] },
+}, ['code', 'brokerCount', 'browsers', 'userLevelHostsDisabled', 'nativeHostBlocked', 'lastFailureRecord']);
+
 export const feedbackDeviceSnapshotSchema = diagnosticObject({
     bridgeStatusCollection: feedbackDeviceDiagnosticsSchema.properties.bridgeStatusCollection,
     bridgeVersion: diagnosticString,
-    bridgeGeneration: { type: 'integer', minimum: 1 }, controlProtocolVersion: { type: 'integer', minimum: 1 }, extensionProtocolVersion: { type: 'integer', minimum: 1 },
+    extensionProtocolVersion: { type: 'integer', minimum: 1 },
     state: { type: 'string', enum: [...bridgeStates] },
-    extension: diagnosticObject({ state: { type: 'string', enum: ['never_connected', 'connected', 'disconnected'] }, route: { type: 'string', enum: ['direct', 'peer', 'none'] },
+    bridge: bridgeBlockSchema,
+    extension: diagnosticObject({ state: { type: 'string', enum: ['never_connected', 'connected', 'disconnected'] }, route: { type: 'string', enum: ['direct', 'none'] },
         version: diagnosticString, lastConnectedAt: diagnosticTimestamp, lastDisconnectedAt: diagnosticTimestamp,
         ozonSellerPromotionReportSupported: { type: 'boolean' }, ozonSellerPromotionReportsSupported: { type: 'boolean' }, ozonSellerAnalyticsReportSupported: { type: 'boolean' },
         ozonSearchPositionsSupported: { type: 'boolean' } }, ['state', 'route']),
-    peer: diagnosticObject({ bridgeVersion: diagnosticString, browserContextPropagationSupported: { type: 'boolean' } }, []),
-    extensionTakeovers: diagnosticObject({ count: nonNegativeIntegerSchema, saturated: { type: 'boolean' }, lastAt: diagnosticTimestamp }, ['count', 'saturated']),
-    peerRejection: diagnosticObject({ code: { type: 'string', enum: [...peerRejectionCodes] }, since: diagnosticTimestamp, retryAt: diagnosticTimestamp }, ['code']),
     browserContext: diagnosticObject({ state: { type: 'string', enum: ['unknown', 'known'] }, wbTabConnected: { type: 'boolean' }, sellerTabConnected: { type: 'boolean' }, changedAt: diagnosticTimestamp }, ['state']),
     storage: diagnosticObject({ results: storageTargetSchema, marketplaceArtifacts: storageTargetSchema, feedbackArtifacts: storageTargetSchema }, []),
     diagnostics: feedbackDeviceDiagnosticsSchema,

@@ -1,4 +1,4 @@
-// Словарь WebSocket-протокола с расширением. Те же имена объявлены enum'ами в
+// Словарь протокола с расширением. Те же имена объявлены enum'ами в
 // расширении (src/local-agent-protocol.ts) и закреплены в
 // contracts/local-agent-contract.json, поэтому расхождение ловится контрактными
 // тестами в обоих репозиториях, а не молчаливым игнорированием сообщения.
@@ -43,50 +43,7 @@ export const MESSAGE_TYPES = Object.freeze({
 
 export const localMessage = (id, type, payload) => ({ id, type, payload });
 
-export const PEER_CAPABILITIES = Object.freeze({ browserContextPropagation: 'browser_context_propagation', diagnosticForwarding: 'diagnostic_snapshot_forwarding_v1', browserJobRejection: 'browser_job_rejection_v1' });
 export const DIAGNOSTIC_SNAPSHOT_CAPABILITY = 'diagnostic_snapshot_v1';
-
-export const peerStatusMessage = ({
-    connections,
-    handoff,
-    bridgeGeneration,
-    bridgeVersion,
-    controlProtocolVersion,
-    extensionProtocolVersion,
-}) => ({
-    type: 'peer_status',
-    extensionConnected: connections.extensionReady,
-    browserJobSupported: connections.extensionBrowserJobReady,
-    bridgeTransitioning: handoff.transitioning,
-    controlProtocolVersion,
-    extensionProtocolVersion,
-    bridgeGeneration,
-    bridgeVersion,
-    instanceId: handoff.instanceId,
-    capabilities: [PEER_CAPABILITIES.browserContextPropagation, PEER_CAPABILITIES.diagnosticForwarding],
-    ...(connections.extensionDiagnosticSnapshotReady === undefined ? {} : { diagnosticSnapshotSupported: connections.extensionDiagnosticSnapshotReady === true }),
-    browserContext: connections.browserContext,
-    ...(connections.extensionOzonPromotionReady === undefined
-        ? {}
-        : { ozonSellerPromotionReportSupported: connections.extensionOzonPromotionReady === true }),
-    ...(connections.extensionOzonPromotionPackageReady === undefined
-        ? {}
-        : { ozonSellerPromotionReportsSupported: connections.extensionOzonPromotionPackageReady === true }),
-    ...(connections.extensionOzonAnalyticsReady === undefined
-        ? {}
-        : { ozonSellerAnalyticsReportSupported: connections.extensionOzonAnalyticsReady === true }),
-    ...(connections.extensionOzonSearchPositionsReady === undefined
-        ? {}
-        : { ozonSearchPositionsSupported: connections.extensionOzonSearchPositionsReady === true }),
-    ...(connections.extensionLastConnectedAtMs === null ? {} : { extensionLastConnectedAtMs: connections.extensionLastConnectedAtMs }),
-    ...(connections.extensionLastDisconnectedAtMs === null ? {} : { extensionLastDisconnectedAtMs: connections.extensionLastDisconnectedAtMs }),
-    // Вторичный процесс сам расширение не видит, поэтому без этого поля конкуренция
-    // диагностируется только на первичном — а агент чаще как раз secondary. Передаются
-    // метки, а не сводка: получатель считает скользящее окно сам, иначе снимок замер бы у
-    // него навсегда — новые `peer_status` при неизменившемся статусе не рассылаются.
-    extensionTakeoverAtMs: connections.extensionTakeoverAtMs,
-    ...(connections.extensionVersion === undefined ? {} : { extensionVersion: connections.extensionVersion }),
-});
 
 export const CLIENT_TO_EXTENSION_MESSAGE_TYPES = Object.freeze([
     MESSAGE_TYPES.browserJobAuthorize,
@@ -181,7 +138,7 @@ export const OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES = Object.freeze({
     OPERATION_CANCELLED: 'cancelled',
     OPERATION_DEADLINE_EXCEEDED: 'deadline',
 });
-export const EXTENSION_CAPABILITIES = Object.freeze(['wb_fetch', 'browser_job', 'seller_reviews', DIAGNOSTIC_SNAPSHOT_CAPABILITY]);
+export const EXTENSION_CAPABILITIES = Object.freeze(['wb_fetch', 'browser_job', 'seller_reviews', 'wb_filters_by_query@1', DIAGNOSTIC_SNAPSHOT_CAPABILITY]);
 
 // Стадия операции продавца внутри payload'а `wb_fetch`. Расширение решает по ней,
 // какой admission применить, поэтому набор объявлен enum'ом SellerOperationStage в

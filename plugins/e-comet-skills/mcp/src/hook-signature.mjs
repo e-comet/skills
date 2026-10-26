@@ -2,7 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { chmod, lstat, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
-import { resolvePeerTokenDir } from './state-paths.mjs';
+import { resolveProfileStateDir } from './state-paths.mjs';
 
 const HOOK_SECRET_FILE = 'feedback-hook-secret';
 const HOOK_SECRET_BYTES = 32;
@@ -122,9 +122,9 @@ export const verifyHookSignature = ({ secret, tool, sessionHash, fields, signatu
 };
 
 /**
- * The rendezvous the claim store used: shared profile state outside every per-application sandbox, so
- * a hook and a local MCP started by different hosts meet on one secret. On Windows an MSIX host
- * redirects %LOCALAPPDATA% into its package container, so the profile root is deliberate.
+ * The profile state directory, shared by a hook and a local MCP started by different hosts so they meet on
+ * one secret. It comes from the OS account home, not from HOME or USERPROFILE, and sits outside every
+ * per-application sandbox: an MSIX host redirects %LOCALAPPDATA% into its package container.
  * @param {Record<string, string | undefined>} [env]
  */
 export const resolveHookSecretDirectory = (env = process.env) => {
@@ -134,10 +134,7 @@ export const resolveHookSecretDirectory = (env = process.env) => {
     if ((!configuredStateRoot || typeof configuredStateRoot !== 'string') && typeof pluginData === 'string' && pluginData.trim()) {
         return resolve(pluginData);
     }
-    return resolvePeerTokenDir({
-        env,
-        ...(typeof configuredHome === 'string' && configuredHome.trim() ? { home: resolve(configuredHome) } : {}),
-    });
+    return resolveProfileStateDir({ env });
 };
 
 /** @param {Record<string, string | undefined>} [env] */

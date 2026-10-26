@@ -1,83 +1,27 @@
-import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { resolveLocalStateDir, resolvePeerTokenDir } from './state-paths.mjs';
+import { EXTENSION_PROTOCOL_VERSION, MAX_FRAME_BYTES } from './native-framing.mjs';
+import { resolveLocalStateDir, resolveProfileStateDir } from './state-paths.mjs';
 import { resolveStorageLayout } from './storage-layout.mjs';
 
+// The plugin release version, which registration stamps on the broker copy. Never this package's own package.json: a
+// run from the canonical source tree has no plugin manifest beside it and counts as development.
 const readBuildVersion = () => {
-    for (const metadataUrl of [new URL('../package.json', import.meta.url), new URL('../../.codex-plugin/plugin.json', import.meta.url)]) {
-        try {
-            const version = JSON.parse(readFileSync(metadataUrl, 'utf8')).version;
-            if (typeof version === 'string' && version.length > 0) return version;
-        } catch (error) {
-            if (error.code !== 'ENOENT') throw error;
-        }
+    try {
+        const version = JSON.parse(readFileSync(new URL('../../.codex-plugin/plugin.json', import.meta.url), 'utf8')).version;
+        if (typeof version === 'string' && version.length > 0) return version;
+    } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
     }
-    throw new Error('Unable to resolve the local bridge build version');
+    return '0.0.0-development';
 };
 
-export const HOST = '127.0.0.1';
-const validPort = (value, fallback) => {
-    // Port 0 is intentionally available only through test/development overrides so integration tests can reserve an ephemeral port.
-    if (typeof value !== 'string' || !/^(?:0|[1-9]\d*)$/.test(value)) return fallback;
-    const port = Number(value);
-    return port <= 65535 ? port : fallback;
-};
-export const resolveBridgePort = ({ env = process.env } = {}) => {
-    const mode = env.NODE_ENV;
-    const allowOverride = mode === 'test' || mode === 'development';
-    return allowOverride ? validPort(env.ECOMET_LOCAL_BRIDGE_PORT, 17361) : 17361;
-};
-export const PORT = resolveBridgePort();
-export const EXTENSION_PATH = '/extension';
-export const PEER_PATH = '/mcp-peer';
-// Deliberately unchanged by the peer-token move: the `/mcp-peer` frames are wire-identical on both sides of
-// it, and the compatibility promise in AGENTS.md is what keeps drain-and-takeover upgrades possible. The move
-// is a change of pairing *secret*, not of protocol — on Windows a mixed pair reads two different token files
-// and fails the proof, which correctly reports `authentication_failed`; the remedy after an upgrade is to
-// restart both applications, as the release notes state. Raise this only when a frame actually changes shape.
-//
-// Peer-only: the Chrome extension never reads this field. Its contract pins `extensionProtocolVersion`.
-export const CONTROL_PROTOCOL_VERSION = 1;
-export const EXTENSION_PROTOCOL_VERSION = 4;
+// Defined in the leaf module the dependency-free broker also loads; every consumer keeps importing them from here.
+export { EXTENSION_PROTOCOL_VERSION, MAX_FRAME_BYTES };
+
 export const SUPPORTED_MCP_PROTOCOL_VERSIONS = ['2025-06-18'];
 export const LATEST_MCP_PROTOCOL_VERSION = SUPPORTED_MCP_PROTOCOL_VERSIONS[0];
-// 6: diagnostic forwarding and reviewed rejection evidence require replacing an older primary that cannot
-// negotiate those frames. Existing drain-and-takeover semantics preserve already admitted business work.
-// 8: an older primary cannot relay the Ozon search positions package family (7 is taken by test builds).
-const DEFAULT_BRIDGE_GENERATION = 8;
-export const resolveBridgeGeneration = ({ env = process.env } = {}) => {
-    const mode = env.NODE_ENV;
-    if (mode !== 'test' && mode !== 'development') return DEFAULT_BRIDGE_GENERATION;
-    const generation = Number(env.ECOMET_LOCAL_BRIDGE_GENERATION);
-    return Number.isSafeInteger(generation) && generation > 0 ? generation : DEFAULT_BRIDGE_GENERATION;
-};
-export const BRIDGE_GENERATION = resolveBridgeGeneration();
 export const BRIDGE_VERSION = readBuildVersion();
-export const HANDOFF_RECONNECT_GRACE_MS = 2000;
-// The grace a peer_handoff frame carries is peer-supplied input. Accepting it verbatim would let a single
-// frame park this instance's listener arbitrarily far into the future, so observers clamp it to this ceiling.
-export const HANDOFF_RECONNECT_GRACE_MAX_MS = 30_000;
-export const HANDOFF_DRAIN_POLL_MS = 25;
-export const EXTENSION_READINESS_WAIT_MS = 2000;
-export const PEER_RECONNECT_BASE_MS = 500;
-// Reconnection never gives up. Once the exponential delay reaches this ceiling the secondary is degraded and
-// keeps retrying at that cadence, so saturation is derived from the delay itself rather than from an attempt
-// ceiling that would have to be kept in sync with the backoff curve.
-export const PEER_RECONNECT_MAX_MS = 30_000;
-// A tool call may pull the next attempt forward, but no more often than this.
-export const PEER_WAKE_COOLDOWN_MS = 2000;
-// A peer that has neither connected nor completed a handshake by now is wedged, not slow. Without this the
-// socket would sit open and silent, emitting no close and so scheduling no further attempt.
-export const PEER_HANDSHAKE_TIMEOUT_MS = 5000;
-export const PEER_TOKEN_READ_TIMEOUT_MS = 1000;
-export const PEER_TOKEN_CREATE_TIMEOUT_MS = 5000;
-export const PEER_PENDING_UPGRADE_LIMIT = 16;
-// close() only starts the closing handshake; a peer that never answers the Close frame would otherwise hold
-// the TCP handle in CLOSING until the process exits — one leaked handle per retry against a silent listener.
-// After this grace the client transport destroys its socket outright.
-export const WS_CLIENT_CLOSE_GRACE_MS = 1000;
-export const WS_HEARTBEAT_INTERVAL_MS = 30_000;
 export const REQUEST_TIMEOUT_MS = 45000;
 // Cabinet restoration can include a portal ping, activation/reload and a retry. Keep its acknowledgement
 // budget independent from the shorter per-request default so a successful export is not reported failed early.
@@ -93,7 +37,6 @@ export const MAX_REQUEST_TIMEOUT_MS = 120000;
 // Observed downloads finish in seconds, tens of seconds at worst, so this is headroom over the real
 // worst case and not a capacity estimate — keep it tight enough that a wedged stream still surfaces.
 export const SELLER_DOWNLOAD_TIMEOUT_MS = 60_000;
-export const MAX_FRAME_BYTES = 32 * 1024 * 1024;
 export const MAX_MCP_MESSAGE_BYTES = 1024 * 1024;
 export const MAX_BROWSER_JOB_TOKEN_BYTES = 128 * 1024;
 // Пределы дескриптора: те же значения применяет расширение, объявлены в манифесте.
@@ -109,6 +52,12 @@ export const SEARCH_CONCURRENCY = 4;
 export const MAX_CHECK_QUERIES = 100;
 export const MAX_CHECK_PAGES_PER_QUERY = 10;
 export const MAX_CHECK_SEARCH_REQUESTS = 1000;
+// wb_filters_by_query: one filters request and at most one full-list request per phrase. A full-list request names at most
+// this many WB fullKey values (`ff` + at most 32 lower-case letters or digits), joined by ";".
+export const MAX_FILTER_QUERIES = 50;
+export const MAX_FILTER_KEYS_PER_REQUEST = 64;
+export const MAX_FILTER_KEY_LENGTH = 34;
+export const FILTER_QUERY_CONCURRENCY = 4;
 // Keep per-job in-flight work conservative; the extension independently owns
 // the service-worker-wide dispatch budget of 30 WB requests per 2.5 seconds.
 export const CHECK_QUERY_CONCURRENCY = 4;
@@ -126,7 +75,7 @@ export const MIN_SELLER_OPERATION_INTERVAL_MS = 1000;
 export const MAX_CONSECUTIVE_SELLER_POLL_FAILURES = 3;
 export const MAX_CONSECUTIVE_SELLER_EXPORT_FAILURES = 3;
 // Темп со стороны агента. Намеренно выше порога приёмки расширения: часы двух процессов и
-// round-trip по WebSocket независимы, поэтому равные значения давали бы ложные срабатывания порога.
+// round-trip через брокер независимы, поэтому равные значения давали бы ложные срабатывания порога.
 export const MIN_SELLER_OPERATION_AGENT_INTERVAL_MS = 1500;
 export const RECOMMENDATION_PAGE_SIZE = 100;
 export const RECOMMENDATION_CONCURRENCY = 4;
@@ -137,8 +86,8 @@ export const MAX_IMAGE_PHOTOS = 30;
 export const DEFAULT_IMAGE_PHOTOS = 15;
 export const MAX_IMAGE_BASKET = 60;
 export const IMAGE_CONCURRENCY = 8;
-// Переопределяются только в test/development — как порт и поколение моста. В проде
-// это параметры хранения результатов пользователя, а не настройка.
+// Переопределяются только в test/development. В проде это параметры хранения результатов
+// пользователя, а не настройка.
 export const positiveIntegerEnv = (name, fallback, { env = process.env } = {}) => {
     if (env.NODE_ENV !== 'test' && env.NODE_ENV !== 'development') return fallback;
     const value = Number(env[name]);
@@ -168,7 +117,6 @@ export const SELLER_JOB_MAX_DURATION_MS = sellerJobDurationMs(
     SELLER_AUTHORIZATION_SCOPE_MAX_MS,
     positiveIntegerEnv('ECOMET_SELLER_JOB_MAX_DURATION_MS', SELLER_AUTHORIZATION_SCOPE_MAX_MS - SELLER_JOB_DOWNLOAD_RESERVE_MS)
 );
-export const HANDOFF_MAX_DRAIN_MS = positiveIntegerEnv('ECOMET_HANDOFF_MAX_DRAIN_MS', 10_000);
 export const MAX_ACTIVE_AUTHORIZATION_SCOPES = positiveIntegerEnv('ECOMET_MAX_ACTIVE_AUTHORIZATION_SCOPES', 32);
 export const RESULT_RETENTION_MS = positiveIntegerEnv('ECOMET_RESULT_RETENTION_MS', 24 * 60 * 60 * 1000);
 export const RESULT_MAX_FILE_BYTES = positiveIntegerEnv('ECOMET_RESULT_MAX_FILE_BYTES', 64 * 1024 * 1024);
@@ -177,12 +125,12 @@ export const IMAGE_BASKET_BOUNDS = [
     4349, 4565, 4877, 5189, 5501, 5813, 6125, 6437, 6749, 7061, 7373, 7685, 7997, 8309, 8741, 9173, 9605, 10373, 11141, 11909, 12677, 13445,
     14213,
 ];
-export { resolveLocalStateDir, resolvePeerTokenDir };
+export { resolveLocalStateDir, resolveProfileStateDir };
 
 // Result-directory relocation is intentionally user-configurable in production; quota and retention overrides above are not.
 export const resolveResultDir = (options = {}) => resolveStorageLayout(options).results;
 
-export const PEER_TOKEN_DIR = resolvePeerTokenDir();
+export const PROFILE_STATE_DIR = resolveProfileStateDir();
 export const STORAGE_LAYOUT = resolveStorageLayout();
 export const RESULT_STORAGE = STORAGE_LAYOUT.results;
 export const ARTIFACT_STORAGE = STORAGE_LAYOUT.marketplaceArtifacts;
@@ -211,8 +159,10 @@ export const FEEDBACK_CLOUD_UPLOAD_DESTINATIONS = Object.freeze([
     Object.freeze({ hostname: 'app.e-comet.io', pathPrefix: '/storage/e-comet-prod-mcp-feedback-732537603439/' }),
 ]);
 export const FEEDBACK_ARTIFACT_RETENTION_MS = 24 * 60 * 60 * 1000;
-export const SESSION_NONCE = randomUUID();
 export const OFFICIAL_EXTENSION_ID = 'apeallgchpgibifmbgefkhifidihmodh';
+// The first extension build that talks to the browser's native messaging host. Equals MINIMUM_SERVED_EXTENSION_VERSION
+// in the release gate (scripts/extension_gate.py); both change together. Tests derive their versions from it.
+export const NATIVE_EXTENSION_MIN_VERSION = '1.6.0';
 export const EXTENSION_ID_OVERRIDE_ENABLED =
     process.env.ECOMET_ENABLE_EXTENSION_ID_OVERRIDE === '1' && ['test', 'development'].includes(process.env.NODE_ENV);
 const extensionIdOverride = new Set(

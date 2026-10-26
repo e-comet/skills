@@ -1,4 +1,5 @@
-import { ARTIFACT_MAX_FILE_BYTES, EXTENSION_PROTOCOL_VERSION, MAX_BROWSER_JOB_TEXT_LENGTH } from './config.mjs';
+import { bridgeCauseError } from './bridge-cause.mjs';
+import { ARTIFACT_MAX_FILE_BYTES, MAX_BROWSER_JOB_TEXT_LENGTH } from './config.mjs';
 import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
 import {
     AUTHORIZATION_FETCH_ERROR_CODES,
@@ -21,11 +22,9 @@ import {
     SELLER_OPERATION_STAGES,
     UNCLASSIFIED_FETCH_ERROR_CODE,
 } from './extension-vocabulary.mjs';
-import { parseAnalyticsDateRange } from './ozon-analytics-domain.mjs';
 import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
 import { isSearchPositionsSkuList, MAX_OZON_SEARCH_POSITIONS_TEXT_LENGTH } from './ozon-search-positions-domain.mjs';
 import { ToolExecutionError, parseBrowserJobRejection, safeExternalToolError, safeOzonPromotionToolError } from './tool-errors.mjs';
-import { encodeFrame } from './websocket.mjs';
 
 const MAX_ID_LENGTH = 128;
 const MAX_STREAM_CHUNK_BYTES = 256 * 1024;
@@ -112,42 +111,6 @@ export const isValidOzonPromotionOperation = (value) => {
     } catch {
         return false;
     }
-};
-export const isValidOzonReportPackageRequest = (value) => {
-    if (
-        !isRecord(value) ||
-        !hasOnlyKeys(value, ['family', 'items', 'deadlineAt']) ||
-        !Number.isSafeInteger(value.deadlineAt) ||
-        value.deadlineAt <= 0 ||
-        !Array.isArray(value.items) ||
-        value.items.length < 1 ||
-        value.items.length > MAX_OZON_REPORT_PACKAGE_ITEMS ||
-        (value.family !== 'promotion' && value.family !== 'analytics' && value.family !== 'positions')
-    ) {
-        return false;
-    }
-    return value.items.every((item) => {
-        // Queries are bounded here; the broker admits only the exact signed queries.
-        if (value.family === 'positions') return isBoundedString(item, MAX_OZON_SEARCH_POSITIONS_TEXT_LENGTH);
-        if (!isRecord(item)) return false;
-        if (value.family === 'promotion') {
-            if (!hasOnlyKeys(item, ['dateFrom', 'dateTo']) || Object.keys(item).length !== 2) return false;
-            try {
-                parseOzonPromotionPeriod(item.dateFrom, item.dateTo);
-                return true;
-            } catch {
-                return false;
-            }
-        }
-        if (!hasOnlyKeys(item, ['dateFrom', 'dateTo', 'breakdown']) || Object.keys(item).length !== 3) return false;
-        if (item.breakdown !== 'period' && item.breakdown !== 'daily') return false;
-        try {
-            parseAnalyticsDateRange(item.dateFrom, item.dateTo);
-            return true;
-        } catch {
-            return false;
-        }
-    });
 };
 const isValidOzonStreamStart = (value, indexed = false) =>
     isRecord(value) &&
@@ -337,21 +300,80 @@ export const parseExtensionServerMessage = (value) => {
     return { ok: true, message: value };
 };
 
-export const createExtensionProtocol = ({
-    connections,
-    requestBroker,
-    handoff,
-    sessionNonce,
-    send,
-    log,
-    broadcastStatus,
-}) => {
-    const handleMessage = async (state, rawMessage) => {
-        const socket = state.socket;
-        let message;
-        try {
-            message = JSON.parse(rawMessage);
-        } catch {
+// The broker refused a frame this process sent, or the client refused one before writing it. Either way the request
+// cannot reach the extension, and the cause is ours, not the seller's.
+export const bridgeFrameRefusal = (refusalCode) => {
+    const refusal = typeof refusalCode === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(refusalCode) ? refusalCode : 'UNKNOWN';
+    const error = bridgeCauseError({ code: 'BRIDGE_FRAME_TOO_LARGE', refusal });
+    error.details = Object.freeze({ refusalCode: refusal });
+    return error;
+};
+
+// Nothing reached the extension, so one retry is safe.
+const DISCONNECTED_RETRY = 'Retry once; if it repeats, check local_bridge_status.';
+export const extensionDisconnectedError = (what = 'The e-Comet extension is not connected to this agent.') =>
+    new ToolExecutionError('EXTENSION_DISCONNECTED', `${what} ${DISCONNECTED_RETRY}`, 'extension', true);
+// The extension may have applied the request already, so this text never invites repeating a create.
+const extensionDisconnectedInFlightError = () => new ToolExecutionError('EXTENSION_DISCONNECTED',
+    'The browser connection closed while the request was running; check local_bridge_status. A read can be repeated, ' +
+        "but do not repeat a report create without the user's decision.", 'extension', true);
+
+const isBrowserContext = (context) => isRecord(context) && Object.keys(context).length === 2 &&
+    typeof context.wbTabConnected === 'boolean' && typeof context.sellerTabConnected === 'boolean';
+
+/**
+ * Runs today's extension session over a broker session. The broker owns the handshake: `openSession` receives the
+ * extension facts it read from `hello_ack`, and the frames that follow are plain objects.
+ */
+export const createExtensionProtocol = ({ connections, requestBroker, log, broadcastStatus = () => undefined }) => {
+    // Every correlated collection the extension (or the broker) can answer for one request id. Ownership decides the
+    // collection: `a() || b()` would always touch the first and log a false late response for the others.
+    const rejectRequest = (id, rejection) =>
+        requestBroker.hasPendingDiagnosticSnapshot?.(id)
+            ? requestBroker.rejectDiagnosticSnapshot(id, rejection)
+            : requestBroker.hasPendingAuthorization(id)
+              ? requestBroker.rejectAuthorization(id, rejection)
+              : requestBroker.hasPendingAuthorizationRelease(id)
+                ? requestBroker.rejectAuthorizationRelease(id, rejection)
+                : requestBroker.hasPendingOzonPromotionOperation(id)
+                  ? requestBroker.rejectOzonPromotionReport(id, rejection)
+                  : requestBroker.hasPendingOzonReportPackage(id)
+                    ? requestBroker.rejectOzonReportPackage(id, rejection)
+                    : requestBroker.hasPendingSellerOperation(id)
+                      ? requestBroker.rejectSellerOperation(id, rejection)
+                      : requestBroker.rejectFetch(id, rejection);
+
+    const updateBrowserContext = (session, context) => {
+        if (isBrowserContext(context) && connections.updateBrowserContext(session, context)) broadcastStatus();
+    };
+
+    const openSession = (session, facts, browserContext) => {
+        if (connections.extensionSession && connections.extensionSession !== session) requestBroker.invalidateAuthorizationWork();
+        const capabilities = Array.isArray(facts?.capabilities) ? facts.capabilities : [];
+        const previous = connections.connectExtension(session, {
+            browserJobSupported: capabilities.includes('browser_job'),
+            ozonSellerPromotionReportSupported: capabilities.includes(OZON_PROMOTION_CAPABILITY),
+            ozonSellerPromotionReportsSupported: capabilities.includes(OZON_PROMOTION_PACKAGE_CAPABILITY),
+            ozonSellerAnalyticsReportSupported: capabilities.includes(OZON_ANALYTICS_CAPABILITY),
+            ozonSearchPositionsSupported: capabilities.includes(OZON_SEARCH_POSITIONS_CAPABILITY),
+            diagnosticSnapshotSupported: capabilities.includes(DIAGNOSTIC_SNAPSHOT_CAPABILITY),
+            version: typeof facts?.extensionVersion === 'string' ? facts.extensionVersion : undefined,
+        });
+        previous?.close();
+        // connectExtension resets the context of a new session, so the one a running broker already holds goes after it.
+        if (isBrowserContext(browserContext)) connections.updateBrowserContext(session, browserContext);
+        log(`extension connected, version ${facts?.extensionVersion || 'unknown'}`);
+        broadcastStatus();
+    };
+
+    const handleMessage = async (session, message) => {
+        if (message?.type === 'session_state') return void updateBrowserContext(session, message.browserContext);
+        // The broker closes the connection right after it, and the close ends the session.
+        if (message?.type === 'session_end') return;
+        if (message?.type === 'broker_refusal') {
+            if (typeof message.id !== 'string') return void log(`broker refused a frame without an id: ${message.code}`);
+            const settled = rejectRequest(message.id, bridgeFrameRefusal(message.code));
+            log(`broker refused message ${message.id}: ${message.code}${settled ? '' : ' (no pending request)'}`);
             return;
         }
 
@@ -360,7 +382,7 @@ export const createExtensionProtocol = ({
             // Коррелированный снимок неверной формы закрывает свой запрос сразу. Без этого он
             // оседал молча, e_comet_diagnose ждал полный таймаут и сообщал причину «unknown»
             // вместо наблюдаемого отказа по форме. Содержимое payload не логируем.
-            if (state.extensionHandshakeComplete && message?.type === MESSAGE_TYPES.diagnosticSnapshotResult &&
+            if (message?.type === MESSAGE_TYPES.diagnosticSnapshotResult &&
                 typeof message.id === 'string' && requestBroker.hasPendingDiagnosticSnapshot?.(message.id)) {
                 requestBroker.rejectDiagnosticSnapshot(message.id, new ToolExecutionError('EXTENSION_DIAGNOSTIC_INVALID',
                     'The extension diagnostic snapshot did not match the negotiated diagnostic_snapshot_v1 shape.', 'extension', false));
@@ -371,72 +393,6 @@ export const createExtensionProtocol = ({
         message = parsed.message;
 
         const { payload, type } = message;
-        if (type === MESSAGE_TYPES.helloAck) {
-            if (state.extensionHandshakeComplete) {
-                log('rejected duplicate extension hello_ack');
-                socket.end(encodeFrame('', 0x8));
-                return;
-            }
-            if (message.id !== state.helloId || payload.sessionNonce !== sessionNonce) {
-                log('rejected extension hello_ack with an invalid session nonce');
-                socket.end(encodeFrame('', 0x8));
-                return;
-            }
-            if (payload.protocolVersion !== EXTENSION_PROTOCOL_VERSION) {
-                log(`rejected extension protocol ${payload.protocolVersion}; expected ${EXTENSION_PROTOCOL_VERSION}`);
-                socket.end(encodeFrame('', 0x8));
-                return;
-            }
-
-            state.extensionHandshakeComplete = true;
-            if (connections.extensionSocket && connections.extensionSocket !== socket) {
-                requestBroker.invalidateAuthorizationWork();
-            }
-            const previousSocket = connections.connectExtension(
-                socket,
-                {
-                    browserJobSupported: Array.isArray(payload.capabilities) && payload.capabilities.includes('browser_job'),
-                    ozonSellerPromotionReportSupported:
-                        Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_PROMOTION_CAPABILITY),
-                    ozonSellerPromotionReportsSupported:
-                        Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_PROMOTION_PACKAGE_CAPABILITY),
-                    ozonSellerAnalyticsReportSupported:
-                        Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_ANALYTICS_CAPABILITY),
-                    ozonSearchPositionsSupported:
-                        Array.isArray(payload.capabilities) && payload.capabilities.includes(OZON_SEARCH_POSITIONS_CAPABILITY),
-                    diagnosticSnapshotSupported:
-                        Array.isArray(payload.capabilities) && payload.capabilities.includes(DIAGNOSTIC_SNAPSHOT_CAPABILITY),
-                    version: payload.extensionVersion,
-                }
-            );
-            previousSocket?.end(encodeFrame('', 0x8));
-            handoff.markTopologySettled();
-            log(`extension connected, version ${payload.extensionVersion || 'unknown'}`);
-            broadcastStatus();
-            return;
-        }
-
-        if (!state.extensionHandshakeComplete) {
-            log('rejected extension operational message before hello_ack');
-            socket.end(encodeFrame('', 0x8));
-            return;
-        }
-
-        if (type === MESSAGE_TYPES.ping) {
-            const context = payload.browserContext;
-            if (
-                context &&
-                Object.keys(context).length === 2 &&
-                typeof context.wbTabConnected === 'boolean' &&
-                typeof context.sellerTabConnected === 'boolean' &&
-                connections.updateBrowserContext(socket, context)
-            ) {
-                broadcastStatus();
-            }
-            send(socket, localMessage(message.id, MESSAGE_TYPES.pong, { at: Date.now() }));
-            return;
-        }
-
         // Конверт уровня протокола (невалидный payload, слишком большое сообщение,
         // неизвестный тип). Его id совпадает с id исходного сообщения, поэтому он
         // закрывает ровно тот запрос, который расширение отвергло. Без этой ветки
@@ -451,21 +407,7 @@ export const createExtensionProtocol = ({
                 { code, message: detail, stage: 'execution', retryable: false },
                 'The extension rejected a local-agent message.'
             );
-            // Коллекцию выбираем по принадлежности: `a() || b()` всегда дёргал первую и
-            // печатал ложный «поздний ответ» на каждый протокольный отказ авторизации.
-            const settled = requestBroker.hasPendingDiagnosticSnapshot?.(message.id)
-                ? requestBroker.rejectDiagnosticSnapshot(message.id, rejection)
-                : requestBroker.hasPendingAuthorization(message.id)
-                ? requestBroker.rejectAuthorization(message.id, rejection)
-                : requestBroker.hasPendingAuthorizationRelease(message.id)
-                  ? requestBroker.rejectAuthorizationRelease(message.id, rejection)
-                  : requestBroker.hasPendingOzonPromotionOperation(message.id)
-                    ? requestBroker.rejectOzonPromotionReport(message.id, rejection)
-                  : requestBroker.hasPendingOzonReportPackage(message.id)
-                    ? requestBroker.rejectOzonReportPackage(message.id, rejection)
-                  : requestBroker.hasPendingSellerOperation(message.id)
-                    ? requestBroker.rejectSellerOperation(message.id, rejection)
-                    : requestBroker.rejectFetch(message.id, rejection);
+            const settled = rejectRequest(message.id, rejection);
             log(`extension rejected message ${message.id}: ${code}${settled ? '' : ' (no pending request)'}`);
             return;
         }
@@ -473,8 +415,17 @@ export const createExtensionProtocol = ({
         if (type === MESSAGE_TYPES.browserJobAuthorizeResult) {
             if (payload.error) {
                 requestBroker.rejectAuthorization(message.id, safeExternalToolError({ ...payload.error, browserJobRejection: payload.browserJobRejection }));
-            } else {
-                requestBroker.resolveAuthorization(message.id, payload.authorization);
+            } else if (!requestBroker.resolveAuthorization(message.id, payload.authorization)) {
+                // A grant that arrives after its request timed out would hold the seller cabinet until the token expires.
+                const authorizationId = payload.authorization?.authorizationId;
+                if (typeof authorizationId === 'string' && authorizationId.length > 0) {
+                    void requestBroker
+                        .requestAuthorizationRelease(authorizationId, ({ requestId }) =>
+                            session.send(localMessage(requestId, MESSAGE_TYPES.browserJobAuthorizationRelease, { authorizationId })))
+                        .catch((error) => log('failed to release a late browser-job authorization:', error.code ?? error.message));
+                } else {
+                    log(`late browser-job authorization ${message.id} carried no authorization id to release`);
+                }
             }
             return;
         }
@@ -516,7 +467,7 @@ export const createExtensionProtocol = ({
 
         if (type === MESSAGE_TYPES.ozonReportPhase) {
             const handled = await requestBroker.recordOzonReportPackagePhase(message.id, payload.family, payload);
-            if (handled) send(socket, localMessage(message.id,
+            if (handled) session.send(localMessage(message.id,
                 payload.family === 'promotion' ? MESSAGE_TYPES.ozonPromotionStreamAck : MESSAGE_TYPES.ozonAnalyticsStreamAck,
                 { frameId: payload.frameId }));
             return;
@@ -526,7 +477,7 @@ export const createExtensionProtocol = ({
                 ? await requestBroker.startOzonReportPackageStream(message.id, 'promotion', payload)
                 : await requestBroker.startOzonPromotionStream(message.id, payload);
             if (handled) {
-                send(socket, localMessage(message.id, MESSAGE_TYPES.ozonPromotionStreamAck, { frameId: payload.frameId }));
+                session.send(localMessage(message.id, MESSAGE_TYPES.ozonPromotionStreamAck, { frameId: payload.frameId }));
             }
             return;
         }
@@ -536,7 +487,7 @@ export const createExtensionProtocol = ({
                 ? await requestBroker.appendOzonReportPackageStreamChunk(message.id, 'promotion', payload)
                 : await requestBroker.appendOzonPromotionStreamChunk(message.id, payload);
             if (handled) {
-                send(socket, localMessage(message.id, MESSAGE_TYPES.ozonPromotionStreamAck, { frameId: payload.frameId }));
+                session.send(localMessage(message.id, MESSAGE_TYPES.ozonPromotionStreamAck, { frameId: payload.frameId }));
             }
             return;
         }
@@ -546,7 +497,7 @@ export const createExtensionProtocol = ({
                 ? await requestBroker.endOzonReportPackageStream(message.id, 'promotion', payload)
                 : await requestBroker.endOzonPromotionStream(message.id, payload);
             if (handled) {
-                send(socket, localMessage(message.id, MESSAGE_TYPES.ozonPromotionStreamAck, { frameId: payload.frameId }));
+                session.send(localMessage(message.id, MESSAGE_TYPES.ozonPromotionStreamAck, { frameId: payload.frameId }));
             }
             return;
         }
@@ -579,7 +530,7 @@ export const createExtensionProtocol = ({
                       ? await requestBroker.appendOzonReportPackageStreamChunk(message.id, 'analytics', payload)
                       : await requestBroker.endOzonReportPackageStream(message.id, 'analytics', payload);
             if (handled) {
-                send(socket, localMessage(message.id, MESSAGE_TYPES.ozonAnalyticsStreamAck, { frameId: payload.frameId }));
+                session.send(localMessage(message.id, MESSAGE_TYPES.ozonAnalyticsStreamAck, { frameId: payload.frameId }));
             }
             return;
         }
@@ -614,28 +565,15 @@ export const createExtensionProtocol = ({
         }
     };
 
-    const onDisconnect = (state) => {
-        if (!connections.disconnectExtension(state.socket)) return false;
-        requestBroker.rejectPendingRequests(
-            new ToolExecutionError(
-                    'EXTENSION_DISCONNECTED',
-                    'The extension disconnected before returning the WB response. Open an authenticated Wildberries tab and retry.',
-                    'extension',
-                    true
-                )
-        );
-        requestBroker.rejectPendingAuthorizations(
-            new ToolExecutionError(
-                    'EXTENSION_DISCONNECTED',
-                    'The extension disconnected before authorizing the browser job. Open an authenticated Wildberries tab and retry.',
-                    'extension',
-                    true
-                )
-        );
+    // In-flight work ends with EXTENSION_DISCONNECTED and is never repeated: a repeated create could duplicate a report.
+    const onSessionEnd = (session) => {
+        if (!connections.disconnectExtension(session)) return false;
+        requestBroker.rejectPendingRequests(extensionDisconnectedInFlightError());
+        requestBroker.rejectPendingAuthorizations(extensionDisconnectedInFlightError());
         log('extension disconnected');
         broadcastStatus();
         return true;
     };
 
-    return { handleMessage, onDisconnect };
+    return { openSession, handleMessage, onSessionEnd };
 };

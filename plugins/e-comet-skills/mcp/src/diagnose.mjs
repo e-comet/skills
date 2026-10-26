@@ -9,7 +9,7 @@ import { probeBrowserExtensionInstall } from './browser-extension-install.mjs';
 const systemCause = (error) => ['EACCES', 'EPERM', 'EROFS'].includes(error?.code) ? 'permission_denied' : 'io_error';
 
 // Наблюдаемое состояние маршрута, а не догадка о сборке: «расширение не подключено» (спрашивать
-// некого), «возможность не объявлена» (подключённая сборка или первичный процесс её не несут) и
+// некого), «возможность не объявлена» (подключённая сборка её не несёт) и
 // «ответ не той формы» — разные наблюдения. Всё, что осталось неопознанным, остаётся unknown.
 const EXTENSION_SNAPSHOT_FAILURES = Object.freeze({
     EXTENSION_DISCONNECTED: { state: 'not_checked', source: 'device_process', cause: 'unavailable' },

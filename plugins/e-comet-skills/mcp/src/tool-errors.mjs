@@ -1,3 +1,4 @@
+import { BRIDGE_CODES } from './bridge-codes.mjs';
 import {
     EXTENSION_UPDATE_URL,
     OZON_PROMOTION_CAPABILITY,
@@ -25,6 +26,11 @@ export const parseBrowserJobRejection = (code, value) => {
 export const browserJobRejectionDetails = (error) => error instanceof ToolExecutionError && error.details?.browserJobRejection
     ? { browserJobRejection: error.details.browserJobRejection } : undefined;
 
+// The bridge cause an Ozon authorization failure carries when no broker answered. Only this process builds it, and only a
+// closed cause code passes.
+export const bridgeCodeDetails = (error) => error instanceof ToolExecutionError && error.code === 'OZON_AUTHORIZATION_REJECTED'
+    && BRIDGE_CODES.includes(error.details?.bridgeCode) ? { bridgeCode: error.details.bridgeCode } : undefined;
+
 // Причина отказа для сборки расширения, не объявившей возможность Ozon. Терминальный код при этом
 // остаётся OZON_ROUTE_NOT_READY: набор кодов зафиксирован в contracts/local-agent-contract.json,
 // который обязан побайтно совпадать с копией в репозитории расширения, поэтому отдельный код связал
@@ -39,7 +45,7 @@ const OZON_EXTENSION_OUTDATED_DETAIL_KEYS = Object.freeze([
     'installedExtensionVersion',
 ]);
 
-// Версия расширения приходит из hello_ack, а на вторичном процессе — ещё и из peer_status, то есть
+// Версия расширения приходит из hello_ack через брокер, то есть
 // из-за границы процесса. В текст и в details она попадает только в консервативном виде: произвольная
 // строка вывела бы сообщение за MAX_SAFE_MESSAGE_LENGTH, и весь терминальный ответ выродился бы в
 // нераспознанную ошибку вместо диагноза.
@@ -128,6 +134,7 @@ export const safeOzonPromotionToolError = (value) => {
     if (value instanceof ToolExecutionError && value.code === 'OZON_AUTHORIZATION_REJECTED' && value.details?.browserJobRejection) {
         safe.details = value.details;
     }
+    if (bridgeCodeDetails(value)) safe.details = bridgeCodeDetails(value);
     if (isOzonExecutionInterruptionDetails(value.code, value.details)) {
         safe.details = { phase: value.details.phase, createOutcome: value.details.createOutcome };
     }
@@ -161,20 +168,20 @@ export const ozonExtensionOutdatedError = (installedExtensionVersion) => {
 export const ozonRouteUnavailableError = (reason = 'unavailable') =>
     new ToolExecutionError(
         'OZON_ROUTE_NOT_READY',
-        (reason === 'disconnected'
-            ? 'The e-Comet extension is not connected to the local bridge. '
-            : reason === 'timeout'
-              ? 'The Ozon report authorization response timed out; this does not establish why the route was unavailable. '
-              : 'The Ozon extension route is unavailable; its cause is not established. ') +
-            `Ensure e-Comet extension ${OZON_PROMOTION_MIN_EXTENSION_VERSION} or newer is enabled in the same browser profile, refresh any authenticated Ozon Seller page under https://seller.ozon.ru/app, then request a new report authorization and retry.`,
+        reason === 'disconnected'
+            // A page no longer starts the browser connection, so refreshing one cannot restore it.
+            ? 'The browser connection closed before the Ozon report authorization completed; no report operation was dispatched by this call. ' +
+                "Check local_bridge_status for the cause, then request a new report authorization on the user's decision."
+            : (reason === 'timeout'
+                ? 'The Ozon report authorization response timed out; this does not establish why the route was unavailable. '
+                : 'The Ozon extension route is unavailable; its cause is not established. ') +
+                `Ensure e-Comet extension ${OZON_PROMOTION_MIN_EXTENSION_VERSION} or newer is enabled in the same browser profile, refresh any authenticated Ozon Seller page under https://seller.ozon.ru/app, then request a new report authorization and retry.`,
         'route',
         false
     );
 
-// Форма ответа фиксирована и на проводе: peer_ozon_promotion_result принимает у toolError ровно
-// ok/code/message/stage/retryable, поэтому лишний ключ отсюда сделал бы кадр невалидным и вторичный
-// процесс ждал бы дедлайна вместо отказа. Диагноз устаревшего расширения добавляет к терминальному
-// ответу сам обработчик инструмента, а не этот сериализатор.
+// Форма ответа фиксирована: ровно ok/code/message/stage/retryable. Диагноз устаревшего расширения
+// добавляет к терминальному ответу сам обработчик инструмента, а не этот сериализатор.
 export const toolFailure = (error, fallback = {}) => {
     if (error instanceof ToolExecutionError || error instanceof StorageUnavailableError) {
         return {

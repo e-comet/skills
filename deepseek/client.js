@@ -21,7 +21,8 @@ window.__ModuleLoader__.load({
       badgeReady: 'Готово к работе', badgeAction: 'Нужно действие', badgeWaiting: 'Ожидание входа', badgeError: 'Нужно внимание', badgeOff: 'Не подключено', badgeChecking: 'Подключение',
       badgeReconnecting: 'Переподключение', reconnecting: 'Переподключение',
       reconnectNow: 'Переподключить сейчас',
-      extension_offline: 'Расширение не на связи', localOfflineBefore: 'Откройте любую страницу ', localOfflineAfter: ' в браузере с расширением e-Comet — оно подключится само.',
+      extension_offline: 'Расширение не на связи',
+      localOffline: 'Откройте браузер с расширением e-Comet. Если он уже открыт, нажмите на значок e-Comet, а если браузер показывает «Требуется действие» — примите там разрешение e-Comet.',
       localDoctorHint: 'Не помогло? Напишите агенту «Диагностируй e-Comet»',
       bridge_unavailable: 'Мост e-Comet недоступен', localBridgeHint: 'Попросите агента проверить подключение e-Comet — напишите ему «Диагностируй e-Comet»',
       localUnavailableBefore: 'Локальный модуль e-Comet не запущен; плагин перезапускает его сам. Если через несколько минут статус не изменился, перезапустите DeepSeek, а если не помогло — напишите в поддержку через виджет на ', localUnavailableAfter: '.',
@@ -341,9 +342,9 @@ window.__ModuleLoader__.load({
             const connection = ({ kind, current, signal }) => {
               const problem = signal==='waiting' || signal==='error';
               const statusKey = current==='connected' ? 'available' : current;
-              // The explanation and its link live in a tooltip on the dashed status word, so a broken row stays one line.
+              // The explanation lives in a tooltip on the dashed status word, so a broken row stays one line.
               const tip = current==='extension_offline' ? h('div',{className:'ec-tip-box'},
-                  t('localOfflineBefore'), h('a',{href:'https://www.wildberries.ru/',target:'_blank',rel:'noopener noreferrer'},'wildberries.ru',externalIcon()), t('localOfflineAfter'),
+                  t('localOffline'),
                   h('br'), h('span',{style:{opacity:.7}},t('localDoctorHint')))
                 : current==='bridge_unavailable' ? h('div',{className:'ec-tip-box'},t('localBridgeHint'))
                 // The local module is not running and the adapter keeps restarting it: the row names the wait and the two user steps itself.

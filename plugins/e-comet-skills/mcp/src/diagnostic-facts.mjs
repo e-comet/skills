@@ -1,6 +1,6 @@
 export const DIAGNOSTIC_STATES = Object.freeze(['passed', 'failed', 'unknown', 'not_checked', 'unsupported']);
 export const MCP_CONFIGURATION_FACTS = Object.freeze({ transport: 'stdio', command: 'node', cwd: '.', entrypoint: 'mcp/src/server.mjs' });
-export const DIAGNOSTIC_CAUSES = Object.freeze(['permission_denied', 'insecure_permissions', 'missing', 'directory_absent', 'corrupt', 'unsupported', 'io_error', 'address_in_use', 'listen_failed', 'unavailable', 'unknown']);
+export const DIAGNOSTIC_CAUSES = Object.freeze(['permission_denied', 'missing', 'directory_absent', 'corrupt', 'unsupported', 'io_error', 'unavailable', 'unknown']);
 
 const safeText = (value) => typeof value === 'string' && value.length > 0 && value.length <= 128 && !/[\u0000-\u001f\u007f]/u.test(value);
 
@@ -24,8 +24,8 @@ export const diagnosticCheck = (/** @type {any} */ input) => {
 };
 
 export const collectStaticFacts = (/** @type {any} */ input) => {
-    const { platform, arch, versions = {}, storageLayout = {}, pairingObservation, observedAt = new Date().toISOString() } = input;
-    const checks = [
+    const { platform, arch, versions = {}, storageLayout = {}, observedAt = new Date().toISOString() } = input;
+    return [
         diagnosticCheck({ check: 'runtime', state: 'passed', observedAt, source: 'node_process', executionPlane: 'device', facts: {
             nodeVersion: versions.node, platform, arch, ...(versions.bridge ? { bridgeVersion: versions.bridge } : {}),
             ...(versions.mcp ? { mcpProtocolVersion: versions.mcp } : {}),
@@ -36,9 +36,6 @@ export const collectStaticFacts = (/** @type {any} */ input) => {
             ])),
         } }),
     ];
-    if (pairingObservation) checks.push(diagnosticCheck({ check: 'pairing_source', state: pairingObservation.state === 'passed' ? 'passed' : 'failed', observedAt: pairingObservation.observedAt ?? observedAt,
-        source: 'peer_token_source', executionPlane: 'device', ...(pairingObservation.reason ? { cause: pairingObservation.reason } : {}) }));
-    return checks;
 };
 
 // A canonical 24-character UTC timestamp, the only time form every report consumer accepts.
@@ -93,21 +90,44 @@ const hookPermissionsFailureFactsSchema = closed({
 export const hookPermissionsFactsSchema = { type: 'object', oneOf: [hookPermissionsInventoryFactsSchema, hookPermissionsFailureFactsSchema] };
 
 export const EXTENSION_INSTALL_VOCABULARY = Object.freeze({
-    browsers: Object.freeze(['chrome', 'edge', 'yandex', 'opera']),
+    browsers: Object.freeze(['chrome', 'edge', 'brave', 'yandex', 'opera']),
     profileSources: Object.freeze(['local_state', 'default_only']),
-    counters: Object.freeze(['profilesChecked', 'installedProfiles', 'enabledProfiles', 'unknownProfiles', 'readFailures']),
+    profileStates: Object.freeze(['enabled', 'disabled', 'unknown']),
     extensionId: /^[a-p]{32}$/,
+    // The directory names Chromium gives a profile, and `other` for a directory it did not name that way: any other
+    // name would be free text, and an unusual directory name can identify its owner, in a report.
+    profile: /^(?:Default|Profile [1-9]\d{0,2}|other)$/,
     version: /^[\w.+-]{1,32}$/,
+    // At most 31 distinct reason values, each from 1 to 1 << 30: Chromium 155 stores a list of values, and an older
+    // bitmask splits into at most 31 bits.
+    maxDisableReasons: 31,
+    maxDisableReason: 2 ** 30,
+    // Generous for a person's browser profiles; the cap keeps the report projection bounded (accepted residual
+    // "Device projection caps are a measured margin" in docs/local-agent-architecture.md#accepted-residuals).
+    maxProfiles: 32,
 });
+const extensionVersion = { type: 'string', pattern: EXTENSION_INSTALL_VOCABULARY.version.source };
+const extensionProfileSchema = closed({
+    profile: { type: 'string', pattern: EXTENSION_INSTALL_VOCABULARY.profile.source },
+    state: enumeration(EXTENSION_INSTALL_VOCABULARY.profileStates),
+    disableReasons: list({ type: 'integer', minimum: 1, maximum: EXTENSION_INSTALL_VOCABULARY.maxDisableReason },
+        { uniqueItems: true, maxItems: EXTENSION_INSTALL_VOCABULARY.maxDisableReasons }),
+    permissionsIncrease: boolean,
+    version: extensionVersion,
+    pendingVersion: extensionVersion,
+    lastUsedDaysAgo: nonNegativeInteger,
+}, ['profile', 'state', 'disableReasons', 'permissionsIncrease']);
 export const extensionInstallFactsSchema = closed({
     extensionId: { type: 'string', pattern: EXTENSION_INSTALL_VOCABULARY.extensionId.source },
     browsers: list(closed({
         browser: enumeration(EXTENSION_INSTALL_VOCABULARY.browsers),
         profileSource: enumeration(EXTENSION_INSTALL_VOCABULARY.profileSources),
-        ...Object.fromEntries(EXTENSION_INSTALL_VOCABULARY.counters.map((key) => [key, nonNegativeInteger])),
-        versions: list({ type: 'string', pattern: EXTENSION_INSTALL_VOCABULARY.version.source }, { uniqueItems: true }),
-        lastUsedDaysAgo: nonNegativeInteger,
-    }, ['browser', 'profileSource', ...EXTENSION_INSTALL_VOCABULARY.counters, 'versions'])),
+        readFailures: nonNegativeInteger,
+        profiles: list(extensionProfileSchema, { maxItems: EXTENSION_INSTALL_VOCABULARY.maxProfiles }),
+        // Whether the browser's process singleton shows it running (null: it could not be told), and since when.
+        running: { oneOf: [boolean, { type: 'null' }] },
+        runningSince: { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$' },
+    }, ['browser', 'profileSource', 'readFailures', 'profiles']), { maxItems: EXTENSION_INSTALL_VOCABULARY.browsers.length }),
 }, ['extensionId', 'browsers']);
 
 // The report-side shape of one negotiated diagnostic_snapshot_v1. The wire validator in the extension

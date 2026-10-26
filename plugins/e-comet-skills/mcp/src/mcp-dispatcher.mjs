@@ -12,6 +12,7 @@ import {
     SUPPORTED_MCP_PROTOCOL_VERSIONS,
 } from './config.mjs';
 import { createArtifactWriter } from './artifact-store.mjs';
+import { BRIDGE_CODES, bridgeCauseError } from './bridge-cause.mjs';
 import { prepareECometFeedback, submitECometCloudFeedback, submitECometFeedback } from './feedback-tools.mjs';
 import { FeedbackPreparationError, feedbackPreparationFailure, feedbackSubmissionFailure } from './feedback-errors.mjs';
 import { feedbackHostResultUnavailable, hasFeedbackCloudTransport, hasFeedbackHostAdapterMarker, isValidFeedbackCloudSubmitInput, isValidFeedbackHostAdapterInput } from './feedback-host-adapter.mjs';
@@ -57,26 +58,6 @@ import { collectDiagnosis } from './diagnose.mjs';
 import { createOperationDiagnostics, decorateOperationResult, operationFactsFromResult } from './operation-diagnostics.mjs';
 import { describeToolContract } from './tool-contracts.mjs';
 
-// Diagnose from a fresh locally-owned status only. Peer text and stale pre-wait snapshots
-// cannot establish a login failure or turn a local bind problem into a marketplace chore.
-const bridgeUnavailableError = (status) => {
-    const explanations = {
-        token_permission_denied: 'The local bridge cannot access its pairing file. Restore filesystem access for the agent process.',
-        token_unavailable: 'The local bridge pairing state is unavailable. Inspect local_bridge_status and report persistent failure to e-Comet.',
-        listen_failed: 'The local bridge could not bind its listener. Inspect local_bridge_status; opening a marketplace tab cannot repair the listener.',
-        authentication_failed: 'The local peer handshake failed authentication. Inspect local_bridge_status; this is not a marketplace login failure.',
-        protocol_mismatch: 'The local bridge processes use incompatible peer protocols. Restart the agent hosts to load the same plugin version.',
-        handshake_required: 'The local peer handshake did not complete. Inspect local_bridge_status and report persistent failure to e-Comet.',
-        connection_failed: 'The local bridge could not connect to its peer. Inspect local_bridge_status and report persistent failure to e-Comet.',
-    };
-    const reason = status?.peerRejection?.code ?? (status?.state === 'listen_failed' ? 'listen_failed' : undefined);
-    if (Object.hasOwn(explanations, reason)) return new ToolExecutionError(
-        `LOCAL_BRIDGE_${reason.toUpperCase()}`, `${explanations[reason]} Observed reason: ${reason}.`, 'local', false);
-    return new ToolExecutionError('EXTENSION_DISCONNECTED',
-        'The extension route did not become ready; the cause is not established. Inspect local_bridge_status before choosing a recovery action.',
-        'extension', true);
-};
-
 const OZON_AUTHORIZATION_ROUTE_CODES = new Set([
     'EXTENSION_DISCONNECTED',
     'BROWSER_JOB_AUTHORIZATION_TIMEOUT',
@@ -101,6 +82,21 @@ const resultCreationFailure = (cause) => {
         'storage', true, { cause });
     if (known) storageCreationEvidence.set(error, { operation: 'create_result', systemCode: code });
     return error;
+};
+
+// The e-Comet signer issues filters_by_query, so an extension refusing that job type (invalid_job/job_type) predates it. Without
+// this an outdated extension reads as our defect. Older WB jobs are known to every supported extension. The refusal details are
+// not passed on: DIAGNOSTICS.md reads invalid_job as our defect, which would contradict the update advice.
+const outdatedExtensionForJobType = (toolName, error) => {
+    const rejection = browserJobRejectionDetails(error)?.browserJobRejection;
+    if (toolName !== 'wb_filters_by_query' || rejection?.reason !== 'invalid_job' || rejection.diagnostic !== 'job_type') return error;
+    return new ToolExecutionError(
+        'EXTENSION_UPDATE_REQUIRED',
+        `The connected e-Comet extension does not support ${toolName}. Update the e-Comet extension at ${EXTENSION_UPDATE_URL}, then request a new authorization and retry.`,
+        'extension',
+        false,
+        { cause: error }
+    );
 };
 
 // Package capability floor, also enforced by scripts/extension_gate.py for publication.
@@ -133,6 +129,13 @@ const ozonPackageCapabilityFailure = (family, status) => {
 };
 
 export const classifyOzonAuthorizationFailure = (error, status, packageFamily) => {
+    // No broker answered, or the broker refused the authorization frame: nothing reached Ozon. The contract pins only
+    // the authorization stage, so the cause and its step ride in details.bridgeCode and the message.
+    if (error instanceof ToolExecutionError && BRIDGE_CODES.includes(error.code)) {
+        const rejected = new ToolExecutionError('OZON_AUTHORIZATION_REJECTED', error.message, 'authorization', false, { cause: error });
+        rejected.details = { bridgeCode: error.code };
+        return rejected;
+    }
     const familySpec = packageFamily === undefined ? undefined : OZON_PACKAGE_FAMILIES[packageFamily];
     if (packageFamily !== undefined) {
         const capabilityFailure = ozonPackageCapabilityFailure(packageFamily, status);
@@ -141,13 +144,6 @@ export const classifyOzonAuthorizationFailure = (error, status, packageFamily) =
     if (packageFamily === undefined && error instanceof ToolExecutionError && OZON_AUTHORIZATION_ROUTE_CODES.has(error.code)
         && status?.extensionConnected === true && status.ozonSellerPromotionReportSupported === false) {
         return ozonExtensionOutdatedError(status.extensionVersion);
-    }
-    if (error instanceof ToolExecutionError && error.code === 'EXTENSION_DISCONNECTED' && status?.extensionConnected !== true) {
-        const localFailure = bridgeUnavailableError(status);
-        // A locally observed pairing/listener failure precedes any Seller probe. Preserve
-        // its recovery within the existing Ozon authorization schema, not a Seller diagnosis.
-        if (localFailure.stage === 'local') return new ToolExecutionError(
-            'OZON_AUTHORIZATION_REJECTED', localFailure.message, 'authorization', false, { cause: error });
     }
     if (error instanceof ToolExecutionError && error.code === 'BROWSER_JOB_AUTHORIZATION_TIMEOUT') {
         // No Seller probe has occurred. A missing authorization response cannot
@@ -158,11 +154,12 @@ export const classifyOzonAuthorizationFailure = (error, status, packageFamily) =
             'authorization', false, { cause: error });
     }
     if (error instanceof ToolExecutionError && OZON_AUTHORIZATION_ROUTE_CODES.has(error.code)) {
+        // The browser connection closed under the authorization; a page cannot reopen it, status names the cause.
+        if (error.code === 'EXTENSION_DISCONNECTED') return ozonRouteUnavailableError('disconnected');
         if (familySpec !== undefined) {
             return new ToolExecutionError(
                 'OZON_ROUTE_NOT_READY',
-                (error.code === 'EXTENSION_DISCONNECTED' ? 'The e-Comet extension is not connected to the local bridge. '
-                    : 'The Ozon report authorization route did not complete; its cause is not established. ') +
+                'The Ozon report authorization route did not complete; its cause is not established. ' +
                     `Ensure e-Comet extension ${familySpec.minVersion ? `${familySpec.minVersion} or newer ` : ''}is enabled in the same browser profile, refresh an authenticated Ozon Seller page, then request a new authorization and retry.`,
                 'route', false
             );
@@ -170,8 +167,7 @@ export const classifyOzonAuthorizationFailure = (error, status, packageFamily) =
         if (status?.extensionConnected === true && status.ozonSellerPromotionReportSupported === false) {
             return ozonExtensionOutdatedError(status.extensionVersion);
         }
-        return ozonRouteUnavailableError(error.code === 'EXTENSION_DISCONNECTED' ? 'disconnected'
-            : error.code === 'BROWSER_JOB_AUTHORIZATION_TIMEOUT' ? 'timeout' : 'unavailable');
+        return ozonRouteUnavailableError(error.code === 'BROWSER_JOB_AUTHORIZATION_TIMEOUT' ? 'timeout' : 'unavailable');
     }
     let message = familySpec === undefined ? 'The Ozon promotion report authorization was rejected.'
         : `The ${familySpec.name} authorization was rejected.`;
@@ -195,13 +191,15 @@ export const classifyOzonAuthorizationFailure = (error, status, packageFamily) =
 
 export const createMcpMessageHandler = ({
     getBridgeStatus,
-    waitForExtensionReady,
-    // Non-blocking nudge that pulls the next bridge reconnect attempt forward. Applied once at the tools/call
-    // dispatch point to every tool declaring `needsBridge`, rather than from inside individual handlers: the
-    // wake-up inside waitForExtensionReady is reachable only by a fully-formed signed call, so the calls a
-    // degraded agent actually makes first — the status read and the discovery call without a triggerUrl —
-    // would otherwise each have to remember to nudge.
-    ensureBridgeConnected = () => undefined,
+    // Connects to a live broker, or waits for one about to appear, and otherwise names why none answers.
+    ensureBroker,
+    // Refreshes policy and, when selected, returns that pass's profile probe for the same diagnosis.
+    refreshBridgeFacts = async (_options = {}) => undefined,
+    // Called once the initialize result is sent: the bridge starts looking for a broker only after the handshake.
+    onInitialized = () => undefined,
+    // Non-blocking: starts a broker connect attempt unless one is in flight. Applied once at the tools/call dispatch
+    // point to every tool declaring `needsBridge`, so a call that returns early still starts it.
+    kick = () => undefined,
     requestBrowserJobAuthorization,
     requestExtensionDiagnosticSnapshot = undefined,
     artifactStorageTarget = ARTIFACT_STORAGE,
@@ -248,7 +246,7 @@ export const createMcpMessageHandler = ({
         return sendResult(id, decorated);
     };
     // Scope revocation occurs before the release route's acknowledgement can suspend, so callers can safely
-    // deliver a terminal result without letting a peer/extension round trip delay it.
+    // deliver a terminal result without letting an extension round trip delay it.
     const releaseAuthorizationInBackground = (lease, context) => {
         if (!lease) return;
         const reportFailure = (releaseError) => {
@@ -320,9 +318,8 @@ export const createMcpMessageHandler = ({
             releaseAuthorizationInBackground(currentLease, context);
         };
         try {
-            if (!(await waitForExtensionReady())) {
-                throw bridgeUnavailableError(getBridgeStatus());
-            }
+            const route = await ensureBroker();
+            if (!route.ok) throw bridgeCauseError(route);
             const token = extractBrowserJobToken(triggerUrl);
             authorizationLease = await requestBrowserJobAuthorization(token);
             if (
@@ -379,7 +376,8 @@ export const createMcpMessageHandler = ({
                     !result.ok
                 )
             );
-        } catch (error) {
+        } catch (caught) {
+            const error = outdatedExtensionForJobType(toolName, caught);
             releaseAuthorization('after job failure');
             let partialResult = {};
             if (writer) {
@@ -403,8 +401,8 @@ export const createMcpMessageHandler = ({
                             stage: 'execution',
                             retryable: false,
                         }),
-                        // Public-only evidence: shared toolFailure is also a strict
-                        // peer-wire serializer and must not gain these extra keys.
+                        // Public-only evidence: shared toolFailure is a strict serializer and
+                        // must not gain these extra keys.
                         ...(storageCreationEvidence.has(error) ? { details: storageCreationEvidence.get(error) } : {}),
                         ...(!storageCreationEvidence.has(error) && browserJobRejectionDetails(error)
                             ? { details: browserJobRejectionDetails(error) }
@@ -706,9 +704,8 @@ export const createMcpMessageHandler = ({
         const jobBudget = { bytes: 0 };
         try {
             requireStorageTarget(artifactStorageTarget, 'marketplace-artifacts');
-            if (!(await waitForExtensionReady())) {
-                throw bridgeUnavailableError(getBridgeStatus());
-            }
+            const route = await ensureBroker();
+            if (!route.ok) throw bridgeCauseError(route);
             authorizationLease = await requestBrowserJobAuthorization(extractBrowserJobToken(triggerUrl));
             const authorization = authorizationLease?.authorization;
             if (
@@ -857,10 +854,8 @@ export const createMcpMessageHandler = ({
             // авторизация на заведомо неисполнимую операцию.
             const outdatedExtension = ozonExtensionOutdated(currentOzonStatus());
             if (outdatedExtension) throw outdatedExtension;
-            if (!(await waitForExtensionReady())) {
-                throw classifyOzonAuthorizationFailure(
-                    new ToolExecutionError('EXTENSION_DISCONNECTED', 'disconnected', 'extension'), currentOzonStatus());
-            }
+            const route = await ensureBroker();
+            if (!route.ok) throw classifyOzonAuthorizationFailure(bridgeCauseError(route), currentOzonStatus());
             // WHY: readiness can attach an older extension after the first snapshot; do not spend its signed authorization.
             const readyExtensionOutdated = ozonExtensionOutdated(currentOzonStatus());
             if (readyExtensionOutdated) throw readyExtensionOutdated;
@@ -920,9 +915,8 @@ export const createMcpMessageHandler = ({
         const unavailableBeforeWait = ozonPackageCapabilityFailure(family, currentOzonStatus());
         beforeWait();
         if (unavailableBeforeWait) throw unavailableBeforeWait;
-        if (!(await waitForExtensionReady())) {
-            throw classifyOzonAuthorizationFailure(new ToolExecutionError('EXTENSION_DISCONNECTED', 'disconnected', 'extension'), currentOzonStatus(), family);
-        }
+        const route = await ensureBroker();
+        if (!route.ok) throw classifyOzonAuthorizationFailure(bridgeCauseError(route), currentOzonStatus(), family);
         const unavailableAfterWait = ozonPackageCapabilityFailure(family, currentOzonStatus());
         if (unavailableAfterWait) throw unavailableAfterWait;
         let lease;
@@ -1072,7 +1066,7 @@ export const createMcpMessageHandler = ({
     // `needsBridge` declares which operational tools depend on the bridge, so the wake-up is applied once at
     // the dispatch point below instead of being remembered inside each handler. A tool added without the flag
     // never nudges; a tool added with it cannot forget to. `local_bridge_status` is deliberately false because
-    // its read-only contract forbids a diagnostic call from pulling forward peer-token creation.
+    // its read-only contract forbids a diagnostic call from starting a connect attempt.
     // `wb_product_images` is also false: it is a public image-CDN lookup that never uses the bridge.
     const toolHandlers = new Map([
         [
@@ -1087,10 +1081,16 @@ export const createMcpMessageHandler = ({
                     sendResult(id, textResult(toolFailure(new ToolExecutionError('INVALID_TOOL_ARGUMENTS', 'Invalid e_comet_diagnose arguments.', 'arguments', false)), true));
                     return;
                 }
+                // A diagnosis must never fail because a refresh did.
+                // Profile reads obey the same explicit probe contract as the collector; passive diagnoses keep stored facts.
+                const withProbe = args.scope === 'installation' && args.mode === 'safe_probes'
+                    && args.probes?.includes('extension_install') === true;
+                const extensionInstall = await Promise.resolve().then(() => refreshBridgeFacts({ withProbe })).catch(() => undefined);
                 const diagnosis = await collectDiagnosis({ ...args, operationDiagnostics, getBridgeStatus: currentBridgeStatus,
                     requestExtensionDiagnosticSnapshot, storageLayout, now, clientName: clientInfo?.name,
                     randomUUID: createUuid, ...(collectInstallation ? { collectInstallation } : {}),
-                    ...(probeExtensionInstall ? { probeExtensionInstall } : {}),
+                    ...(extensionInstall ? { probeExtensionInstall: async () => extensionInstall }
+                        : probeExtensionInstall ? { probeExtensionInstall } : {}),
                     ...(collectHookPermissions ? { collectHookPermissions } : {}) });
                 sendResult(id, textResult(diagnosis));
             } },
@@ -1121,6 +1121,10 @@ export const createMcpMessageHandler = ({
         [
             'wb_check_by_query',
             { needsBridge: true, run: (id, args) => handleBrowserJob(id, 'wb_check_by_query', 'check_by_query', args) },
+        ],
+        [
+            'wb_filters_by_query',
+            { needsBridge: true, run: (id, args) => handleBrowserJob(id, 'wb_filters_by_query', 'filters_by_query', args) },
         ],
         [
             'wb_recommendations_by_product',
@@ -1165,6 +1169,7 @@ export const createMcpMessageHandler = ({
                 serverInfo: { name: 'e-comet-local-bridge', version: BRIDGE_VERSION },
                 instructions: serverInstructions,
             });
+            onInitialized();
             return;
         }
         if (method === 'ping') {
@@ -1185,10 +1190,9 @@ export const createMcpMessageHandler = ({
             sendError(id, -32602, `Unknown tool: ${params?.name}`);
             return;
         }
-        // Before the handler runs, so a degraded agent's very first call starts the reconnect rather than
-        // waiting out the retry interval — including the signed-call forms that return early, before they ever
-        // reach waitForExtensionReady.
-        if (tool.needsBridge) ensureBridgeConnected();
+        // Before the handler runs, so the first call starts a connect attempt rather than waiting for the next
+        // re-list — including the signed-call forms that return early, before they ever reach ensureBroker.
+        if (tool.needsBridge) kick();
         await tool.run(id, params?.arguments ?? {});
     };
 };

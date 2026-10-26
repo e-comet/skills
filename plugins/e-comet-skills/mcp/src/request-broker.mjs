@@ -29,7 +29,7 @@ const ozonPromotionError = (code, message) => {
 };
 const normalizeOzonPromotionError = (error, fallbackCode, fallbackMessage) =>
     // The consumer's own writer can fail before opening a stream. Preserve this local
-    // diagnosis without adding storage errors to the extension/peer terminal vocabulary.
+    // diagnosis without adding storage errors to the extension terminal vocabulary.
     error instanceof StorageUnavailableError || (error instanceof ToolExecutionError &&
     OZON_PROMOTION_TERMINAL_CODE_STAGES[error.code] === error.stage &&
     error.retryable === false)
@@ -77,10 +77,6 @@ export class RequestBroker {
         createRequestId = randomUUID,
         defaultTimeout = REQUEST_TIMEOUT_MS,
         authorizationReleaseTimeout = AUTHORIZATION_RELEASE_TIMEOUT_MS,
-        // Сколько посредников стоит между нами и расширением на текущем маршруте.
-        // Каждый из них ждёт на один запас дольше нижележащего, поэтому наш дедлайн
-        // должен быть позже всех. Бюджет самого запроса при этом не меняется.
-        routeHopCount = () => 1,
         authorizationScopeMaxMs = AUTHORIZATION_SCOPE_MAX_MS,
         sellerAuthorizationScopeMaxMs = SELLER_AUTHORIZATION_SCOPE_MAX_MS,
         maxActiveAuthorizationScopes = MAX_ACTIVE_AUTHORIZATION_SCOPES,
@@ -95,7 +91,6 @@ export class RequestBroker {
         this.createRequestId = createRequestId;
         this.defaultTimeout = defaultTimeout;
         this.authorizationReleaseTimeout = authorizationReleaseTimeout;
-        this.routeHopCount = routeHopCount;
         this.onUnsettled = onUnsettled;
         this.authorizationScopeMaxMs = authorizationScopeMaxMs;
         this.sellerAuthorizationScopeMaxMs = sellerAuthorizationScopeMaxMs;
@@ -620,7 +615,7 @@ export class RequestBroker {
             // таймер сработал последним и типизированный отказ снизу успел доехать.
             return this.#createPending(
                 this.pendingRequests,
-                timeout + REQUEST_TIMEOUT_GRACE_MS * Math.max(1, this.routeHopCount()),
+                timeout + REQUEST_TIMEOUT_GRACE_MS,
                 () =>
                     new ToolExecutionError(
                         'WB_FETCH_TIMEOUT',
@@ -656,7 +651,7 @@ export class RequestBroker {
         }
         return this.#createPending(
             this.pendingAuthorizations,
-            timeout + REQUEST_TIMEOUT_GRACE_MS * Math.max(1, this.routeHopCount()),
+            timeout + REQUEST_TIMEOUT_GRACE_MS,
             () =>
                 new ToolExecutionError(
                     'BROWSER_JOB_AUTHORIZATION_TIMEOUT',
@@ -754,7 +749,7 @@ export class RequestBroker {
         }
         return this.#createPending(
             this.pendingAuthorizationReleases,
-            timeout + REQUEST_TIMEOUT_GRACE_MS * Math.max(1, this.routeHopCount()),
+            timeout + REQUEST_TIMEOUT_GRACE_MS,
             () =>
                 new ToolExecutionError(
                     'BROWSER_JOB_AUTHORIZATION_RELEASE_TIMEOUT',
@@ -830,7 +825,7 @@ export class RequestBroker {
                         true
                     )
                 );
-            }, timeout + REQUEST_TIMEOUT_GRACE_MS * Math.max(1, this.routeHopCount()));
+            }, timeout + REQUEST_TIMEOUT_GRACE_MS);
             const pending = {
                 resolve,
                 reject,
@@ -954,7 +949,7 @@ export class RequestBroker {
                 Math.min(
                     deadlineRemaining,
                     OZON_PROMOTION_OPERATION_MAX_MS,
-                    timeout + REQUEST_TIMEOUT_GRACE_MS * Math.max(1, this.routeHopCount())
+                    timeout + REQUEST_TIMEOUT_GRACE_MS
                 )
             );
             currentPending.timer.unref?.();

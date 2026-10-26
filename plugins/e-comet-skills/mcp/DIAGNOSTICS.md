@@ -1,8 +1,8 @@
 # `local_bridge_status` technical reference
 
-`local_bridge_status` is a passive snapshot. It does not start a listener, create or repair pairing data, schedule a reconnect, probe storage, open a browser tab, obtain authorization, or make a marketplace request. `ok=true` means only that the status response was produced.
+`local_bridge_status` is a passive snapshot. It does not connect to a broker, repair the browser-host registration, wait, probe storage, open a browser tab, obtain authorization, or make a marketplace request. `ok=true` means only that the status response was produced.
 
-e_comet_diagnose with runtime scope, safe-probes mode, and the extension-snapshot probe uses the negotiated diagnostic_snapshot_v1 route. Its facts contain protocol version, observation time, extension version, capabilities, activation state, storage-read state, and the WB, WB Seller, and Ozon port-registration states. Activation is present, absent, or unknown; storage is passed, failed, or unknown; each port is true, false, or unknown. A port value proves registration rather than operational readiness. The probe performs one activation-storage read and observes the extension's in-memory port registry. It does not open, reload, ping, switch, dispatch, cancel, authorize, or call a marketplace. An older extension or primary reports unsupported.
+e_comet_diagnose with runtime scope, safe-probes mode, and the extension-snapshot probe uses the negotiated diagnostic_snapshot_v1 route. Its facts contain protocol version, observation time, extension version, capabilities, activation state, storage-read state, and the WB, WB Seller, and Ozon port-registration states. Activation is present, absent, or unknown; storage is passed, failed, or unknown; each port is true, false, or unknown. A port value proves registration rather than operational readiness. The probe performs one activation-storage read and observes the extension's in-memory port registry. It does not open, reload, ping, switch, dispatch, cancel, authorize, or call a marketplace. An older extension reports unsupported.
 
 Negotiated browser-job refusals may include a versioned, closed browser-job rejection record in public error details. The optional diagnostic is present only for the invalid-job reason. This record never contains tokens, claims, user identifiers, paths, or arbitrary error text. Its absence preserves the legacy refusal and does not imply an unknown reason.
 
@@ -25,7 +25,7 @@ does not produce this code.
 
 ## Missing authorization handoff
 
-A signed local tool answers `code:"BROWSER_JOB_HANDOFF_REQUIRED"` (`stage:"handoff"`, `retryable:true`) when it was called without `triggerUrl`; the Ozon tools answer `OZON_AUTHORIZATION_REJECTED` with the message "The trusted browser-job hook did not provide Ozon authorization." for the same condition. Model-authored arguments must omit `triggerUrl`, so this means the host `PreToolUse` hook did not run or did not rewrite the input: the plugin hooks are not trusted, are disabled, changed after a plugin update, or the host does not run plugin hooks in this task. It is not a marketplace, extension or e-Comet account failure, and `browser_job` was already called once. Do not call `browser_job` or the local tool again until the hook condition is resolved: each repeat spends one signed authorization and fails the same way. On an observed Codex host, run installation `hook_permissions` (`safe_probes`) and follow its `disabled`, `review_required` and `not_checked` guidance below; the user action is Settings → Plugins → Personal → e-Comet MCP Tools → Hooks. On Claude Code, `/hooks` lists the configured hooks. On Cowork there is no hook-trust control: verify that the plugin is installed and enabled in Customize → Plugins → Yours and start a new task. The receipt is `outcome:"failed"`, `retryDisposition:"unknown"`.
+A signed local tool answers `code:"BROWSER_JOB_HANDOFF_REQUIRED"` (`stage:"handoff"`, `retryable:true`) when it was called without `triggerUrl`; the Ozon tools answer `OZON_AUTHORIZATION_REJECTED` with the message "The trusted browser-job hook did not provide Ozon authorization." for the same condition. Model-authored arguments must omit `triggerUrl`, so this means the host `PreToolUse` hook did not run or did not rewrite the input: the plugin hooks are not trusted, are disabled, changed after a plugin update, or the host does not run plugin hooks in this task. It is not a marketplace, extension or e-Comet account failure, and `browser_job` was already called once. Do not call `browser_job` or the local tool again until the hook condition is resolved: each repeat spends one signed authorization and fails the same way. On an observed Codex host, run installation `hook_permissions` (`safe_probes`) and follow its `disabled`, `review_required` and `not_checked` guidance below; the user action is Settings → Plugins → Personal → e-Comet MCP Tools → Hooks. On Claude Code, `/hooks` lists the configured hooks. On Cowork there is no hook-trust control. A Claude conversation runs plugin hooks only after its sandbox starts, and a new task starts without it: when the local tools are named `mcp__remote-devices__...` and no shell command has run in the conversation, run one no-op shell command (`true`), then call `browser_job` once and the local tool once. Otherwise verify that the plugin is installed and enabled in Customize → Plugins → Yours. The receipt is `outcome:"failed"`, `retryDisposition:"unknown"`.
 
 ## Seller cabinet codes
 
@@ -42,18 +42,47 @@ authorizations without changing the outcome.
 | Field | Producer and exact meaning | Inference boundary / next discriminating check |
 | --- | --- | --- |
 | `ok` | MCP dispatcher; response construction succeeded | It is not product health. Inspect the typed checks and the selected operation. |
-| `extensionConnected`, `browserJobSupported` | Effective direct or authenticated-peer route state | They do not prove login, hook execution, or a particular operation. Call the selected typed tool. |
-| `bridgeRole`, `bridgeTransitioning`, `listenerState` | Bridge runtime; role is `primary`, `secondary`, or `disconnected`; listener event is `pending`, `listening`, `address_in_use`, or `failed` | `secondary` with `address_in_use` is normal. `listenerState` is a last event, not current port ownership. |
-| `state` | Ordered compatibility summary: `initializing`, `listen_failed`, `waiting_for_extension`, `extension_connected_no_wb_tab`, `extension_contended`, `extension_context_unknown`, `peer_context_unknown`, `ready`, `extension_update_required`, `peer_reconnecting`, or `peer_unavailable` | It is neither a complete fault list nor permission to run/retry a business operation. |
-| `bridgeVersion`, `bridgeGeneration`, `controlProtocolVersion`, `extensionProtocolVersion`, `instanceId`, `websocket` | Local build/control metadata and configured loopback endpoint | These fields do not prove which build owns the port or that a route works. |
-| `extension.state`, `extension.route`, `extension.version`, `extension.lastConnectedAt`, `extension.lastDisconnectedAt` | Derived effective extension observation; states are `never_connected`, `connected`, `disconnected`; routes are `direct`, `peer`, `none` | Retained version/time after disconnect is valid. A version is not an integrity or end-to-end check. |
+| `extensionConnected`, `browserJobSupported` | Whether this process holds an extension session through a broker, and whether that extension announced signed browser jobs | They do not prove login, hook execution, or a particular operation. Call the selected typed tool. |
+| `state` | Ordered compatibility summary: `initializing` (the first broker connect attempt is in flight), `waiting_for_extension`, `extension_connected_no_wb_tab`, `extension_context_unknown`, `ready`, or `extension_update_required` | It is neither a complete fault list nor permission to run/retry a business operation. |
+| `bridgeVersion`, `extensionProtocolVersion`, `instanceId` | Local build metadata and the identifier of this process | These fields do not prove that a route works. |
+| `extension.state`, `extension.route`, `extension.version`, `extension.lastConnectedAt`, `extension.lastDisconnectedAt` | Derived effective extension observation; states are `never_connected`, `connected`, `disconnected`; route is `direct` while this process holds a broker session, otherwise `none` | Retained version/time after disconnect is valid. A version is not an integrity or end-to-end check. |
 | `extension.ozonSellerPromotionReportSupported`, `extension.ozonSellerPromotionReportsSupported`, `extension.ozonSellerAnalyticsReportSupported`, `extension.ozonSearchPositionsSupported`, `ozonSellerPromotionReportSupported`, `ozonSellerPromotionReportsSupported`, `ozonSellerAnalyticsReportSupported`, `ozonSearchPositionsSupported` | Capability reported by a connected extension; the top-level fields are legacy copies | Absence means unobserved, not `false`; the typed Ozon tool remains authoritative. |
 | `extensionLastConnectedAtMs`, `extensionLastDisconnectedAtMs`, `extensionVersion` | Compatibility copies of effective extension observations | Copies are not independent evidence. |
-| `extensionTakeovers.count`, `extensionTakeovers.lastAtMs`, `extensionTakeovers.saturated` | Recent takeover-window count, retained last timestamp, and lower-bound marker | `lastAtMs` may lie outside the count window. It does not identify a browser profile. |
-| `peer.bridgeVersion`, `peer.browserContextPropagationSupported`, `peer.diagnosticForwardingSupported` | Metadata from an authenticated primary. The diagnostic-forwarding field is true when that primary advertised diagnostic_snapshot_forwarding_v1; false includes a compatible legacy or other primary that did not advertise it. | A missing peer is normal for a primary. The diagnostic-forwarding field alone says nothing about extension diagnostic-snapshot capability and does not prove that a snapshot request will succeed. |
-| `peerRejection.code`, `peerRejection.since`, `peerRejection.retryAt` | Current continuous rejection streak and retry schedule | Codes are `authentication_failed`, `protocol_mismatch`, `handshake_required`, `connection_failed`, `listen_failed`, `token_permission_denied`, `token_unavailable`. The token code is not an e-Comet login error and combines multiple pairing causes. |
 | `browserContext.state`, `browserContext.wbTabConnected`, `browserContext.sellerTabConnected`, `browserContext.changedAt` | Extension-reported registered WB and WB Seller ports; state is `known` or `unknown` | Registered ports are not authenticated sessions. `changedAt` is not a freshness check and says nothing about Ozon. |
 | `storage.results`, `storage.marketplaceArtifacts`, `storage.feedbackArtifacts` | Resolved configuration. Each target has `state`: `ready` with `backend` `plugin_data`, `application_data`, or `override`, or `unavailable` with `reason` from the closed configuration vocabulary | `ready` does not prove a write. Status performs no write probe. Reasons are `plugin_data_missing`, `plugin_data_invalid`, `plugin_data_conflict`, `application_data_invalid`, `override_invalid`. |
+
+## Cause code and broker fields
+
+`code` is the field to read first. It is one closed value that the bridge sets from what it observed; the fields below
+are the evidence behind it and none of them is a recovery instruction. The bridge reaches the extension only through
+the broker that the browser starts; status reports what this process last observed and never connects, repairs or
+waits to produce it.
+
+| Field | Producer and exact meaning | Inference boundary / next discriminating check |
+| --- | --- | --- |
+| `code` | Cause classification set by the bridge. `connected`: an extension route is observed. `connecting`: the bridge is still starting, or a tool call is waiting up to 30 s for a broker about to appear. The other values are the causes from the table below; `BRIDGE_NO_BROWSER` is the one used when nothing more specific was observed. A route lost mid-job is the failing tool call's EXTENSION_DISCONNECTED, never a status code: status then names the cause found since. | It classifies the bridge, not a marketplace, a login or a particular operation. A value that is not listed is kept as data and given no invented meaning. |
+| `registration.state`, `registration.version`, `registration.runtime`, `registration.manifestWrittenAt`, `registration.error`, `registration.error.name`, `registration.error.code` | The last browser-host registration check made by this process; `registration` is null until one ran. State is `registered` (something was written), `current` (already up to date), `disabled` (this run registers nothing), `failed` (a step failed) or `denied` (macOS refused a browser folder). Any other refused browser folder makes it `failed` only when no folder holds the manifest; otherwise it stays `registered` or `current` with the refusal in `registration.error`. Runtime is `path_node` (Node found on PATH) or `host_executable` (the host application's own executable), null when none was resolved. `registration.manifestWrittenAt` is the ISO time of the newest host manifest, null when unknown. `registration.error` names the failed step and its system code, null without a failure. | Registration says where the browser would start the broker from, not that a browser did. The error carries a step name and a code, never a message or a path. |
+| `userLevelHosts` | One item per browser: the browser; `allowed`, whether its NativeMessagingUserLevelHosts policy allows hosts registered per user (true, false, or null when no policy is set); and `hostBlocked`, whether its NativeMessagingBlocklist and NativeMessagingAllowlist policies block the e-Comet host io.ecomet.bridge (true when the block list holds `*` or the host and the allow list does not name it, false when the lists do not block it, null when no block list is set). Only mandatory policies count, as in the browser; recommended ones are ignored. Empty when no policy was read. Read at start, on a tool call that finds no broker and in a diagnosis, not in the background, so between them it can be out of date. | A false `allowed` or a true `hostBlocked` is a policy somebody set, not a fault of the installation. |
+| `extensionInstall` | The facts the extension_install probe returns, in the shape documented for e_comet_diagnose; null until a probe ran. | Profile metadata only. It never proves that the extension is connected. |
+| `brokers` | Live broker entries, newest first. Each item has the process id, the browser the extension reported, the extension and broker versions, the ISO start time, and whether this process is connected to it. Empty when none runs. | An entry never carries the nonce or the endpoint. A listed broker does not prove that a job will succeed. |
+| `lastFailureRecord`, `lastFailureRecord.name`, `lastFailureRecord.code`, `lastFailureRecord.at` | The newest broker failure record that is newer than every live entry, the newest manifest write and this process's last good session; older records are ignored and deleted. Null when there is none. | A record names an error and its code, never a message or a path. It counts toward a cause only while the probe shows an install enabled on a native-capable extension build. |
+| `clientProtocolVersion`, `brokerProtocolVersion`, `brokerVersion` | The client protocol version this plugin speaks, the one the connected broker reported, and that broker's plugin version. The last two are null without a broker session. | Different versions are a fact to report, not a reason to retry. |
+
+| Cause | Observed condition | Owner and supported next step |
+| --- | --- | --- |
+| `BRIDGE_NO_BROWSER` | No live broker entry and none of the more specific causes below was observed, including no install observed or an unreadable profile. | User: open the browser that has the e-Comet extension (the named browser when the probe saw one; install it from the Chrome Web Store if it is missing), click the e-Comet icon, accept the permission the browser asks for, then repeat the request; if it still fails, apply the extension update or restart the browser, then report it. |
+| `BRIDGE_HOST_NOT_STARTED` | No live broker entry, and the browser that would be chosen has the extension enabled on a native-capable build, a policy that admits the host, and a process singleton showing it running for at least 30 s: its extension had the time to start the connector and did not. | User: click the e-Comet icon in the profile where e-Comet is installed (open that profile if it is closed), then repeat the request; if it still fails, report it and also write to e-Comet support in the chat on app.e-comet.io from that profile, which can attach the extension's log. |
+| `BRIDGE_PERMISSION_REQUIRED` | The browser keeps the native-capable extension disabled until the user accepts its new permission. | User: accept the permission in the named browser, then repeat the request. |
+| `BRIDGE_EXTENSION_OUTDATED` | No enabled install runs a native-capable extension build. | User: apply the extension update offered on app.e-comet.io or restart the browser, accept the new permission, repeat; report if the version stays old. |
+| `BRIDGE_EXTENSION_DISABLED` | At least one install was observed and every observed install is disabled for a reason other than the permission. | User: turn e-Comet on in the extensions page of the browser. |
+| `BRIDGE_USER_HOSTS_DISABLED` | The NativeMessagingUserLevelHosts policy is false for every browser that would otherwise be chosen, and none of them blocks the host. | Whoever manages the computer: allow hosts registered per user. |
+| `BRIDGE_HOST_BLOCKED` | No browser that would otherwise be chosen admits the host, and in at least one of them NativeMessagingBlocklist holds `*` or io.ecomet.bridge while NativeMessagingAllowlist does not name it. The browser then refuses to start the connector ("Access to the native messaging host was disabled by the system administrator."). | Whoever manages the computer: allow io.ecomet.bridge in NativeMessagingAllowlist. Not a fault of e-Comet or the user. |
+| `BRIDGE_BROKER_UNRESPONSIVE` | A live broker entry exists, and its endpoint did not accept within 2 s, failed with an error that does not prove the entry stale, or accepted and then closed or sent no hello reply within 5 s. | User: restart the browser; report if it repeats. |
+| `BRIDGE_BROKER_FAILED` | The registration is `failed`, or, with an install enabled on a native-capable extension build, a broker failure record is newer than every live entry, the newest manifest write and this process's last good session. | Report it to e-Comet without naming a cause: the registration error or the failure record carries the step and code. Neither alone names the owner: a broker failure record keeps the system code, such as ENOSPC or EPERM, when the computer refused a startup step. |
+| `BRIDGE_FRAME_TOO_LARGE` | The broker refused a message for the extension, or the client refused an oversize one before writing; the tool error's message names the refusal code in parentheses (FRAME_TOO_LARGE, FRAME_MALFORMED, AUTHORIZATION_NOT_OWNED, ID_TOO_LONG, SESSION_CONTROL_FORBIDDEN). | Our defect: report it. |
+| `BRIDGE_MACOS_FOLDER_ACCESS` | macOS denied the manifest write into a browser folder. | User: in System Settings under Privacy and Security, Files and Folders, allow the browser for the application that runs the agent, then repeat. |
+| `BRIDGE_UNAVAILABLE_IN_WSL` | The MCP process runs inside WSL. | User: run the agent on Windows; in Codex Desktop turn off running the agent in WSL. |
+| `BRIDGE_UNSUPPORTED_PLATFORM` | The MCP process runs on an operating system that registration does not cover: neither Windows, macOS nor Linux. | User: use the agent on Windows, macOS or Linux. |
 
 ## Typed passive diagnostics
 
@@ -64,8 +93,6 @@ Every check has `check`, `state`, `observedAt`, `source`, and `executionPlane`. 
 | `diagnostics.snapshot` | MCP status observation time | It dates this response, not every nested source observation. |
 | `diagnostics.runtime.facts.nodeVersion`, `diagnostics.runtime.facts.platform`, `diagnostics.runtime.facts.arch`, `diagnostics.runtime.facts.bridgeVersion`, `diagnostics.runtime.facts.mcpProtocolVersion` | Current Node process and negotiated MCP metadata | It does not identify a hook process or host UI. |
 | `diagnostics.client.facts.name`, `diagnostics.client.facts.version`, `diagnostics.client.facts.provenance`, `diagnostics.client.facts.hostRuntimeVersion` | Bounded strings retained from MCP initialize; provenance is `client_reported`. The host runtime version is present only under the native DeepSeek adapter: the DeepSeek Harness runtime version it resolved its declared peers against, passed through the local module's environment; never the Desktop product version | It is not a trusted host-session identity or proof of hook support. Malformed/oversized input is omitted. |
-| `diagnostics.listener.facts.operation`, `diagnostics.listener.facts.listenerState`, `diagnostics.listener.facts.systemCode` | Existing bind observation; operation is `bind_listener`. An observed code is allowlisted as `EACCES`, `EPERM`, `EADDRINUSE`, `EADDRNOTAVAIL`, `EAFNOSUPPORT`, or `EINVAL` | Causes are `address_in_use`, `listen_failed`, or `unknown`. A healthy secondary makes `address_in_use` passed. A system code does not identify the OS policy that produced it. |
-| `diagnostics.pairingSource.cause` | Latest source-owned safe classification. `permission_denied` means the token source returned an access-denied system result. On non-Windows systems, `insecure_permissions` can mean unsafe mode or ownership, an unexpected directory or file type, a symlink, or replacement of the checked directory during the read. | Causes are `permission_denied`, `insecure_permissions`, `missing`, `corrupt`, `unsupported`, or `io_error`. These classifications do not identify the operating-system policy, affected object, or safe repair. Do not infer a grant/restriction action or a successful repair from them. No path, token, owner, environment value, or raw exception is exposed. |
 | `diagnostics.routeFreshness.facts.lastObservedAt` | Time of an actually observed route response, when a producer supplies it | No current producer supplies a freshness time, so the check is `unknown` with next check `observe_extension_heartbeat`; `browserContext.changedAt` is never substituted. |
 | `diagnostics.storage.facts.scope`, `diagnostics.storage.facts.targets` | Sanitized copy of resolved targets; scope is `configuration` | It does not establish writability. A future explicit storage I/O fact is the discriminating check. |
 
@@ -76,7 +103,7 @@ Unknown future fields and enum values must be preserved as data by consumers but
 `node mcp/src/doctor.mjs --json` runs outside the MCP lifecycle and returns
 `{"schemaVersion":1,"checks":DiagnosticCheck[],"limitations":DoctorLimitations}`. Collection exit status is 0 even
 when individual checks fail; status 1 means the doctor could not form valid output. It reads metadata and resolves
-configuration but performs no write, listener, pairing, retention, extension, authorization, or business operation.
+configuration but performs no write, broker connection, registration, retention, extension, authorization, or business operation.
 
 Doctor checks use the shared check fields and state/cause vocabularies above. `runtime` describes the executing Node
 process. `storage` reports the same configuration-only target facts described above. `package_layout.facts.layout` is
@@ -130,12 +157,11 @@ path still identifies the created file; a collision or replacement is preserved.
 `identity_unavailable`; the unverified path is preserved. Existing result, workbook, and feedback retention passes do
 not own the diagnostic filename grammar, so they do not promise to remove that rare tiny residual file. The runtime
 `extension_snapshot` probe requests one capability-negotiated, read-only extension snapshot. It returns `unsupported`
-without sending a diagnostic frame when the connected extension or authenticated primary did not advertise the route.
+without sending a diagnostic frame when the connected extension did not advertise the route.
 It makes no marketplace request. `unsupported` says nothing about installation or activation, and it does not
-identify which side lacks the route, the extension build or the primary process; it does not support prescribing an
-extension update. The next discriminating check is the installation `extension_install` probe; activation stays
+support prescribing an extension update. The next discriminating check is the installation `extension_install` probe; activation stays
 unobserved on this route. `not_checked` with cause `unavailable` (source `device_process`) means no connected extension
-was reachable, directly or through the primary, so nothing was asked: the observation is a missing connection, never a
+was reachable, so nothing was asked: the observation is a missing connection, never a
 missing capability, and the bridge status names the next step. `unknown` with cause `unavailable` (source
 `device_process`) means the device stopped waiting at its own deadline before an answer arrived, or the request was
 abandoned by a bridge shutdown; it says nothing about the extension. `failed` with cause `corrupt` means a connected extension
@@ -169,39 +195,60 @@ Claude Code exposes its read-only `/hooks`
 browser, but this probe establishes no programmatic Cowork trust endpoint.
 
 The installation `extension_install` probe reads Chromium profile metadata with plain file reads and never spawns a
-process. It checks the user-data roots of Google Chrome, Microsoft Edge, Yandex Browser and Opera for the current
-platform; other browsers are not checked, and their absence from `facts` means unchecked, not uninstalled. Per
+process. It checks the user-data roots of Google Chrome, Microsoft Edge, Brave, Yandex Browser and Opera for the
+current platform; other browsers are not checked, and their absence from `facts` means unchecked, not uninstalled. Per
 browser it lists profiles from `Local State` (`profile.info_cache`), falling back to `Default` alone with
 `profileSource:"default_only"`, which means partial coverage. Opera also checks its root profile when a `Default`
-directory is absent. A profile counts as installed when a matching extension manifest is found under
-`Extensions/<id>/<version>/manifest.json`. Its state follows a closed table read from `Secure Preferences`
-(or `Preferences`): `disable_reasons` empty → enabled; `disable_reasons` a non-empty integer list → disabled; the
-legacy `state:1` without `disable_reasons` → enabled; anything else, including a missing record, → unknown. A file
-that reads fine can still leave the state unknown; that is neither a read failure nor "disabled".
+directory is absent. A profile is listed in `profiles` when its `Secure Preferences` (or `Preferences`) holds the
+extension's record or an installed copy is found under `Extensions/<id>/<version>_<n>`; a profile with neither is not
+listed. A profile is named by its directory name only (`Default`, `Profile N`). A directory with any other name is read
+like the rest but listed as `other` when it holds the extension, so its name never reaches a report; one without the
+extension adds nothing and is no read failure. A browser lists at most 32 profiles; any further profile holding the
+extension stays unseen.
+
+A listed profile's `state` follows a closed table over its record: no `disable_reasons` or an empty one, and no `state`
+(or the legacy `state:1`) → `enabled`; a non-empty `disable_reasons` → `disabled`; anything else, including a missing or
+unrecognized record, → `unknown`. `disable_reasons` is read as the list of reason values current Chromium writes, kept as they are, and as an integer
+bitmask older builds wrote, split into its set bits; `disableReasons` holds the reasons: `1` is the user's own action
+and `2` the permissions increase.
+`permissionsIncrease:true` means bit `2` is among them: an update asked for a new permission and the browser keeps the
+extension disabled until the user accepts it. It does not say that is the only reason; read `disableReasons`. A file
+that reads fine can still leave the state `unknown`; that is neither a read failure nor "disabled".
+
+`version` is the running version from the record's stored manifest. A record without a stored manifest takes
+the version from its installed copy's folder name. A command-line build was observed to store neither, so it reports
+no version. `pendingVersion` is an update the
+browser has fetched and not yet applied. Either is omitted when the files give no version in the safe grammar.
 
 The fact shape is
-`extension_install.facts.{extensionId,browsers[].{browser,profileSource,profilesChecked,installedProfiles,enabledProfiles,unknownProfiles,readFailures,versions[],lastUsedDaysAgo?}}`.
-`lastUsedDaysAgo` is the whole number of days since the newest modification time of the browser's `Local State` and
-the checked profiles' preference files, obtained by `stat` without reading them. It measures file age, not browser
-use: Chromium rewrites those files while the browser runs, so a recent value usually means a recent run, but other
-software can touch the files too, and an old value proves only that the successfully stat'ed checked files have not
-changed. It is omitted when none of those files could be stat'ed. It never identifies the browser the user is working
-in right now: order candidates by
-it and mention a long-unchanged browser, but leave the choice to the user. When the extension is connected,
-`extension.version` in `local_bridge_status` is the connected copy's version; a checked browser whose `versions[]`
-contains it is a likely candidate, not the proven source: unchecked browsers, unchecked profiles and unpacked copies
-can hold the same version.
-`browser` is `chrome`, `edge`, `yandex`, or `opera`; `versions` holds distinct versions read from manifests in the
-safe version grammar, never directory names. Profile names, paths, account e-mails and every other preference field
-never enter the facts. States: `passed` when every found root was read; `unknown` with cause `permission_denied` or
-`io_error` when a read failed (partial facts are retained); `not_checked` with cause `directory_absent` when no known
-root exists. Inference boundaries: `installedProfiles:0` everywhere supports absence only in checked browsers and
-profiles when metadata reads succeeded; partial or failed reads do not support absence. "Disabled" is supported only
-when `installedProfiles>0`, `enabledProfiles:0` and `unknownProfiles:0` with complete metadata reads; any
-`unknownProfiles>0` forbids the word "disabled". `enabledProfiles>0` names a candidate browser, not the browser the
-user works in; the probe never proves that the extension is connected or activated. Activation of a connected
-extension is observed by the runtime `extension_snapshot` probe (`activationIdentity.state`), because an unactivated
-extension still connects to the local bridge.
+`extension_install.facts.{extensionId,browsers[].{browser,profileSource,readFailures,profiles[].{profile,state,disableReasons[],permissionsIncrease,version?,pendingVersion?,lastUsedDaysAgo?},running?,runningSince?}}`.
+`running` tells whether that browser runs, from the process singleton in its user-data folder, read with plain file
+calls: on Windows the `lockfile` the browser holds open and the system removes when it exits, even after a crash; on
+macOS and Linux the `SingletonLock` link to `<host>-<pid>`, which counts only when it names this computer and a live
+process, because a crash leaves the link behind. It is `true`, `false`, or `null` when the singleton could not be read
+or understood; a probe that predates it omits it. `runningSince`, present only with `running:true`, is the singleton's
+modification time, which is when the browser started. A running browser does not say which profile is open: the
+profile with e-Comet can still be closed. The singleton is no profile metadata, so it never counts as a read failure.
+`lastUsedDaysAgo` is the whole number of days since the newest modification time of that profile's `Preferences` and
+`Secure Preferences` files, obtained by `stat` without reading them. It measures file age, not browser use: Chromium
+rewrites those files while the browser runs, so a recent value usually means a recent run, but other software can touch
+the files too, and an old value proves only that the successfully stat'ed files have not changed. It is omitted when
+neither file could be stat'ed. It never identifies the browser the user is working in right now: order candidates by
+it and mention a long-unchanged one, but leave the choice to the user. When the extension is connected,
+`extension.version` in `local_bridge_status` is the connected copy's version; a listed profile whose `version` equals
+it is a likely candidate, not the proven source: unchecked browsers, unchecked profiles and unpacked copies can hold
+the same version.
+`browser` is `chrome`, `edge`, `brave`, `yandex`, or `opera`; versions are read in the safe version grammar and never
+come from anywhere but the record and the folder name. Display names, account e-mails, paths and every other
+preference field never enter the facts. States: `passed` when every found root was read; `unknown` with cause
+`permission_denied` or `io_error` when a read failed (partial facts are retained); `not_checked` with cause
+`directory_absent` when no known root exists. Inference boundaries: empty `profiles` everywhere supports absence only
+in checked browsers and profiles when metadata reads succeeded; partial or failed reads do not support absence.
+"Disabled" is supported only when `profiles` is not empty, every listed profile has `state:"disabled"` and
+`readFailures` is `0`; any profile with `state:"unknown"` forbids the word "disabled". A profile with `state:"enabled"`
+names a candidate browser, not the browser the user works in; the probe never proves that the extension is connected or
+activated. Activation of a connected extension is observed by the runtime `extension_snapshot` probe
+(`activationIdentity.state`), because an unactivated extension still connects to the local bridge.
 
 The installation `codex_mcp_auth` probe makes one bounded native `codex mcp list --json` call. It reports a
 configuration snapshot, not the current Desktop runtime connection, and selects exact configured names from our
@@ -230,8 +277,7 @@ The extension fact shape is
 `extension_snapshot.facts.{protocolVersion,observedAt,extensionVersion,capabilities[],activationIdentity.state,storageRead.state,ports.wb,ports.wbSeller,ports.ozon}`.
 The nested time is the extension observation time. Activation is `present`, `absent`, or `unknown`; storage is
 `passed`, `failed`, or `unknown`; every port is `true`, `false`, or `unknown`. Capabilities are extension-reported.
-Ports describe in-memory registration rather than login or operation readiness. A peer-forwarded snapshot still
-originates at the extension route on the device.
+Ports describe in-memory registration rather than login or operation readiness.
 
 Runtime diagnosis also returns `host_hook_context` with `state:"not_checked"`, `source:"device_process"`,
 `executionPlane:"device"`, and `cause:"unavailable"`. The device MCP has no demonstrated channel for reading context
@@ -259,7 +305,7 @@ grant. `allowed` is emitted only for the existing bounded `RETRY_FEEDBACK_ONCE` 
 always `forbidden`; missing handoff and insufficient evidence remain `unknown`. When a result carries both a
 top-level `retryable` flag and `operationDiagnostic.retryDisposition`, the `retryDisposition` governs repeats:
 `retryable:true` only says the failure class can clear once its prerequisite is fixed, never that the same call may
-be repeated without a user decision. Receipts never enter peer-wire failures,
+be repeated without a user decision. Receipts never enter
 authorization input, nested errors, cloud-only adapter markers, or cloud-only preparation/finalization results.
 
 For decorated results, the JSON text representation is the same value as `structuredContent`; existing resource links
@@ -272,11 +318,10 @@ access-denied system codes or `unknown` otherwise. The raw exception, path, and 
 the collection failure does not prevent report generation.
 
 Native and Cowork feedback archives use the same feedback-safe projection of the device evidence collected at
-preparation time. The report retains the named snapshot, runtime, client, listener, pairing-source, route-freshness,
+preparation time. The report retains the named snapshot, runtime, client, route-freshness,
 and storage checks described above, including their state, observation time, source, execution plane, and closed
-cause; the bounded `extensionTakeovers` count with its saturation flag and last time; `peerRejection` with its `since`
-and `retryAt` times; and `browserContext.changedAt`. Runtime retains only the bounded version/platform/architecture
-fields; listener retains only `bind_listener`, its closed state, and an allowlisted system code; route freshness retains
+cause, and `browserContext.changedAt`. Runtime retains only the bounded version/platform/architecture
+fields; route freshness retains
 only a valid observed timestamp; storage retains only path-free configuration targets. The client check retains the
 bounded name and version the host sent in MCP initialize with `client_reported` provenance: it names the Claude or
 Codex runtime, or the DeepSeek adapter (`e-comet-deepseek-harness`, with the plugin package version) plus, under that

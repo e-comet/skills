@@ -2,9 +2,13 @@ import { OZON_PROMOTION_MIN_EXTENSION_VERSION } from './extension-vocabulary.mjs
 import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
 import { maxSearchPositionsQueries } from './ozon-search-positions-domain.mjs';
 
+const claudeSandboxStep =
+    'Claude runs plugin hooks only after the conversation sandbox starts: if this tool is named mcp__remote-devices__... and no shell command has run in this conversation, first run one no-op shell command (true) with the host Bash tool, then call browser_job. ';
+
 const authorizationWorkflow =
     'This typed local tool owns the workflow: select it based on user intent, then call the remote e-Comet browser_job exactly once with the matching typed job and immediately invoke this tool. ' +
     'In Claude and Codex, model-authored arguments must omit both triggerUrl and trigger_url so the trusted host hook can inject the transport-only authorization immediately before this local call. ' +
+    claudeSandboxStep +
     'Never decode, print, edit, copy, or expose the authorization. Do not infer an authorization failure from client status: attempt the actual remote call and report only the confirmed error in user-friendly language. If a tool is missing from the catalog, repeat the host tool search up to three times; never repeat browser_job or this tool to make an error disappear. ';
 
 const ozonScopeGuard =
@@ -13,7 +17,8 @@ const ozonScopeGuard =
     'do not call browser_job, do not substitute the nearest tool, and do not run any Ozon tool as a probe; say that only these three exist and ask what the user wants. ';
 
 const ozonHookInjection =
-    'The trusted Claude or Codex host hook injects the opaque transport-only triggerUrl; model-authored arguments must omit both triggerUrl and trigger_url. Never decode, print, edit, copy, or expose that authorization. ';
+    'The trusted Claude or Codex host hook injects the opaque transport-only triggerUrl; model-authored arguments must omit both triggerUrl and trigger_url. Never decode, print, edit, copy, or expose that authorization. ' +
+    claudeSandboxStep;
 
 const ozonPackageContext =
     'The extension automatically uses the first ready Seller context and pins its company for this package; never ask the user to focus a tab. A fresh authorization uses the then-current context and does not guarantee the previous company. ' +
@@ -55,15 +60,19 @@ const reportDeliveryGuidance =
     'When the file exists, recover delivery through the host file capability using the same workbook; if a copy is needed, preserve the original and verify the copy against the returned size and SHA-256. ' +
     'Do not recreate a completed report because opening or reading its downloaded workbook failed. If the exact file cannot be checked from this host, report that verification gap without claiming the file is missing. ';
 
-const localBridgeGuidance =
-    'LOCAL_BRIDGE_* failures describe observed local pairing or listener problems, not marketplace login failures. Use the returned cause and local_bridge_status; do not prescribe opening a WB tab or obtaining repeated authorizations for a local permissions/bind failure. ';
+export const BRIDGE_FAILURE_GUIDANCE =
+    "A BRIDGE_* code (stage local; for Ozon tools OZON_AUTHORIZATION_REJECTED: read details.bridgeCode) names the observed reason no browser connection exists, and its message is the user's next step: relay that step in the user's language. " +
+    'It is not a login or marketplace failure; never prescribe a WB or Ozon tab for it. ' +
+    'Offer to report BRIDGE_BROKER_FAILED and BRIDGE_FRAME_TOO_LARGE to e-Comet without guessing a cause; BRIDGE_UNAVAILABLE_IN_WSL and BRIDGE_UNSUPPORTED_PLATFORM are setups e-Comet does not support. ' +
+    "Once the user has taken the step, repeat with one fresh browser_job and call on the user's decision. " +
+    "EXTENSION_DISCONNECTED means the browser connection closed mid-job: check local_bridge_status, and never repeat a report create without the user's decision. ";
 
 const localBridgeFailureGuidance =
-    localBridgeGuidance +
+    BRIDGE_FAILURE_GUIDANCE +
     'For LOCAL_STORAGE_FAILED, use details.systemCode and the message when supplied to distinguish access, space/quota and path conflicts; do not infer the cause from the generic code alone. ';
 
 const rejectionAndHandoffGuidance =
-    'BROWSER_JOB_HANDOFF_REQUIRED (stage handoff) means this tool ran without hook-injected authorization: the host hook did not run or did not rewrite the input, because the plugin hooks are not trusted, are disabled, changed after a plugin update, or the host does not run plugin hooks in this task. It is not a marketplace, extension or account failure. Do not call browser_job or this tool again until that is resolved; each repeat spends one signed authorization. On Codex run e_comet_diagnose with installation scope, safe_probes and the hook_permissions probe and follow its result: on disabled or review_required the user enables or trusts the e-Comet handlers in Settings → Plugins → Personal → e-Comet MCP Tools → Hooks, on ready or not_checked the cause is not established; on Claude Code /hooks lists the configured hooks; on Cowork verify that the plugin is installed and enabled and start a new task. retryable:true never authorizes an automatic repeat. ' +
+    'BROWSER_JOB_HANDOFF_REQUIRED (stage handoff) means this tool ran without hook-injected authorization: the host hook did not run or did not rewrite the input, because the plugin hooks are not trusted, are disabled, changed after a plugin update, or the host does not run plugin hooks in this task. It is not a marketplace, extension or account failure. Do not call browser_job or this tool again until that is resolved; each repeat spends one signed authorization. On Codex run e_comet_diagnose with installation scope, safe_probes and the hook_permissions probe and follow its result: on disabled or review_required the user enables or trusts the e-Comet handlers in Settings → Plugins → Personal → e-Comet MCP Tools → Hooks, on ready or not_checked the cause is not established; on Claude Code /hooks lists the configured hooks; in Claude with mcp__remote-devices__... tool names, if no shell command had run in this conversation, its sandbox and hooks had not started: run one no-op shell command (true), then call browser_job once and this tool once; a new task starts without the sandbox again; otherwise verify that the plugin is installed and enabled in Customize → Plugins → Yours. retryable:true never authorizes an automatic repeat. ' +
     'A whole-call BROWSER_JOB_REJECTED or BROWSER_JOB_ACCOUNT_MISMATCH (for Ozon tools, OZON_AUTHORIZATION_REJECTED with the same details) carries details.browserJobRejection.reason: ecomet_not_authenticated means the extension is not activated, and the user activates it with the API key from the e-Comet account (https://app.e-comet.io/account) in the browser where it is connected; subject_mismatch (code BROWSER_JOB_ACCOUNT_MISMATCH) means the extension is activated with a different e-Comet account than the connector, and the user uses the same account on both; expired or token_reuse need one fresh browser_job on the user\'s decision; every other reason is an e-Comet defect to report, not a user change. See the packaged mcp/DIAGNOSTICS.md section "Missing authorization handoff". ';
 
 const buyerOutcomeGuidance =
@@ -107,6 +116,16 @@ const checkContract =
             'Do not claim that the product is absent from all Wildberries search results. Results are a current WB-session snapshot. ' +
             resultPathGuidance;
 
+const filtersContract =
+            'Get the Wildberries search filters for 1-50 phrases: every card characteristic (Цвет, Состав, Материал, Сезон…) with all its values, and the categories (предметы) WB shows for each phrase. Use for Russian requests about фильтры выдачи, фильтры по запросу, «Все фильтры», значения фильтров, or заполнить характеристики / доп. поля карточки как в фильтрах WB. ' +
+            authorizationWorkflow + localBridgeFailureGuidance + buyerOutcomeGuidance + rejectionAndHandoffGuidance +
+            'Authorize with job {type:"filters_by_query",queries:[string,...]}; send 1-50 unique non-empty phrases as a shopper types them. ' +
+            'Read filters[]: one entry per filter across all phrases; values are WB\'s exact spellings in WB\'s order, the union over the phrases; queryCount counts the phrases that show the filter, and queries[].filterKeys lists the filters of each phrase. ' +
+            'Quote values verbatim when advising what to fill in a card. complete:false means WB returned only the first values of that list: say the list may be longer. ' +
+            'Per phrase, empty means WB found nothing for it; request_failed with WB_UNRELIABLE_RESPONSE means WB answered with decoy data, which was discarded; partial means some lists stayed truncated. Never present a failed phrase as one without filters. ' +
+            'Brand, seller, price, delivery and yes/no filters are not returned. Which phrase showed which value is in the result file. Results are a current WB-session snapshot. ' +
+            resultPathGuidance;
+
 const recommendationsContract =
             'Get live Wildberries recommendation shelves for source article IDs and check whether specific products occur in them. Use for Russian requests about рекомендации, похожие товары, рекомендательная полка, соседние товары, or whether a product встречается в рекомендациях. ' +
             authorizationWorkflow + localBridgeFailureGuidance + buyerOutcomeGuidance + rejectionAndHandoffGuidance +
@@ -142,7 +161,7 @@ const sellerReviewsContract =
             'Use exact resource_link.uri/artifact.path, not name. ' +
             'Opening/search/listing failure cannot prove deletion: check exact file via host filesystem capability; if uncheckable, report verification gap. ' +
             'Recover same workbook; preserve original, verify copies by size/SHA-256; never regenerate for delivery failure. ' +
-            'LOCAL_BRIDGE_*: pairing/listener, not login; no WB-tab/repeated-auth fix. ' +
+            BRIDGE_FAILURE_GUIDANCE +
             'LOCAL_STORAGE_FAILED: use details.systemCode/message, never guess. ' +
             'ARTIFACT_TOO_LARGE: no redownload; offer user-selected narrower export, retain workbooks. ' +
             'Metadata/private links only; bytes never enter tool result or model context, no base64. ' +
@@ -153,6 +172,7 @@ const promotionContract =
             ozonAuthorizationWorkflow +
             reportDeliveryGuidance +
             rejectionAndHandoffGuidance +
+            BRIDGE_FAILURE_GUIDANCE +
             ozonHandoffGuidance +
             'Use canonical inclusive dateFrom/dateTo dates with at most 89 inclusive days. One call produces one period and one workbook. ' +
             'Neighboring analytics are unavailable in this first tool: it does not provide product, traffic, finance, campaign, or other Ozon reports. ' +
@@ -161,8 +181,8 @@ const promotionContract =
             'For legacy singular compatibility, ARTIFACT_REJECTED may describe an internal acknowledgement failure in its message; the code alone is not proof of a disk problem. Preserve any stated confirmed create outcome and do not repeat it automatically. ' +
             'An OZON_ROUTE_NOT_READY failure carrying error.details.reason "extension_outdated" means the installed e-Comet extension is too old for this report: tell the user to update the extension to the version in error.details and retry, ' +
             `and do not tell them to open the report page. This operation requires extension ${OZON_PROMOTION_MIN_EXTENSION_VERSION} or newer and any authenticated Ozon Seller page under https://seller.ozon.ru/app, not an exact promotion-overview route and never a Wildberries tab. ` +
-            'The same code without those details means no ready Ozon route was reachable; it does not establish a cause. A timeout is not proof of disconnection. If status reports extensionConnected:false, explain that there is no effective extension route, without claiming attachment to an old primary. ' +
-            'For an unready route, ask the user to check the extension in the same browser profile and refresh any authenticated Ozon /app page, then obtain a new authorization before retrying. Never reuse the consumed one-use authorization, automatically loop, or use WB-tab recovery for Ozon. ' +
+            'The same code without those details means no ready Ozon route was reachable; it does not establish a cause. A timeout is not proof of disconnection. If status reports extensionConnected:false, its code names the cause; never invent another. ' +
+            'For an unready route, ask the user to check the extension in the same browser profile and refresh any authenticated Ozon /app page, then obtain a new authorization before retrying; when the message says the browser connection closed, check local_bridge_status instead of a page. Never reuse the consumed one-use authorization, automatically loop, or use WB-tab recovery for Ozon. ' +
             'Returns compact metadata and exactly one private resource_link. The resource_link contains a local file URI; workbook bytes, base64, company context, report identifiers, and request details are not included in model content.';
 
 const promotionPackageContract =
@@ -170,6 +190,7 @@ const promotionPackageContract =
             ozonPackageAuthorizationWorkflow('ozon_seller_promotion_reports', 'periods:[{dateFrom,dateTo},...]') +
             reportDeliveryGuidance +
             rejectionAndHandoffGuidance +
+            BRIDGE_FAILURE_GUIDANCE +
             'Each period independently uses canonical inclusive dates and may contain at most 89 inclusive days. Periods may overlap and need not be chronological; exact duplicates are rejected and there is no aggregate-day cap. ' +
             'One browser authorization and one local call cover the whole ordered package. Completed workbooks remain available when later items fail; return every completed resource_link and report every failed and skipped item from the ordered result. ' +
             'The operation may create saved reports in Ozon, but it does not change products, campaigns, budgets, or seller settings. ' +
@@ -180,6 +201,7 @@ const analyticsPackageContract =
             ozonPackageAuthorizationWorkflow('ozon_seller_analytics_report', 'reports:[{dateFrom,dateTo,breakdown},...]') +
             reportDeliveryGuidance +
             rejectionAndHandoffGuidance +
+            BRIDGE_FAILURE_GUIDANCE +
             'Each report independently uses canonical inclusive dates, an explicit breakdown:"period" or breakdown:"daily", at most 731 inclusive days, and the signed Moscow issuance window. ' +
             'daily means daily rows inside one XLSX workbook for that report; never create one report per day unless the user explicitly requests separate date items. ' +
             'REPORT_TERMINAL_FAILURE may include details.marketplaceErrorCode: retain this observed numeric code in a consented bug report, but never invent its business meaning or treat it as permission to retry create. ' +
@@ -217,11 +239,11 @@ const searchPositionsContract = (maxQueries) =>
             'OZON_SEARCH_FAILED: Ozon failed this query; report the query as failed, no automatic retry. ' +
             'OZON_RATE_LIMITED: Ozon limited the requests; the package stopped and the remaining queries are skipped; no automatic retry. Ozon counts per minute, so a new job for the skipped queries waits at least a minute, on the user\'s decision. ' +
             'OZON_SEARCH_POSITIONS_CAPABILITY_UNAVAILABLE: the connected extension cannot run this tool; the user updates the e-Comet extension, then a new authorization on the user\'s decision; opening an Ozon page does not help. ' +
-            'OZON_ROUTE_NOT_READY: no ready Ozon Seller route was reachable and its cause is not established; ask the user to check the extension in the same browser profile and refresh any authenticated Ozon Seller page under https://seller.ozon.ru/app, then a new authorization on the user\'s decision. Never use WB-tab recovery for Ozon. ' +
+            'OZON_ROUTE_NOT_READY: no ready Ozon Seller route was reachable and its cause is not established; ask the user to check the extension in the same browser profile and refresh any authenticated Ozon Seller page under https://seller.ozon.ru/app, then a new authorization on the user\'s decision; when the message says the browser connection closed, check local_bridge_status instead of a page. Never use WB-tab recovery for Ozon. ' +
             'OZON_CONTEXT_CHANGED: the Seller company changed during the run, so the remaining queries are skipped; a new job on the user\'s decision pins the then-current company. ' +
             'OZON_EXECUTION_INTERRUPTED: the extension\'s results could not be accepted; an internal e-Comet failure, not a Seller login or route problem; offer an e-Comet bug report. ' +
             ozonPackageContext +
-            localBridgeGuidance +
+            BRIDGE_FAILURE_GUIDANCE +
             rejectionAndHandoffGuidance +
             ozonHandoffGuidance;
 
@@ -243,7 +265,9 @@ Do not describe report contents, diagnostics, environment metadata, version, pla
 
 After explicit report consent and the history disclosure and question, clear ordinary continuation defaults to \`includeTranscript:true\`. Use \`includeTranscript:false\` only when the user explicitly opts out. Silence is not consent and calls no feedback tools. If report consent or the history preference is ambiguous, ask one short clarification, do not repeat the warning, and call no feedback tools until resolved. For example, “Yes, send it; maybe leave the history out” leaves the history preference unresolved; default inclusion must not override it. The history interaction is complete only after an explicit include or exclude choice, or clear continuation after the disclosure and question with no unresolved preference.
 
-If the user declines or cancels, do not call \`prepare_e_comet_feedback\`, \`report_issue\`, or \`submit_e_comet_feedback\`. When the issue and explicit report consent are known, the history interaction is complete, and \`report_issue\` is available, the first subsequent action must be \`prepare_e_comet_feedback\`; emit no acknowledgement, restatement, recap, diagnostic call, or other prose before it.
+If the user declines or cancels, do not call \`prepare_e_comet_feedback\`, \`report_issue\`, or \`submit_e_comet_feedback\`. When the issue and explicit report consent are known, the history interaction is complete, and \`report_issue\` is available, the first subsequent action must be \`prepare_e_comet_feedback\`, preceded only by the Claude sandbox step below when it applies; emit no acknowledgement, restatement, recap, diagnostic call, or other prose before it.
+
+Claude runs plugin hooks only after the conversation sandbox starts. If the local feedback tools are named \`mcp__remote-devices__...\` and no shell command has run in this conversation, first run one no-op shell command (\`true\`) with the host Bash tool, then call \`prepare_e_comet_feedback\`.
 
 ## Author and send
 
@@ -267,7 +291,7 @@ The service allows five authorizations per hour. On a \`report_issue\` rate-limi
 
 Explain failures only from the fixed safe message and supplied closed \`error.details.operation\`, \`reason\`, \`systemCode\`, and \`httpStatus\`. An optional source module and line are public-code investigation context, not a user path or proven cause. Unknown internal errors remain unknown. A trusted-hook denial does not authorize changing consent, history choice, or hook trust. \`status:"not_started"\` confirms that call did not upload; follow its current reason and action without describing it as possibly sent, while preserving any separate earlier uncertainty.
 
-After preparation failure, explain the observed error, what it does not establish, and one action from \`recommendedAction\`. \`CHECK_FEEDBACK_HOOKS\` means inspect available host/plugin configuration and evidence; suggest enabling or trusting a hook only when that missing prerequisite is observed. \`RESTART_FEEDBACK_FLOW\` means explain only the supplied handoff evidence and ask the user to start a fresh flow; it does not itself prove invalidity or expiry. \`RETRY_WITH_VALID_REPORT\` corrects only identified invalid fields and preserves history choice. \`RETRY_FEEDBACK_ONCE\` offers one retry, never a loop. \`CHECK_LOCAL_STORAGE\` asks the user to check local storage access without exposing paths. \`FEEDBACK_HOOK_HANDOFF_UNAVAILABLE\` does not establish its cause; in Claude Code, \`/hooks\` inspects configured hooks, while Cowork has no invented hook-trust switch.
+After preparation failure, explain the observed error, what it does not establish, and one action from \`recommendedAction\`. \`CHECK_FEEDBACK_HOOKS\` means inspect available host/plugin configuration and evidence; suggest enabling or trusting a hook only when that missing prerequisite is observed. \`RESTART_FEEDBACK_FLOW\` means explain only the supplied handoff evidence and ask the user to start a fresh flow; it does not itself prove invalidity or expiry. \`RETRY_WITH_VALID_REPORT\` corrects only identified invalid fields and preserves history choice. \`RETRY_FEEDBACK_ONCE\` offers one retry, never a loop. \`CHECK_LOCAL_STORAGE\` asks the user to check local storage access without exposing paths. \`FEEDBACK_HOOK_HANDOFF_UNAVAILABLE\` does not establish its cause; in Claude Code, \`/hooks\` inspects configured hooks, while Cowork has no invented hook-trust switch. In Claude with \`mcp__remote-devices__...\` tool names, if no shell command had run in this conversation, its sandbox and hooks had not started and nothing was sent: run one no-op shell command (\`true\`), then call \`prepare_e_comet_feedback\` once more with the same report and history choice. A new task starts without the sandbox again.
 
 \`UPLOAD_DESTINATION_REFUSED\` and \`FEEDBACK_ARCHIVE_MISMATCH\` are terminal: report the safe error and stop without retrying submit, obtaining another grant, or preparing again. For any uncertain upload, preparation metadata such as expiry does not prove recoverable bytes. Never promise an archive, save, report, receipt, or status lookup; never resend that artifact or prepare a new report as a workaround. If submit returns \`UPLOAD_UNCERTAIN\` or \`FEEDBACK_SUBMISSION_FAILED\` without \`status:"not_started"\`, say «Не удалось подтвердить отправку. Отчёт мог быть получен, поэтому я не буду отправлять его повторно автоматически.» and ask what the user wants to do.
 
@@ -282,7 +306,7 @@ export const FEEDBACK_CONTRACT_TOOL_NAMES = Object.freeze([
 ]);
 
 const signedNames = [
-    'wb_product_card', 'wb_search_by_query', 'wb_check_by_query',
+    'wb_product_card', 'wb_search_by_query', 'wb_check_by_query', 'wb_filters_by_query',
     'wb_recommendations_by_product', 'wb_seller_reviews',
     'ozon_seller_promotion_report', 'ozon_seller_promotion_reports',
     'ozon_seller_analytics_report', 'ozon_search_positions',
@@ -295,6 +319,7 @@ const signedContracts = Object.freeze({
     wb_product_card: productCardContract,
     wb_search_by_query: searchContract,
     wb_check_by_query: checkContract,
+    wb_filters_by_query: filtersContract,
     wb_recommendations_by_product: recommendationsContract,
     wb_seller_reviews: sellerReviewsContract,
     ozon_seller_promotion_report: promotionContract,

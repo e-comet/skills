@@ -209,8 +209,8 @@ const codexToolResult = (record, pending) => {
 
 // Native DSH session v4 logs use numeric milliseconds and exact top-level events. Do not
 // walk message payloads or parse authored arguments: only names and correlated outcomes leave here.
-// Prepared-receipt recovery has separate session/argument rules; retain independent pairing ownership:
-// docs/local-agent-architecture.md#accepted-residuals.
+// Prepared-receipt recovery keeps its own session/argument rules and its own call/result matching: see the accepted
+// residual "Separate native preparation-recovery and diagnostic pairing" in docs/local-agent-architecture.md#accepted-residuals.
 const deepseekToolEvent = (record, pending) => {
     if (!isObject(record.data)) return undefined;
     const data = record.data;

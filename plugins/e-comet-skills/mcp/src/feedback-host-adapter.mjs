@@ -2,8 +2,10 @@ import { FEEDBACK_CLOUD_MAX_BYTES } from './config.mjs';
 import { isValidFeedbackDeviceSnapshot } from './feedback-device-diagnostics.mjs';
 
 // 3: the device projection carries client name and version, takeover and timing fields, and the
-// preparation-time evidence checks; an older cloud half fails closed until both halves are updated.
-export const FEEDBACK_HOST_ADAPTER_VERSION = 3;
+// preparation-time evidence checks. 4: it drops the takeover, listener and peer fields and carries the bridge cause
+// code with its registration and broker facts instead. An older cloud half fails closed until both halves are updated.
+// Accepted residual "Mixed feedback halves refuse with a version mismatch": docs/local-agent-architecture.md#accepted-residuals.
+export const FEEDBACK_HOST_ADAPTER_VERSION = 4;
 export const FEEDBACK_CLOUD_TRANSPORT_VERSION = 1;
 export const FEEDBACK_CLOUD_ARCHIVE_BASE64_MAX_LENGTH = Math.ceil(FEEDBACK_CLOUD_MAX_BYTES / 3) * 4;
 

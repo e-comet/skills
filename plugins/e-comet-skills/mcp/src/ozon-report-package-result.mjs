@@ -22,6 +22,8 @@ export const OZON_PACKAGE_STOP_REASONS = Object.freeze([
     'systemic_failure_breaker',
     'execution_interrupted',
 ]);
+// Positions add their two preflight stops; kept here, beside the shared list, so the schema needs no job module.
+export const OZON_SEARCH_POSITIONS_STOP_REASONS = Object.freeze([...OZON_PACKAGE_STOP_REASONS, 'region_unavailable', 'sku_limit_exceeded']);
 
 const reasonsByCode = Object.freeze({
     OZON_AUTHORIZATION_REJECTED: 'authorization_unavailable',
@@ -41,7 +43,7 @@ const reasonsByCode = Object.freeze({
 export const ozonPackageStopReason = (code) => Object.hasOwn(reasonsByCode, code) ? reasonsByCode[code] : 'execution_interrupted';
 
 // Only the local routing boundary can attest that nothing reached a transport.
-// A peer/page cannot forge this evidence by adding a property to an error payload.
+// A page cannot forge this evidence by adding a property to an error payload.
 const preexecutionErrors = new WeakSet();
 export const markOzonPackageNotStarted = (error) => { preexecutionErrors.add(error); return error; };
 export const isOzonPackageNotStarted = (error) => preexecutionErrors.has(error);

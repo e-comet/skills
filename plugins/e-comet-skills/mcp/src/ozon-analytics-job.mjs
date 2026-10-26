@@ -3,7 +3,7 @@ import { ozonAnalyticsArtifactName, parseAnalyticsReports } from './ozon-analyti
 import { executeOzonReportPackage } from './ozon-report-package-job.mjs';
 import { ozonPackageDeadline } from './ozon-report-package-result.mjs';
 import { StorageUnavailableError } from './storage-layout.mjs';
-import { browserJobRejectionDetails, ToolExecutionError } from './tool-errors.mjs';
+import { bridgeCodeDetails, browserJobRejectionDetails, ToolExecutionError } from './tool-errors.mjs';
 import { OZON_ANALYTICS_TERMINAL_CODE_STAGES, isOzonAnalyticsTerminalDetails, isOzonExecutionInterruptionDetails } from './extension-vocabulary.mjs';
 
 const authorizationRejected = (cause) =>
@@ -24,7 +24,7 @@ export const safeOzonAnalyticsToolError = (error) => {
         // Local ToolExecutionError always owns an initially undefined details field.
         // Absence of evidence must not erase an otherwise known local failure.
         (error?.details !== undefined && !isOzonAnalyticsTerminalDetails(error?.code, error.details) &&
-            !isOzonExecutionInterruptionDetails(error?.code, error.details) && !browserJobRejectionDetails(error)) ||
+            !isOzonExecutionInterruptionDetails(error?.code, error.details) && !browserJobRejectionDetails(error) && !bridgeCodeDetails(error)) ||
         stage === undefined ||
         error?.stage !== stage ||
         error?.retryable !== false ||
@@ -38,7 +38,8 @@ export const safeOzonAnalyticsToolError = (error) => {
         ...(isOzonAnalyticsTerminalDetails(error.code, error.details) ? { details: { marketplaceErrorCode: error.details.marketplaceErrorCode } } : {}),
         ...(isOzonExecutionInterruptionDetails(error.code, error.details)
             ? { details: { phase: error.details.phase, createOutcome: error.details.createOutcome } } : {}),
-        ...(browserJobRejectionDetails(error) ? { details: browserJobRejectionDetails(error) } : {}) };
+        ...(browserJobRejectionDetails(error) ? { details: browserJobRejectionDetails(error) } : {}),
+        ...(bridgeCodeDetails(error) ? { details: bridgeCodeDetails(error) } : {}) };
 };
 
 export const executeOzonAnalyticsJob = async ({
