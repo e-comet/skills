@@ -59,7 +59,8 @@ export const REMOTE_E_COMET_TOOL_NAMES = Object.freeze([
     'update_campaign_settings', 'update_campaign_clusters_settings', 'update_campaign_target_products_settings',
     'update_product_settings', 'update_stock_rebalancer_settings',
     'campaign_comments', 'product_comments', 'update_campaign_comments', 'update_product_comments',
-    'campaign_journal', 'product_journal', 'account_journal',
+    'campaign_journal', 'product_journal', 'account_journal', 'search_positions', 'recom_positions',
+    'org_balance_history', 'campaign_budget', 'campaign_budget_history',
 ]);
 const REMOTE_TOOL_NAME = new RegExp(`^mcp__(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|e-comet)__(?:${REMOTE_E_COMET_TOOL_NAMES.join('|')})$`);
 
