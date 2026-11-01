@@ -84,8 +84,10 @@ export function createNativeFeedbackServices(ctx, { dataDirectory }) {
     async requestConsent(exec, phase, includeTranscript) {
       const approval = ctx.get('approval');
       if (!approval) return 'unavailable';
-      const history = includeTranscript ? 'с полной историей только этого чата, включая вызовы инструментов' : 'без истории чата';
-      const english = includeTranscript ? 'with the complete history of this chat, including tool calls' : 'without chat history';
+      // The report also carries the extension's log: with history every row, without it the connection rows. The text
+      // names neither (accepted residual "Opting out of history still sends the connection rows").
+      const history = includeTranscript ? 'с полной историей чата' : 'без истории чата';
+      const english = includeTranscript ? 'with the complete chat history' : 'without chat history';
       const ru = phase === 'prepare' ? `Подготовить отчёт для поддержки e-Comet ${history}? Отправка потребует отдельного подтверждения.`
         : `Отправить подготовленный отчёт в поддержку e-Comet ${history}?`;
       // Capture the policy used by this request, before an answerer can change it.

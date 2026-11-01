@@ -120,6 +120,11 @@ export const SELLER_JOB_MAX_DURATION_MS = sellerJobDurationMs(
 export const MAX_ACTIVE_AUTHORIZATION_SCOPES = positiveIntegerEnv('ECOMET_MAX_ACTIVE_AUTHORIZATION_SCOPES', 32);
 export const RESULT_RETENTION_MS = positiveIntegerEnv('ECOMET_RESULT_RETENTION_MS', 24 * 60 * 60 * 1000);
 export const RESULT_MAX_FILE_BYTES = positiveIntegerEnv('ECOMET_RESULT_MAX_FILE_BYTES', 64 * 1024 * 1024);
+// A long tool answers within this wait, and so does each result call: Cowork's cloud drops a device call after 60 s,
+// and that budget also carries the answer over the bridge. Accepted residual "Long bridge jobs hand over to
+// e_comet_run_result after 30 s": docs/local-agent-architecture.md#accepted-residuals.
+export const RUN_WAIT_MS = positiveIntegerEnv('ECOMET_RUN_WAIT_MS', 30_000);
+export const RUN_RESULT_RETENTION_MS = positiveIntegerEnv('ECOMET_RUN_RESULT_RETENTION_MS', 30 * 60 * 1000);
 export const IMAGE_BASKET_BOUNDS = [
     143, 287, 431, 719, 1007, 1061, 1115, 1169, 1313, 1601, 1655, 1919, 2045, 2189, 2405, 2621, 2837, 3053, 3269, 3485, 3701, 3917, 4133,
     4349, 4565, 4877, 5189, 5501, 5813, 6125, 6437, 6749, 7061, 7373, 7685, 7997, 8309, 8741, 9173, 9605, 10373, 11141, 11909, 12677, 13445,
@@ -144,21 +149,29 @@ export const FEEDBACK_MAX_SUMMARY_LENGTH = 512;
 // prepares successfully cannot later be rejected while requesting its upload grant.
 export const FEEDBACK_KINDS = Object.freeze(['bug', 'wrong_data', 'missing_capability', 'unclear_contract']);
 export const FEEDBACK_MAX_BYTES = 32 * 1024 * 1024;
-// Cowork cloud route: the archive travels inside the bridged call input, so it is bounded by the
-// measured device-bridge capacity, not by the native 32 MiB budget.
-export const FEEDBACK_CLOUD_MAX_BYTES = 256 * 1024;
+// An upload no trusted hook signed may go only to e-Comet's own storage. The server signs for S3 and hands the URL
+// out under the app's storage proxy, which forwards the raw path.
+export const FEEDBACK_UPLOAD_DESTINATIONS = Object.freeze([
+    Object.freeze({ hostname: 'app.e-comet.io', pathPrefix: '/storage/e-comet-prod-mcp-feedback-732537603439/' }),
+]);
 // Every probe that gathers evidence while a report is prepared is abandoned after this long: the
 // extension's read-only snapshot, the installation reads, the browser-profile scan and the Codex hook
 // inspector, which needs up to five seconds for a cold start. Preparation is independent of extension
 // readiness by contract, so a stalled route may cost seconds, never the 45-second business deadline,
 // and a report is never lost to the evidence gathered for it.
 export const FEEDBACK_EVIDENCE_TIMEOUT_MS = 5000;
-// Only e-Comet's own storage may receive a device-side cloud upload; the device cannot verify hook provenance.
-// The server signs for S3 and hands the URL out under the app's storage proxy, which forwards the raw path.
-export const FEEDBACK_CLOUD_UPLOAD_DESTINATIONS = Object.freeze([
-    Object.freeze({ hostname: 'app.e-comet.io', pathPrefix: '/storage/e-comet-prod-mcp-feedback-732537603439/' }),
-]);
+// The archive's copy of the extension's own log (extension-log.json), newest rows kept. The whole log is at most 3,000
+// rows, typically well under 2 MiB, and the 32 MiB report limit also has to hold the transcript.
+export const FEEDBACK_EXTENSION_LOG_MAX_BYTES = 4 * 1024 * 1024;
 export const FEEDBACK_ARTIFACT_RETENTION_MS = 24 * 60 * 60 * 1000;
+// Bounds for reading the extension's own connection log from a browser profile on disk (leveldb-read.mjs), on the
+// failure path only. The log value is at most 3,000 rows, about 1-2 MiB of JSON; LevelDB rolls its write-ahead log at a
+// 4 MiB write buffer, so 8 MiB per file covers a full log or a large table; the rest of our storage's keys fit in
+// 32 MiB, the total of the one pass that reads both log keys of a profile. A file or total over its limit is not read
+// and the reader reports `truncated` instead of guessing. One profile is read: that of the browser the cause names.
+// timeoutMs bounds every file read of that pass: a failing call already waits up to a minute for the broker and for
+// the repair of its registration, so the read adds seconds, never another wait.
+export const EXTENSION_LOG_LIMITS = Object.freeze({ maxFileBytes: 8 * 1024 * 1024, maxTotalBytes: 32 * 1024 * 1024, timeoutMs: 2000 });
 export const OFFICIAL_EXTENSION_ID = 'apeallgchpgibifmbgefkhifidihmodh';
 // The first extension build that talks to the browser's native messaging host. Equals MINIMUM_SERVED_EXTENSION_VERSION
 // in the release gate (scripts/extension_gate.py); both change together. Tests derive their versions from it.

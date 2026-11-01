@@ -1,4 +1,5 @@
 import { diagnosticCheck } from './diagnostic-facts.mjs';
+import { extensionLogCheck } from './extension-log.mjs';
 
 const iso = (value) => {
     if (!Number.isFinite(value) || Math.abs(value) > 8.64e15) return undefined;
@@ -48,6 +49,8 @@ export const deriveBridgeDiagnostics = (raw) => {
             routeFreshness: diagnosticCheck({ check: 'route_freshness', state: Number.isFinite(raw.routeLastObservedAtMs) ? 'passed' : 'unknown', observedAt,
                 source: 'extension_heartbeat', executionPlane: 'device',
                 ...(Number.isFinite(raw.routeLastObservedAtMs) ? { facts: { lastObservedAt: iso(raw.routeLastObservedAtMs) } } : { cause: 'unknown', nextCheck: 'observe_extension_heartbeat' }) }),
+            // Kept from the last tool call that found no broker; its ages count to this observation.
+            ...(raw.extensionLog ? { extensionLog: extensionLogCheck(raw.extensionLog, { observedAt, nowMs: Date.parse(observedAt) }) } : {}),
         },
     };
 };

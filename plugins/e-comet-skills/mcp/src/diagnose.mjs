@@ -5,6 +5,7 @@ import { collectDoctorReport } from './doctor.mjs';
 import { collectCodexHookPermissions } from './codex-hook-permissions.mjs';
 import { collectCodexMcpAuth } from './codex-mcp-auth.mjs';
 import { probeBrowserExtensionInstall } from './browser-extension-install.mjs';
+import { collectExtensionLog as readExtensionLog, extensionLogCheck } from './extension-log.mjs';
 
 const systemCause = (error) => ['EACCES', 'EPERM', 'EROFS'].includes(error?.code) ? 'permission_denied' : 'io_error';
 
@@ -72,7 +73,8 @@ const probeStorageTarget = async (name, target, { observedAt, randomUUID, fileSy
             handle = await fileSystem.open(path, 'wx');
             acquired = true;
             steps.push(step('create', 'passed'));
-            try { identity = await handle.stat(); }
+            // NTFS file IDs exceed 2^53, so only bigint stats tell neighbouring files apart.
+            try { identity = await handle.stat({ bigint: true }); }
             catch (error) { steps.push(step('identify', 'failed', error?.code)); failure = error; }
         }
         catch (error) { steps.push(step('create', 'failed', error?.code)); failure = error; }
@@ -88,7 +90,7 @@ const probeStorageTarget = async (name, target, { observedAt, randomUUID, fileSy
         if (acquired) {
             let sameFile = false;
             if (identity) {
-                try { const current = await fileSystem.stat(path); sameFile = current.dev === identity.dev && current.ino === identity.ino; }
+                try { const current = await fileSystem.stat(path, { bigint: true }); sameFile = current.dev === identity.dev && current.ino === identity.ino; }
                 catch (error) { steps.push(step('remove', 'failed', error?.code)); failure ??= error; }
             }
             try { await handle.close(); }
@@ -115,6 +117,8 @@ export const collectDiagnosis = async (/** @type {any} */ { scope, mode, operati
     collectHookPermissions = collectCodexHookPermissions,
     collectMcpAuth = collectCodexMcpAuth,
     probeExtensionInstall = probeBrowserExtensionInstall,
+    collectExtensionLog = readExtensionLog,
+    replaceExtensionLog = (_evidence) => undefined,
     fileSystem = fs } = {}) => {
     const observedAt = new Date(now()).toISOString();
     let checks = [];
@@ -137,6 +141,14 @@ export const collectDiagnosis = async (/** @type {any} */ { scope, mode, operati
         if (scope === 'installation' && probes.includes('extension_install')) checks.push(await probeExtensionInstall({ now }));
         if (scope === 'runtime' && probes.includes('extension_snapshot')) {
             checks.push(await collectExtensionSnapshotCheck({ requestExtensionDiagnosticSnapshot, observedAt }));
+        }
+        // The offline counterpart of the snapshot: what the browser told the extension, read from the profile on disk.
+        // A fresh read replaces the one the last failing tool call left in status, there too, so the cause in `code` is
+        // judged again from it; a reader that throws is unreadable.
+        if (scope === 'runtime' && probes.includes('extension_log')) {
+            const evidence = await collectExtensionLog({ now }).catch((error) => ({ state: 'unreadable', systemCode: error?.code, startFailureAtMs: [] }));
+            replaceExtensionLog(evidence);
+            checks = [...checks.filter(({ check }) => check !== 'extension_log'), extensionLogCheck(evidence, { observedAt, nowMs: Date.parse(observedAt) })];
         }
     }
     if (scope === 'runtime') checks.push(diagnosticCheck({ check: 'host_hook_context', state: 'not_checked', observedAt,

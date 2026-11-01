@@ -36,8 +36,10 @@ function extensionRoute(result) {
     const status = JSON.parse(result.content.find(block => block?.type === 'text').text);
     if (result.isError === true || status?.ok !== true || status.extensionConnected === true || status.code === 'connected') return 'connected';
     if (status.code === 'connecting') return 'checking';
-    // Their user step is the offline card's: open the browser, or click the e-Comet icon in the one that runs.
-    if (['BRIDGE_NO_BROWSER', 'BRIDGE_HOST_NOT_STARTED', 'BRIDGE_PERMISSION_REQUIRED'].includes(status.code)) return 'extension_offline';
+    // Their user step is the offline card's: open the browser, or click the e-Comet icon in the one that runs (a connector
+    // that answered once and is gone now asks for the same click first).
+    const offline = ['BRIDGE_NO_BROWSER', 'BRIDGE_HOST_NOT_STARTED', 'BRIDGE_PERMISSION_REQUIRED', 'BRIDGE_BROKER_NOT_VISIBLE'];
+    if (offline.includes(status.code)) return 'extension_offline';
     return typeof status.code === 'string' ? 'bridge_unavailable' : 'connected';
   } catch { return 'connected'; }
 }
@@ -89,8 +91,10 @@ export async function registerMcpClients(ctx, { adapter, remote, local, onUnavai
   let bridgeRead;
   let bridgeCache;
   // Local tools carry no account state, so a lost local process is simply started again.
+  let localRestarts = 0;
   const localRestart = createRetry(async () => {
     if (disposed || paused || connections.has('local')) return true;
+    localRestarts += 1;
     await mount('local', 'e-comet-local', local);
     return statuses.local === 'connected';
   }, { delays: retryDelaysMs });
@@ -127,8 +131,12 @@ export async function registerMcpClients(ctx, { adapter, remote, local, onUnavai
       if (kind === 'remote') client = await connectRemoteClient(options);
       else {
         client = new Client({ name: 'e-comet-deepseek-harness', version: PACKAGE_VERSION }, { capabilities: {} });
+        // A module started again learns the closed class of the failure before it and how often it was started again,
+        // so a bug report it prepares shows more than MCP_CALL_FAILED.
+        const restart = { ...(statuses.localFailure ? { ECOMET_HOST_LAST_FAILURE: statuses.localFailure.cause } : {}),
+          ...(localRestarts > 0 ? { ECOMET_HOST_RESTARTS: String(localRestarts) } : {}) };
         const transport = new StdioClientTransport({ ...options,
-          env: { ...scrubbedParentEnv(), ...options.env }, stderr: 'inherit' });
+          env: { ...scrubbedParentEnv(), ...options.env, ...restart }, stderr: 'inherit' });
         // On Windows the SDK's spawn falls back to a shell wrapper when the executable does not resolve, so a missing
         // executable surfaces as a transport error followed by a closed connection; keep the spawn code for the class.
         transport.onerror = error => { if (SPAWN_CODES.has(error?.code)) spawnError ??= error; };

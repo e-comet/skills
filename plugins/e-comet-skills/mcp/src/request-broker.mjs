@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { artifactFailureDetails } from './artifact-store.mjs';
 import { isOzonPackageNotStarted } from './ozon-report-package-result.mjs';
 import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
 
@@ -14,7 +15,7 @@ import {
 } from './config.mjs';
 import { isValidOzonPromotionOperation, isValidOzonSearchPositionsResult, isValidSellerOperation } from './extension-protocol.mjs';
 import { SELLER_OPERATION_STAGES } from './extension-vocabulary.mjs';
-import { OZON_PROMOTION_TERMINAL_CODE_STAGES, ToolExecutionError } from './tool-errors.mjs';
+import { OZON_PROMOTION_TERMINAL_CODE_STAGES, ToolExecutionError, artifactFailureMessage } from './tool-errors.mjs';
 import { StorageUnavailableError } from './storage-layout.mjs';
 import { isAllowedWbUrl, validTimeout } from './wb-domain.mjs';
 
@@ -27,14 +28,17 @@ const ozonPromotionError = (code, message) => {
     if (stage === undefined) throw new TypeError(`Unknown Ozon promotion terminal code: ${code}`);
     return new ToolExecutionError(code, message, stage, false);
 };
-const normalizeOzonPromotionError = (error, fallbackCode, fallbackMessage) =>
+const normalizeOzonPromotionError = (error, fallbackCode, fallbackMessage) => {
     // The consumer's own writer can fail before opening a stream. Preserve this local
     // diagnosis without adding storage errors to the extension terminal vocabulary.
-    error instanceof StorageUnavailableError || (error instanceof ToolExecutionError &&
-    OZON_PROMOTION_TERMINAL_CODE_STAGES[error.code] === error.stage &&
-    error.retryable === false)
-        ? error
-        : ozonPromotionError(fallbackCode, fallbackMessage);
+    if (error instanceof StorageUnavailableError || (error instanceof ToolExecutionError &&
+        OZON_PROMOTION_TERMINAL_CODE_STAGES[error.code] === error.stage && error.retryable === false)) return error;
+    // A rejected local workbook write keeps its closed class and filesystem code, never its text, and names its step.
+    const artifact = fallbackCode === 'ARTIFACT_REJECTED' ? artifactFailureDetails(error) : undefined;
+    const normalized = ozonPromotionError(fallbackCode, artifactFailureMessage(artifact) ?? fallbackMessage);
+    if (artifact) normalized.details = Object.freeze(artifact);
+    return normalized;
+};
 
 // Signed job type and items per package family. A result-only family has no create, phases or streams:
 // each item ends with one terminal result, which must also match the signed request.
@@ -107,6 +111,7 @@ export class RequestBroker {
     pendingOzonReportPackages = new Map();
     ozonReportReservation = null;
     activeAuthorizationScopes = new Map();
+    endedAuthorizationScopes = new Map();
     inFlightFetches = new Map();
 
     get activeRequestCount() {
@@ -596,14 +601,14 @@ export class RequestBroker {
             );
         }
         if (typeof authorizationScopeId !== 'string') {
-            return Promise.reject(this.#reauthorizationRequired());
+            return Promise.reject(this.#scopeEnded(authorizationScopeId));
         }
         const authorizationScope = this.activeAuthorizationScopes.get(authorizationScopeId);
         if (!authorizationScope || !this.#authorizationScopeIsActive(authorizationScopeId, authorizationScope)) {
-            return Promise.reject(this.#reauthorizationRequired());
+            return Promise.reject(this.#scopeEnded(authorizationScopeId));
         }
         if (authorizationScope.authorizationId !== authorizationId) {
-            return Promise.reject(this.#reauthorizationRequired());
+            return Promise.reject(this.#scopeEnded(authorizationScopeId));
         }
         const dedupeKey = `${authorizationScopeId}\n${authorizationId}\n${url}\n${timeout}`;
         const existing = this.inFlightFetches.get(dedupeKey);
@@ -673,6 +678,7 @@ export class RequestBroker {
                     jobType: authorization?.jobType,
                     job: authorization?.job,
                     expiresAtMs: Date.now() + authorizationScopeLifetimeMs,
+                    ceilingMs: this.#authorizationScopeCeiling(authorization),
                     isRouteActive: routeBinding.isActive,
                     releaseRoute: routeBinding.release,
                     expiryTimer: undefined,
@@ -737,7 +743,7 @@ export class RequestBroker {
                         };
                     })(),
                     isActive: () => this.#authorizationScopeIsActive(requestId, authorizationScope),
-                    release: () => this.#releaseAuthorizationScope(requestId, true),
+                    release: () => this.#releaseAuthorizationScope(requestId, true, 'released'),
                 };
             }
         );
@@ -764,7 +770,7 @@ export class RequestBroker {
     requestSellerOperation(operation, streamHandlers, timeout, authorizationId, authorizationScopeId) {
         const authorizationScope = this.activeAuthorizationScopes.get(authorizationScopeId);
         if (!authorizationScope || !this.#authorizationScopeIsActive(authorizationScopeId, authorizationScope)) {
-            return Promise.reject(this.#reauthorizationRequired());
+            return Promise.reject(this.#scopeEnded(authorizationScopeId));
         }
         if (authorizationScope.authorizationId !== authorizationId || !isValidSellerOperation(operation)) {
             return Promise.reject(
@@ -1202,19 +1208,23 @@ export class RequestBroker {
         });
     }
 
-    async #releaseAuthorizationScope(requestId, notifyRoute) {
+    async #releaseAuthorizationScope(requestId, notifyRoute, reason = undefined) {
         const authorizationScope = this.activeAuthorizationScopes.get(requestId);
         if (!authorizationScope) return false;
         this.activeAuthorizationScopes.delete(requestId);
         clearTimeout(authorizationScope.expiryTimer);
+        // Later calls through the same lease name the same cause; only the newest few ended scopes are kept.
+        this.endedAuthorizationScopes.set(requestId, { reason: authorizationScope.expired ? 'expired' : reason ?? 'route_changed',
+            ceilingMs: authorizationScope.ceilingMs });
+        if (this.endedAuthorizationScopes.size > 64) this.endedAuthorizationScopes.delete(this.endedAuthorizationScopes.keys().next().value);
         // Release must remove buyer correlations synchronously, before any asynchronous route cleanup.
         // Other scopes remain active; their requests must not inherit this operation's terminal cause.
         for (const [fetchRequestId, pending] of this.pendingRequests) {
-            if (pending.authorizationScopeId === requestId) this.rejectFetch(fetchRequestId, this.#reauthorizationRequired());
+            if (pending.authorizationScopeId === requestId) this.rejectFetch(fetchRequestId, this.#scopeEnded(requestId));
         }
         for (const [sellerRequestId, pending] of this.pendingSellerOperations) {
             if (pending.authorizationScopeId !== requestId) continue;
-            this.#cancelSellerOperation(sellerRequestId, pending, this.#reauthorizationRequired());
+            this.#cancelSellerOperation(sellerRequestId, pending, this.#scopeEnded(requestId));
         }
         for (const [ozonRequestId, pending] of this.pendingOzonPromotionOperations) {
             if (pending.authorizationScopeId !== requestId) continue;
@@ -1252,13 +1262,22 @@ export class RequestBroker {
         });
     }
 
-    #reauthorizationRequired() {
-        return new ToolExecutionError(
-            'BROWSER_JOB_REAUTHORIZATION_REQUIRED',
-            'Browser job authorization must be acquired again after the bridge connection changed.',
-            'authorization',
-            true
-        );
+    // Why a scope ended (spec 7.2): it expired, its bridge connection changed, or its job released it.
+    #reauthorizationRequired(reason = 'route_changed', ceilingMs = this.authorizationScopeMaxMs) {
+        const message = reason === 'expired'
+            ? 'Browser job authorization must be acquired again: it expired, and one authorization lasts at most ' +
+                `${Math.max(1, Math.round(ceilingMs / 60_000))} minutes. Split the remaining work into smaller jobs and request a new browser job for each.`
+            : reason === 'released'
+              ? 'Browser job authorization must be acquired again: this one was released when its job ended. Request a new browser job for further work.'
+              : 'Browser job authorization must be acquired again after the bridge connection changed. Request a new browser job for the remaining work.';
+        const error = new ToolExecutionError('BROWSER_JOB_REAUTHORIZATION_REQUIRED', message, 'authorization', true);
+        error.details = Object.freeze({ reason });
+        return error;
+    }
+
+    #scopeEnded(requestId) {
+        const ended = this.endedAuthorizationScopes.get(requestId);
+        return this.#reauthorizationRequired(ended?.reason, ended?.ceilingMs);
     }
 
     #take(collection, requestId) {

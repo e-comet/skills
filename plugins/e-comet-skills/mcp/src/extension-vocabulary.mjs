@@ -44,6 +44,10 @@ export const MESSAGE_TYPES = Object.freeze({
 export const localMessage = (id, type, payload) => ({ id, type, payload });
 
 export const DIAGNOSTIC_SNAPSHOT_CAPABILITY = 'diagnostic_snapshot_v1';
+// Version 2 adds tab readiness and a downloaded update; an extension without this capability refuses version 2.
+export const DIAGNOSTIC_SNAPSHOT_V2_CAPABILITY = 'diagnostic_snapshot_v2';
+// A downloaded extension update waiting to be applied, in version 2 snapshots (a plain Chrome version).
+export const PENDING_UPDATE_VERSION_PATTERN = /^\d{1,9}(\.\d{1,9}){0,3}$/;
 
 export const CLIENT_TO_EXTENSION_MESSAGE_TYPES = Object.freeze([
     MESSAGE_TYPES.browserJobAuthorize,
@@ -138,7 +142,7 @@ export const OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES = Object.freeze({
     OPERATION_CANCELLED: 'cancelled',
     OPERATION_DEADLINE_EXCEEDED: 'deadline',
 });
-export const EXTENSION_CAPABILITIES = Object.freeze(['wb_fetch', 'browser_job', 'seller_reviews', 'wb_filters_by_query@1', DIAGNOSTIC_SNAPSHOT_CAPABILITY]);
+export const EXTENSION_CAPABILITIES = Object.freeze(['wb_fetch', 'browser_job', 'seller_reviews', 'wb_filters_by_query@1', DIAGNOSTIC_SNAPSHOT_CAPABILITY, DIAGNOSTIC_SNAPSHOT_V2_CAPABILITY]);
 
 // Стадия операции продавца внутри payload'а `wb_fetch`. Расширение решает по ней,
 // какой admission применить, поэтому набор объявлен enum'ом SellerOperationStage в
@@ -182,6 +186,19 @@ export const RETRYABLE_FETCH_ERROR_CODES = Object.freeze([
 ]);
 
 export const UNCLASSIFIED_FETCH_ERROR_CODE = 'WB_FETCH_FAILED';
+
+// Optional closed evidence beside `code`/`error` in `wb_fetch_result.response` (contract `wbFetchResultFields`).
+// An older extension sends none of it; an unknown value is dropped, never shown.
+export const WB_FETCH_TIMEOUT_PHASES = Object.freeze(['no_tab', 'tab_loading', 'reload_backoff', 'reload_failed', 'not_sent', 'sent_no_answer']);
+export const SELLER_FAILURE_REASONS = Object.freeze({
+    SELLER_STATE_UNAVAILABLE: Object.freeze(['probe_cooling_down', 'restore_unresolved', 'storage_failed']),
+    SELLER_AUTH_UNAVAILABLE: Object.freeze(['access_token_missing', 'seller_token_missing', 'both_missing', 'header_too_long', 'reader_failed']),
+});
+export const SELLER_FAILURE_CLASSES = Object.freeze(['network', 'status', 'envelope', 'script']);
+export const WBAAS_RECOVERY_OUTCOMES = Object.freeze(['proactive_refresh_started', 'refreshed_and_retried', 'refresh_failed',
+    'service_unavailable', 'retry_skipped_aborted', 'retried_after_shared_refresh', 'page_throttled']);
+export const wbaasRecoveryOutcome = (value) =>
+    value !== null && typeof value === 'object' && WBAAS_RECOVERY_OUTCOMES.includes(value.outcome) ? value.outcome : undefined;
 
 // Numeric Ozon evidence is deliberately narrower than free-form diagnostic details.
 export const isOzonAnalyticsTerminalDetails = (code, value) => code === 'REPORT_TERMINAL_FAILURE' &&

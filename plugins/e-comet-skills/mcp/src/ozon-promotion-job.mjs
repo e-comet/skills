@@ -4,7 +4,7 @@ import { parsePromotionPeriods } from './ozon-report-package-domain.mjs';
 import { executeOzonReportPackage } from './ozon-report-package-job.mjs';
 import { ozonPackageDeadline } from './ozon-report-package-result.mjs';
 import { OZON_PROMOTION_OPERATION_MAX_MS } from './request-broker.mjs';
-import { safeOzonPromotionToolError, ToolExecutionError } from './tool-errors.mjs';
+import { ozonDescriptorRejected, safeOzonPromotionToolError, ToolExecutionError } from './tool-errors.mjs';
 import { StorageUnavailableError } from './storage-layout.mjs';
 
 const XLSX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
@@ -47,7 +47,7 @@ export const executeOzonPromotionJob = async ({
         if (authorization.jobType !== 'ozon_seller_promotion_report') throw new Error('Wrong Ozon promotion job type');
         assertOzonPromotionPeriodEqual({ dateFrom, dateTo }, authorization.job);
     } catch (error) {
-        throw authorizationRejected(error);
+        throw ozonDescriptorRejected(error) ?? authorizationRejected(error);
     }
     if (typeof requestOzonPromotionReport !== 'function' || typeof createArtifactWriter !== 'function') {
         throw authorizationRejected(new Error('Ozon promotion execution dependencies are unavailable'));
@@ -149,7 +149,7 @@ export const executeOzonPromotionPackageJob = async ({
             throw new Error('Ozon promotion package execution dependencies are unavailable');
         }
     } catch (error) {
-        throw authorizationRejected(error);
+        throw ozonDescriptorRejected(error) ?? authorizationRejected(error);
     }
     return executeOzonReportPackage({
         family: 'promotion',
@@ -166,7 +166,7 @@ export const executeOzonPromotionPackageJob = async ({
             }
             const safe = safeOzonPromotionToolError(error);
             return { code: safe.code, message: safe.message, stage: safe.stage, retryable: false,
-                ...(safe.code === 'OZON_EXECUTION_INTERRUPTED' && safe.details ? { details: safe.details } : {}) };
+                ...(['OZON_EXECUTION_INTERRUPTED', 'ARTIFACT_REJECTED'].includes(safe.code) && safe.details ? { details: safe.details } : {}) };
         },
     });
 };

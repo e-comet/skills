@@ -19,12 +19,18 @@ import {
     OZON_SEARCH_POSITIONS_CAPABILITY,
     OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES,
     RETRYABLE_FETCH_ERROR_CODES,
+    SELLER_FAILURE_CLASSES,
+    SELLER_FAILURE_REASONS,
     SELLER_OPERATION_STAGES,
     UNCLASSIFIED_FETCH_ERROR_CODE,
+    WB_FETCH_TIMEOUT_PHASES,
+    wbaasRecoveryOutcome,
+    DIAGNOSTIC_SNAPSHOT_V2_CAPABILITY,
+    PENDING_UPDATE_VERSION_PATTERN,
 } from './extension-vocabulary.mjs';
 import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
 import { isSearchPositionsSkuList, MAX_OZON_SEARCH_POSITIONS_TEXT_LENGTH } from './ozon-search-positions-domain.mjs';
-import { ToolExecutionError, parseBrowserJobRejection, safeExternalToolError, safeOzonPromotionToolError } from './tool-errors.mjs';
+import { ToolExecutionError, fetchFailureGuidance, parseBrowserJobRejection, safeExternalToolError, safeOzonPromotionToolError } from './tool-errors.mjs';
 
 const MAX_ID_LENGTH = 128;
 const MAX_STREAM_CHUNK_BYTES = 256 * 1024;
@@ -35,7 +41,17 @@ const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const MAX_SAFE_MESSAGE_LENGTH = 500;
 
 const isRecord = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-export const isDiagnosticSnapshot = (payload) =>
+const isTabReadiness = (value) => isRecord(value) && hasOnlyKeys(value, ['ready', 'lastPingAgeMs']) && typeof value.ready === 'boolean' &&
+    (value.lastPingAgeMs === undefined || isNonNegativeSafeInteger(value.lastPingAgeMs));
+// Version 2 is version 1 plus tab readiness and a downloaded update, served only behind diagnostic_snapshot_v2.
+export const isDiagnosticSnapshot = (payload) => {
+    if (!isRecord(payload) || payload.protocolVersion !== 2) return isDiagnosticSnapshotV1(payload);
+    const { tabs, pendingUpdateVersion, ...base } = payload;
+    return isRecord(tabs) && hasOnlyKeys(tabs, ['wb', 'wbSeller', 'ozon']) && ['wb', 'wbSeller', 'ozon'].every((key) => isTabReadiness(tabs[key])) &&
+        (pendingUpdateVersion === undefined || (typeof pendingUpdateVersion === 'string' && PENDING_UPDATE_VERSION_PATTERN.test(pendingUpdateVersion))) &&
+        isDiagnosticSnapshotV1({ ...base, protocolVersion: 1 });
+};
+const isDiagnosticSnapshotV1 = (payload) =>
     isRecord(payload) &&
     hasOnlyKeys(payload, ['protocolVersion', 'observedAt', 'extensionVersion', 'capabilities', 'activationIdentity', 'storageRead', 'ports']) &&
     Object.keys(payload).length === 7 && payload.protocolVersion === 1 &&
@@ -300,6 +316,20 @@ export const parseExtensionServerMessage = (value) => {
     return { ok: true, message: value };
 };
 
+// The closed evidence a `wb_fetch_result` failure may carry beside its code (contract `wbFetchResultFields`).
+export const fetchFailureDetails = (code, response) => {
+    const details = {};
+    if (code === 'WB_FETCH_TIMEOUT' && WB_FETCH_TIMEOUT_PHASES.includes(response.phase)) details.phase = response.phase;
+    if (SELLER_FAILURE_REASONS[code]?.includes(response.reason)) details.reason = response.reason;
+    if (SELLER_FAILURE_CLASSES.includes(response.class) && typeof response.wbRefused === 'boolean') {
+        Object.assign(details, { class: response.class, wbRefused: response.wbRefused });
+        if (Number.isSafeInteger(response.httpStatus) && response.httpStatus >= 100 && response.httpStatus <= 599) details.httpStatus = response.httpStatus;
+    }
+    const recovery = wbaasRecoveryOutcome(response.wbaasRecovery);
+    if (recovery) details.recovery = recovery;
+    return Object.keys(details).length ? Object.freeze(details) : undefined;
+};
+
 // The broker refused a frame this process sent, or the client refused one before writing it. Either way the request
 // cannot reach the extension, and the cause is ours, not the seller's.
 export const bridgeFrameRefusal = (refusalCode) => {
@@ -357,6 +387,7 @@ export const createExtensionProtocol = ({ connections, requestBroker, log, broad
             ozonSellerAnalyticsReportSupported: capabilities.includes(OZON_ANALYTICS_CAPABILITY),
             ozonSearchPositionsSupported: capabilities.includes(OZON_SEARCH_POSITIONS_CAPABILITY),
             diagnosticSnapshotSupported: capabilities.includes(DIAGNOSTIC_SNAPSHOT_CAPABILITY),
+            diagnosticSnapshotV2Supported: capabilities.includes(DIAGNOSTIC_SNAPSHOT_V2_CAPABILITY),
             version: typeof facts?.extensionVersion === 'string' ? facts.extensionVersion : undefined,
         });
         previous?.close();
@@ -547,15 +578,17 @@ export const createExtensionProtocol = ({ connections, requestBroker, log, broad
             const code = typeof payload.response.code === 'string' ? payload.response.code : UNCLASSIFIED_FETCH_ERROR_CODE;
             const authorizationFailure = AUTHORIZATION_FETCH_ERROR_CODES.includes(code);
             const retryable = RETRYABLE_FETCH_ERROR_CODES.includes(code);
+            const details = fetchFailureDetails(code, payload.response);
             const rejection = safeExternalToolError(
                 {
                     code,
-                    message: payload.response.error,
+                    message: fetchFailureGuidance(code, details) ?? payload.response.error,
                     stage: authorizationFailure ? 'authorization' : 'execution',
                     retryable,
                 },
                 'Wildberries request failed.'
             );
+            if (details) rejection.details = details;
             if (requestBroker.hasPendingSellerOperation(message.id)) requestBroker.rejectSellerOperation(message.id, rejection);
             else requestBroker.rejectFetch(message.id, rejection);
         } else if (requestBroker.hasPendingSellerOperation(message.id)) {

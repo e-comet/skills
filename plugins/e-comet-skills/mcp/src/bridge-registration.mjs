@@ -47,7 +47,7 @@ const POLICY_BROWSERS = [
 
 const execFileAsync = promisify(execFile);
 /** The `run` registration expects: asynchronous, hidden, killed after 5 s unless the caller grants more. */
-export const runBounded = (file, args, { timeout = 5000 } = {}) => execFileAsync(file, args, { timeout, windowsHide: true });
+export const runBounded = (file, args, { timeout = 5000, env = undefined } = {}) => execFileAsync(file, args, { timeout, windowsHide: true, ...(env ? { env } : {}) });
 // A cold Windows PowerShell can take over ten seconds to start on a loaded machine; the bound only stops a hang.
 const REGISTRY_WRITE_TIMEOUT_MS = 60_000;
 
@@ -62,11 +62,16 @@ const psLiteral = (value) => `'${value.replace(/['\u2018-\u201B]/g, (quote) => q
 // the current user's physical hive; reading it back through that same provider verifies what the browser can see.
 // Replies go through Write-Output: a script policy (App Control, AppLocker) runs this in ConstrainedLanguage, which
 // refuses [Console] calls after the key is already written. Accepted residual: "Registry provider unreachable".
+// The key is read before it is written, and the reply says how it was found (OK_SAME, OK_DIFFERENT, OK_MISSING): a
+// key that was missing or different means the browser could not have found the registration until now. A read that
+// fails counts as missing.
 const writeWindowsRegistration = async ({ env, run, key, manifestPath }) => {
     const script = [
         "$ErrorActionPreference='Stop'; $stage='CONNECT'; try {",
         "$provider=[wmiclass]'\\\\.\\root\\default:StdRegProv';",
         `$key=${psLiteral(key.slice('HKCU\\'.length))}; $value=${psLiteral(manifestPath)};`,
+        "$stage='READ'; $before=$provider.GetStringValue([uint32]2147483649,$key,'');",
+        "$previous=if ($before.ReturnValue -ne 0) { 'MISSING' } elseif ($before.sValue -ceq $value) { 'SAME' } else { 'DIFFERENT' };",
         "$stage='CREATE'; $created=$provider.CreateKey([uint32]2147483649,$key);",
         'if ($created.ReturnValue -ne 0) { Write-Output "WMI_CREATE_$($created.ReturnValue)"; return };',
         "$stage='WRITE'; $written=$provider.SetStringValue([uint32]2147483649,$key,'',$value);",
@@ -74,7 +79,7 @@ const writeWindowsRegistration = async ({ env, run, key, manifestPath }) => {
         "$stage='READ'; $read=$provider.GetStringValue([uint32]2147483649,$key,'');",
         'if ($read.ReturnValue -ne 0) { Write-Output "WMI_READ_$($read.ReturnValue)"; return };',
         "if ($read.sValue -cne $value) { Write-Output 'WMI_VERIFY_MISMATCH'; return };",
-        "Write-Output 'OK'",
+        'Write-Output "OK_$previous"',
         // PowerShell wraps the provider's failure, and every wrapper reports 80131501: the innermost exception's ErrorCode
         // (a ManagementException's WMI status) or HResult is the cause. Property reads only, because ConstrainedLanguage
         // refuses method calls such as GetBaseException(). Unsigned hex, as HRESULTs are read; a negative decimal's
@@ -86,11 +91,13 @@ const writeWindowsRegistration = async ({ env, run, key, manifestPath }) => {
     const { stdout } = await run(system32(env, 'WindowsPowerShell\\v1.0\\powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', script],
         { timeout: REGISTRY_WRITE_TIMEOUT_MS });
     const reply = stdout.replace(/^\uFEFF/, '').trim();
-    if (reply !== 'OK') {
+    const found = /^OK_(SAME|DIFFERENT|MISSING)$/.exec(reply);
+    if (!found) {
         const code = /^(?:WMI_(?:CONNECT|CREATE|WRITE|READ)_(?:\d+|HRESULT_[0-9A-F]{8})|WMI_VERIFY_MISMATCH)$/.test(reply)
             ? reply : 'REGISTRY_PROVIDER_INVALID_REPLY';
         throw Object.assign(new Error('Native host registration was not verified'), { code });
     }
+    return { previous: /** @type {'same' | 'different' | 'missing'} */ (found[1].toLowerCase()) };
 };
 // Anything but a clear "not there" counts as present, so a guarded folder is attempted and reported, not skipped.
 const exists = (fs, path) => fs.stat(path).then(() => true, (error) => !['ENOENT', 'ENOTDIR'].includes(error?.code));
@@ -201,6 +208,29 @@ const launcherRuntime = (text) => {
     return shell ? shell[1].replaceAll("'\\''", "'") : null;
 };
 
+/**
+ * Whether the runtime a launcher records still runs as Node 22 or newer: `-v`, started the way the launcher starts it
+ * (with ELECTRON_RUN_AS_NODE when it sets it), through the bounded `run`. Only a repair asks, so an ordinary start and a
+ * healthy tool call start no extra process. `env` is the environment the variable is added to.
+ * True when it answers v22 or newer; false when it is missing (ENOENT) or answers an older version; null when the answer
+ * proves nothing: the launcher is shared, so it may name another host's packaged executable this process may not start
+ * (EACCES, EPERM), and a timeout, an exit code or an answer that is no version say nothing about the browser's start.
+ * @returns {Promise<boolean | null>}
+ */
+export async function runtimeRuns({ run, launcherText, platform, env = process.env }) {
+    const runtime = launcherRuntime(launcherText);
+    if (runtime === null) return false;
+    const electron = new RegExp(`^${platform === 'win32' ? 'set "ELECTRON_RUN_AS_NODE=1"' : 'export ELECTRON_RUN_AS_NODE=1'}\\r?$`, 'm').test(launcherText);
+    let stdout;
+    try {
+        ({ stdout } = await (electron ? run(runtime, ['-v'], { env: { ...env, ELECTRON_RUN_AS_NODE: '1' } }) : run(runtime, ['-v'])));
+    } catch (error) {
+        return error?.code === 'ENOENT' ? false : null;
+    }
+    const major = Number(/^v(\d+)\./.exec(String(stdout).trim())?.[1]);
+    return Number.isInteger(major) ? major >= MIN_NODE_MAJOR : null;
+}
+
 const renameWithRetry = async (fs, from, to, settled = async () => false) => {
     const deadline = Date.now() + RENAME_RETRY_LIMIT_MS;
     for (;;) {
@@ -306,11 +336,6 @@ const readRegistered = async (fs, bridgeDir, manifestPath) => {
     }
 };
 
-const launcherUsable = async (fs, launcherPath) => {
-    const runtime = launcherRuntime(await fs.readFile(launcherPath, 'utf8').catch(() => ''));
-    return runtime !== null && (await exists(fs, runtime));
-};
-
 // Prunes an old version directory only when it is older than the registered version, so a newer one another process
 // has just staged survives, is not this process's own, and was last modified over a minute ago. A staging directory
 // is pruned once it is an hour old. A directory a running broker holds on Windows refuses removal; the next
@@ -338,13 +363,19 @@ const prune = async ({ fs, bridgeDir, keep, registeredVersion, now }) => {
 /**
  * Makes sure the browsers can start the broker. Idempotent and safe to run from several processes at once.
  * deps = { platform, env, stateDir, srcDir, hostName, allowedOrigin, version, execPath, home?, now, fs, run, log }
+ * `verifiedSinceMs` is since when the registration the browser reads has stayed unchanged: the newest of the manifest
+ * and launcher modification times and, on Windows, the time the key was last found missing or different. A repair also
+ * checks that the launcher's runtime still runs (`runtimeRecheck`) and re-points a launcher whose runtime is proven gone
+ * or too old to another runtime: `repaired`; `failed` when no other runtime exists, `inconclusive` when the check proves
+ * nothing, and the launcher is left as it is in both.
  * @returns {Promise<{ state: 'registered' | 'current' | 'disabled' | 'failed' | 'denied', version: string,
- *   runtime: 'path_node' | 'host_executable' | null, manifestWrittenAtMs: number | null,
- *   error: { name: string, code: string | null } | null }>}
+ *   runtime: 'path_node' | 'host_executable' | null, manifestWrittenAtMs: number | null, verifiedSinceMs: number | null,
+ *   runtimeRecheck: 'not_run' | 'passed' | 'repaired' | 'failed' | 'inconclusive', error: { name: string, code: string | null } | null }>}
  */
 export async function ensureRegistration(deps) {
     const { platform, env, stateDir, srcDir, hostName, allowedOrigin, version, execPath, now, fs, run, log } = deps;
-    const result = (state, fields = {}) => ({ state, version, runtime: null, manifestWrittenAtMs: null, error: null, ...fields });
+    const result = (state, fields = {}) => ({ state, version, runtime: null, manifestWrittenAtMs: null, verifiedSinceMs: null,
+        runtimeRecheck: /** @type {'not_run' | 'passed' | 'repaired' | 'failed' | 'inconclusive'} */ ('not_run'), error: null, ...fields });
     const target = resolveRegistrationTarget({ env, platform, hostName, home: deps.home ?? resolveAccountHome() });
     if (!target) return result('disabled');
     let step = 'Staging';
@@ -416,13 +447,27 @@ export async function ensureRegistration(deps) {
         const dirStamp = takeOver ? stamp : registered.stamp;
         const launcherPath = join(dir, platform === 'win32' ? 'broker.cmd' : 'broker.sh');
         let wrote = false;
-        if (takeOver || !(await launcherUsable(fs, launcherPath))) {
+        const launcherText = await fs.readFile(launcherPath, 'utf8').catch(() => '');
+        const recorded = launcherRuntime(launcherText);
+        let rewrite = takeOver || recorded === null || !(await exists(fs, recorded));
+        const renderLauncher = (/** @type {{ path: string, electronRunAsNode: boolean }} */ chosen) => (platform === 'win32'
+            ? renderWindowsLauncher({ runtimePath: chosen.path, electronRunAsNode: chosen.electronRunAsNode })
+            : renderPosixLauncher({ runtimePath: chosen.path, electronRunAsNode: chosen.electronRunAsNode }));
+        // A runtime that is still there can be one that no longer runs (a downgraded Node): a repair asks it, unless this
+        // pass has just asked the same PATH node while resolving the runtime. Only a runtime proven gone or too old is
+        // replaced, and only by a launcher that differs: the launcher is shared, and a check that proves nothing (another
+        // host's packaged executable, a timeout) leaves it as it is.
+        /** @type {'not_run' | 'passed' | 'repaired' | 'failed' | 'inconclusive'} */
+        let runtimeRecheck = 'not_run';
+        if (!rewrite && deps.repair) {
+            const runs = runtime?.source === 'path_node' && runtime.path === recorded ? true : await runtimeRuns({ run, launcherText, platform, env });
+            rewrite = runs === false && runtime !== null && renderLauncher(runtime) !== launcherText;
+            runtimeRecheck = runs === null ? 'inconclusive' : runs ? 'passed' : rewrite ? 'repaired' : 'failed';
+        }
+        if (rewrite) {
             step = 'LauncherWrite';
             if (!runtime) throw Object.assign(new Error('No runtime for the broker'), { code: 'RUNTIME_NOT_FOUND' });
-            const launcher = platform === 'win32'
-                ? renderWindowsLauncher({ runtimePath: runtime.path, electronRunAsNode: runtime.electronRunAsNode })
-                : renderPosixLauncher({ runtimePath: runtime.path, electronRunAsNode: runtime.electronRunAsNode });
-            await writeAtomically(fs, launcherPath, launcher, platform === 'win32' ? undefined : 0o755);
+            await writeAtomically(fs, launcherPath, renderLauncher(runtime), platform === 'win32' ? undefined : 0o755);
             wrote = true;
         }
 
@@ -450,17 +495,29 @@ export async function ensureRegistration(deps) {
                 if (!denied || (platform === 'darwin' && error.code === 'EPERM')) denied = failure(step, error);
             }
         }
+        let keyVerifiedSinceMs = null;
         if (target.key) {
             step = 'RegistryWrite';
             // The key names a manifest path that does not change, so a verified write is remembered and an ordinary start
             // starts no PowerShell. A repair, a tool call that found no broker, writes it anyway: a key removed since is
             // restored when it is needed. Accepted residual: "A restored Windows key is found on the next call".
+            // The stamp also keeps since when the key has been found as written; only the key and value decide a write.
+            // Accepted residual "Released plugins rewrite the registry stamp".
             const registryStamp = join(bridgeDir, 'registry.json');
-            const wanted = JSON.stringify({ key: target.key, value: manifestPaths[0] });
-            if (deps.repair || (await fs.readFile(registryStamp, 'utf8').catch(() => null)) !== wanted) {
-                await writeWindowsRegistration({ env, run, key: target.key, manifestPath: manifestPaths[0] });
-                // A stamp that cannot be written only means the next start verifies the key again.
-                await writeAtomically(fs, registryStamp, wanted).catch(() => undefined);
+            const stamp = await fs.readFile(registryStamp, 'utf8').then(JSON.parse).catch(() => null);
+            const matches = stamp?.key === target.key && stamp?.value === manifestPaths[0];
+            keyVerifiedSinceMs = matches && Number.isFinite(stamp.verifiedSinceMs) ? stamp.verifiedSinceMs : null;
+            if (deps.repair || !matches) {
+                const { previous } = await writeWindowsRegistration({ env, run, key: target.key, manifestPath: manifestPaths[0] });
+                // Only a pass that changed the time writes the stamp: one that found the key as written would put back the
+                // time it read before, over a newer one another process's repair wrote meanwhile.
+                // Accepted residual "Two processes each run a repair": docs/local-agent-architecture.md#accepted-residuals.
+                if (previous !== 'same' || keyVerifiedSinceMs === null) {
+                    keyVerifiedSinceMs = now();
+                    // A stamp that cannot be written only means the next start verifies the key again.
+                    await writeAtomically(fs, registryStamp, JSON.stringify({ key: target.key, value: manifestPaths[0], verifiedSinceMs: keyVerifiedSinceMs }))
+                        .catch(() => undefined);
+                }
             }
         }
 
@@ -469,6 +526,7 @@ export async function ensureRegistration(deps) {
         if (!denied) await prune({ fs, bridgeDir, keep: [ownDir, dir], registeredVersion: dirStamp.version, now });
         const mtimes = await Promise.all(manifestPaths.map((path) => fs.stat(path).then((info) => info.mtimeMs, () => null)));
         const written = mtimes.filter((mtime) => mtime !== null);
+        const changes = [...written, await fs.stat(launcherPath).then((info) => info.mtimeMs, () => null), keyVerifiedSinceMs].filter((at) => at !== null);
         // Only macOS's per-app folder guard has a step for the user (System Settings). Any other refusal fails the
         // registration only when no browser folder took the manifest: a failed registration is the cause of every
         // missing broker, and a seller whose own browser is registered must still hear that it is closed. The refusal
@@ -478,6 +536,8 @@ export async function ensureRegistration(deps) {
         return result(refused || (wrote ? 'registered' : 'current'), {
             runtime: runtime?.source ?? null,
             manifestWrittenAtMs: written.length > 0 ? Math.max(...written) : null,
+            verifiedSinceMs: changes.length > 0 ? Math.max(...changes) : null,
+            runtimeRecheck,
             error: denied,
         });
     } catch (error) {
@@ -493,8 +553,11 @@ export const repairRegistration = (deps) => ensureRegistration({ ...deps, repair
 
 // The three policies that decide whether a browser may start our host, each null when unset or unreadable: whether
 // NativeMessagingUserLevelHosts allows hosts registered per user, and the NativeMessagingBlocklist and
-// NativeMessagingAllowlist host names.
-const UNSET = Object.freeze({ allowed: null, blocklist: null, allowlist: null });
+// NativeMessagingAllowlist host names. `failed` marks a read that observed nothing, which is not "no policy".
+const UNSET = Object.freeze({ allowed: null, blocklist: null, allowlist: null, failed: false });
+// reg.exe and plutil exit 1 for a key or file that does not exist, whatever the system language; a timeout, a tool
+// that cannot start or any other exit is a read that failed.
+const readFailed = (error) => error?.code !== 1;
 const hostList = (value) => (Array.isArray(value) ? value.filter((item) => typeof item === 'string') : null);
 
 // One `reg query <key> /s` per root prints the vendor key and every subkey under its full root name. Only the vendor
@@ -504,12 +567,13 @@ const REGISTRY_ROOTS = { HKLM: 'HKEY_LOCAL_MACHINE', HKCU: 'HKEY_CURRENT_USER' }
 const readWindowsPolicy = async ({ run, env, vendor }) => {
     if (!vendor) return UNSET;
     const query = async (root) => {
-        const found = { allowed: null, blocklist: null, allowlist: null };
+        const found = { allowed: null, blocklist: null, allowlist: null, failed: false };
         let stdout;
         try {
             ({ stdout } = await run(system32(env, 'reg.exe'), ['query', `${root}\\Software\\Policies\\${vendor}`, '/s']));
-        } catch {
-            // A missing key exits non-zero with its "unable to find" text; a timeout or any other failure observes nothing.
+        } catch (error) {
+            // A missing key exits 1 with its localized "unable to find" text; a timeout or any other failure observes nothing.
+            found.failed = readFailed(error);
             return found;
         }
         const key = `${REGISTRY_ROOTS[root]}\\Software\\Policies\\${vendor}`.toLowerCase();
@@ -533,29 +597,38 @@ const readWindowsPolicy = async ({ run, env, vendor }) => {
     };
     const [machine, user] = await Promise.all([query('HKLM'), query('HKCU')]);
     // Machine policy wins over user policy, per policy.
-    return { allowed: machine.allowed ?? user.allowed, blocklist: machine.blocklist ?? user.blocklist, allowlist: machine.allowlist ?? user.allowlist };
+    return { allowed: machine.allowed ?? user.allowed, blocklist: machine.blocklist ?? user.blocklist, allowlist: machine.allowlist ?? user.allowlist,
+        failed: machine.failed || user.failed };
 };
 
 // Each policy is taken from the first plist that sets it, the user's before the computer's.
 const readMacPolicy = async ({ run, user, bundle }) => {
     const plists = [`/Library/Managed Preferences/${user}/${bundle}.plist`, `/Library/Managed Preferences/${bundle}.plist`];
+    let failed = false;
     const first = async (name, format, parse) => {
         for (const plist of plists) {
+            let stdout;
             try {
-                const value = parse((await run('/usr/bin/plutil', ['-extract', name, format, '-o', '-', plist])).stdout.trim());
+                ({ stdout } = await run('/usr/bin/plutil', ['-extract', name, format, '-o', '-', plist]));
+            } catch (error) {
+                // Absent here: the next location decides.
+                failed ||= readFailed(error);
+                continue;
+            }
+            try {
+                const value = parse(stdout.trim());
                 if (value !== null) return value;
             } catch {
-                // Absent here, or no value of its kind: the next location decides.
+                // No value of its kind: the next location decides.
             }
         }
         return null;
     };
     const flag = (value) => (value === 'true' || value === '1' ? true : value === 'false' || value === '0' ? false : null);
-    return {
-        allowed: await first('NativeMessagingUserLevelHosts', 'raw', flag),
-        blocklist: await first('NativeMessagingBlocklist', 'json', (value) => hostList(JSON.parse(value))),
-        allowlist: await first('NativeMessagingAllowlist', 'json', (value) => hostList(JSON.parse(value))),
-    };
+    const allowed = await first('NativeMessagingUserLevelHosts', 'raw', flag);
+    const blocklist = await first('NativeMessagingBlocklist', 'json', (value) => hostList(JSON.parse(value)));
+    const allowlist = await first('NativeMessagingAllowlist', 'json', (value) => hostList(JSON.parse(value)));
+    return { allowed, blocklist, allowlist, failed };
 };
 
 // Every JSON file in the folder is a source; a false anywhere wins, because then the browser may ignore user hosts, and
@@ -580,7 +653,9 @@ const readLinuxPolicy = async ({ dir, fs }) => {
         const lists = policies.map((policy) => hostList(policy?.[name])).filter((list) => list !== null);
         return lists.length === 0 ? null : lists.flat();
     };
-    return { allowed: values.length === 0 ? null : !values.includes(false), blocklist: merged('NativeMessagingBlocklist'), allowlist: merged('NativeMessagingAllowlist') };
+    // A file this user cannot read is one the browser, running as the same user, cannot read either: no read failure.
+    return { allowed: values.length === 0 ? null : !values.includes(false), blocklist: merged('NativeMessagingBlocklist'), allowlist: merged('NativeMessagingAllowlist'),
+        failed: false };
 };
 
 // Chromium MessageService::IsNativeMessagingHostAllowed: a block list holding "*" or the host blocks it unless the
@@ -601,6 +676,7 @@ const accountName = () => {
 /**
  * Per browser, whether its NativeMessagingUserLevelHosts policy allows user-level hosts (`allowed`) and whether its
  * NativeMessagingBlocklist and NativeMessagingAllowlist block `hostName` (`hostBlocked`): true, false or null (unset).
+ * `readFailed: true` when a read observed nothing (a timeout, a tool that did not start), so a null there is unknown.
  */
 export async function readUserLevelHostsPolicy({ platform, run, env = process.env, user = accountName(), fs = { readdir, readFile },
     hostName = NATIVE_HOST_NAME }) {
@@ -609,6 +685,6 @@ export async function readUserLevelHostsPolicy({ platform, run, env = process.en
             ? await readWindowsPolicy({ run, env, vendor })
             : platform === 'darwin' ? (user ? await readMacPolicy({ run, user, bundle }) : UNSET)
                 : platform === 'linux' && linux ? await readLinuxPolicy({ dir: linux, fs }) : UNSET;
-        return { browser, allowed: policy.allowed, hostBlocked: blocksHost(policy, hostName) };
+        return { browser, allowed: policy.allowed, hostBlocked: blocksHost(policy, hostName), ...(policy.failed ? { readFailed: true } : {}) };
     }));
 }

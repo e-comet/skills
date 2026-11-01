@@ -2,7 +2,7 @@ import { request as httpsRequest } from 'node:https';
 import { validateHeaderValue } from 'node:http';
 import { recordFeedbackHttpStatus, withFeedbackOperation } from './feedback-diagnostics.mjs';
 
-import { FEEDBACK_CLOUD_UPLOAD_DESTINATIONS, FEEDBACK_MAX_BYTES } from './config.mjs';
+import { FEEDBACK_MAX_BYTES, FEEDBACK_UPLOAD_DESTINATIONS } from './config.mjs';
 
 const MAX_UPLOAD_URL_BYTES = 8 * 1024;
 const MAX_REQUIRED_HEADERS = 32;
@@ -27,11 +27,11 @@ const rejected = (status) => {
     return error;
 };
 const uncertain = (cause = undefined) => new FeedbackUploadError('UPLOAD_UNCERTAIN', 'The feedback archive upload outcome is uncertain.', cause);
+const timeout = () => Object.assign(new Error('Feedback upload deadline elapsed.'), { code: 'ETIMEDOUT', feedbackReason: 'network_timeout' });
 const destinationRefused = (cause = undefined) => Object.assign(
     new FeedbackUploadError('UPLOAD_DESTINATION_REFUSED', 'The feedback upload destination is not an e-Comet storage location.', cause),
     { feedbackReason: 'destination_refused' },
 );
-const timeout = () => Object.assign(new Error('Feedback upload deadline elapsed.'), { code: 'ETIMEDOUT', feedbackReason: 'network_timeout' });
 
 /**
  * Pins a signed upload URL to e-Comet storage. Exact hostname, default port, https, no credentials, no fragment,
@@ -47,14 +47,16 @@ const timeout = () => Object.assign(new Error('Feedback upload deadline elapsed.
  * @param {Record<string, string>} requiredHeaders
  * @returns {URL}
  */
-export const assertUploadDestination = (uploadUrl, destinations = FEEDBACK_CLOUD_UPLOAD_DESTINATIONS, requiredHeaders = {}) => {
+export const assertUploadDestination = (uploadUrl, destinations = FEEDBACK_UPLOAD_DESTINATIONS, requiredHeaders = {}) => {
     let target;
     try { target = new URL(uploadUrl); } catch (error) { throw destinationRefused(error); }
     if (target.protocol !== 'https:' || target.port !== '' || target.username || target.password || target.hash) throw destinationRefused();
     const allowed = destinations.some(({ hostname, pathPrefix }) => target.hostname === hostname && target.pathname.startsWith(pathPrefix));
-    if (!allowed) throw destinationRefused();
+    // An escaped separator would leave the bucket only where something on the way decodes it; refuse it rather than
+    // rely on the storage proxy forwarding the raw path.
+    if (!allowed || /%2f|%5c/i.test(target.pathname)) throw destinationRefused();
     // S3 virtual-host addressing selects the bucket from Host, even when the connection URL is pinned.
-    // The unsigned cloud transport must not replace that authority through its required headers.
+    // A grant no hook signed must not replace that authority through its required headers.
     if (Object.entries(requiredHeaders).some(([name, value]) => name.toLowerCase() === 'host' && value.toLowerCase() !== target.host)) {
         throw destinationRefused();
     }
@@ -111,11 +113,11 @@ const assertGrant = ({ uploadUrl, requiredHeaders, expiresAt, bytes }, now, maxB
 /**
  * Sends one immutable feedback archive to one signed S3-compatible HTTPS URL.
  * @param {{ uploadUrl?: string, requiredHeaders?: Record<string, string>, expiresAt?: number, bytes?: Buffer }} grant
- * @param {{ requestImpl?: typeof httpsRequest, now?: () => number, timeoutMs?: number, maxBytes?: number, acceptedStatuses?: ReadonlyArray<number>, setTimeoutImpl?: (callback: () => void, milliseconds: number) => unknown, clearTimeoutImpl?: (timer: unknown) => void }} options
+ * @param {{ requestImpl?: typeof httpsRequest, now?: () => number, timeoutMs?: number, maxBytes?: number, setTimeoutImpl?: (callback: () => void, milliseconds: number) => unknown, clearTimeoutImpl?: (timer: unknown) => void }} options
  */
 export const putFeedbackArchive = async (grant, options = {}) => {
-    const { requestImpl = httpsRequest, now = Date.now, timeoutMs = DEFAULT_UPLOAD_TIMEOUT_MS, maxBytes = FEEDBACK_MAX_BYTES, acceptedStatuses = [200, 201, 204], setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout } = options;
-    if (typeof requestImpl !== 'function' || typeof now !== 'function' || typeof setTimeoutImpl !== 'function' || typeof clearTimeoutImpl !== 'function' || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_UPLOAD_TIMEOUT_MS || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > FEEDBACK_MAX_BYTES || !Array.isArray(acceptedStatuses) || !acceptedStatuses.length || acceptedStatuses.some((status) => !Number.isInteger(status) || status < 100 || status > 599)) {
+    const { requestImpl = httpsRequest, now = Date.now, timeoutMs = DEFAULT_UPLOAD_TIMEOUT_MS, maxBytes = FEEDBACK_MAX_BYTES, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout } = options;
+    if (typeof requestImpl !== 'function' || typeof now !== 'function' || typeof setTimeoutImpl !== 'function' || typeof clearTimeoutImpl !== 'function' || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_UPLOAD_TIMEOUT_MS || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > FEEDBACK_MAX_BYTES) {
         throw grantInvalid();
     }
     let validated;
@@ -157,7 +159,7 @@ export const putFeedbackArchive = async (grant, options = {}) => {
                     response.resume?.();
                     if (!Number.isInteger(response.statusCode) || response.statusCode < 100 || response.statusCode > 599) {
                         finish(reject, uncertain());
-                    } else if (acceptedStatuses.includes(response.statusCode)) {
+                    } else if ([200, 201, 204].includes(response.statusCode)) {
                         finish(resolve, { status: 'uploaded' });
                     } else {
                         finish(reject, rejected(response.statusCode));

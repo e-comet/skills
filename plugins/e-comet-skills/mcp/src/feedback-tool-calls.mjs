@@ -14,16 +14,28 @@ const FEEDBACK_TOOL_SUFFIXES = new Set([
     'submit_e_comet_feedback',
 ]);
 // A result is read only for its closed outcome fields, never copied: `ok`, `status`, and a `code`,
-// `stage` and `cause` either at the top level of a failure envelope or nested under `error`, all in these
-// identifier grammars; any other value stays out, and prose is never parsed. The grammars describe our own
-// envelopes, so only our own tools are read for them. Another server's result can still say the call
-// failed through `ok` and the host's own flag, but a value this server never defined is not ours to put
-// in a support archive.
+// `stage` and `cause` either at the top level of a failure envelope or nested under `error`, the nested
+// causes the error's `details` carry, a package's `stopReason` and the first failed item's `code` and
+// `stage`, all in these identifier grammars; any other value stays out, and prose is never parsed. The
+// grammars describe our own envelopes, so only our own tools are read for them. Another server's result
+// can still say the call failed through `ok` and the host's own flag, but a value this server never
+// defined is not ours to put in a support archive.
 const OUTCOME_LOWER = /^[a-z][a-z_]{1,31}$/;
 // The native cause classes include `http_4xx` and `http_5xx`, so the cause grammar admits digits.
 const OUTCOME_CAUSE = /^[a-z][a-z0-9_]{1,31}$/;
 const OUTCOME_CODE = /^[A-Z][A-Z0-9_]{2,63}$/;
-const OUTCOME_KEYS = new Set(['ok', 'status', 'code', 'stage', 'cause', 'isError']);
+const OUTCOME_GRAMMARS = Object.freeze({
+    status: OUTCOME_LOWER, code: OUTCOME_CODE, stage: OUTCOME_LOWER, cause: OUTCOME_CAUSE, reason: OUTCOME_CAUSE,
+    bridgeCode: OUTCOME_CODE, refusalCode: OUTCOME_CODE, systemCode: OUTCOME_CODE, stopReason: OUTCOME_LOWER,
+    itemCode: OUTCOME_CODE, itemStage: OUTCOME_LOWER,
+});
+const OUTCOME_KEYS = new Set(['ok', 'isError', 'marketplaceErrorCode', ...Object.keys(OUTCOME_GRAMMARS)]);
+// The collections a package result lists its items in; the first failed item explains a stopped package.
+const ITEM_COLLECTIONS = Object.freeze(['exports', 'periods', 'reports', 'queries', 'articles', 'products', 'items']);
+// The requests a buyer item keeps beneath it: search and recommendation pages, product-card units.
+const NESTED_ITEMS = Object.freeze(['pages', 'units']);
+// Ozon's numeric error code, a signed 32-bit integer.
+const int32 = (value) => (Number.isSafeInteger(value) && value >= -2147483648 && value <= 2147483647 ? value : undefined);
 // Bounded parse of one result text: a marketplace result can be large, and one absurd tool output must
 // not stall the single-threaded server while it looks for five small fields. Beyond this, only the
 // host's own error flag is kept.
@@ -62,7 +74,7 @@ export const REMOTE_E_COMET_TOOL_NAMES = Object.freeze([
     'campaign_journal', 'product_journal', 'account_journal', 'search_positions', 'recom_positions',
     'org_balance_history', 'campaign_budget', 'campaign_budget_history',
 ]);
-const REMOTE_TOOL_NAME = new RegExp(`^mcp__(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|e-comet)__(?:${REMOTE_E_COMET_TOOL_NAMES.join('|')})$`);
+const REMOTE_TOOL_NAME = new RegExp(`^mcp__(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|e-comet|plugin_e-comet-skills_e-comet|(?:claude_ai_)?https_mcp_e-comet_io_mcp)__(?:${REMOTE_E_COMET_TOOL_NAMES.join('|')})$`);
 
 const toolSuffix = (name) => name.split('__').at(-1);
 
@@ -85,10 +97,8 @@ export const isFeedbackToolOutcome = (value) => {
     const keys = Object.keys(value);
     if (keys.length === 0 || keys.some((key) => !OUTCOME_KEYS.has(key))) return false;
     return (value.ok === undefined || typeof value.ok === 'boolean')
-        && (value.status === undefined || (typeof value.status === 'string' && OUTCOME_LOWER.test(value.status)))
-        && (value.code === undefined || (typeof value.code === 'string' && OUTCOME_CODE.test(value.code)))
-        && (value.stage === undefined || (typeof value.stage === 'string' && OUTCOME_LOWER.test(value.stage)))
-        && (value.cause === undefined || (typeof value.cause === 'string' && OUTCOME_CAUSE.test(value.cause)))
+        && Object.entries(OUTCOME_GRAMMARS).every(([key, grammar]) => value[key] === undefined || (typeof value[key] === 'string' && grammar.test(value[key])))
+        && (value.marketplaceErrorCode === undefined || int32(value.marketplaceErrorCode) !== undefined)
         && (value.isError === undefined || value.isError === true);
 };
 
@@ -129,11 +139,45 @@ const unwrapEnvelope = (value) => {
 };
 
 const closedField = (candidate, grammar) => (typeof candidate === 'string' && grammar.test(candidate) ? candidate : undefined);
+// A failure's closed cause: a named reason, else the phase a WB timeout stopped in.
+const causeOf = (details) => closedField(details?.reason, OUTCOME_CAUSE) ?? closedField(details?.phase, OUTCOME_CAUSE);
+// An item's failure: its `error` object, or the `errorDetails` a buyer page or unit keeps beside its string `error`.
+const failureOf = (entry) => (isObject(entry) ? [entry.error, entry.errorDetails].find((failure) => isObject(failure) && closedField(failure.code, OUTCOME_CODE)) : undefined);
+
+/**
+ * The closed outcome fields of one of our own results, each in its grammar or absent: the top-level fields, the nested
+ * causes under the error's `details` (a rejection's reason included), a package's `stopReason`, and the code, stage and
+ * cause of the first failed item, buyer page or product-card unit. The operation receipt reads the same fields.
+ * @param {Record<string, any>} value
+ */
+export const closedOutcomeFields = (value) => {
+    const error = isObject(value.error) ? value.error : undefined;
+    const details = isObject(error?.details) ? error.details : isObject(value.details) ? value.details : undefined;
+    const item = ITEM_COLLECTIONS.flatMap((key) => (Array.isArray(value[key]) ? value[key] : []))
+        .flatMap((entry) => [entry, ...NESTED_ITEMS.flatMap((key) => (isObject(entry) && Array.isArray(entry[key]) ? entry[key] : []))])
+        .map(failureOf).find(Boolean);
+    const fields = {
+        status: closedField(value.status, OUTCOME_LOWER),
+        code: closedField(value.code, OUTCOME_CODE) ?? closedField(error?.code, OUTCOME_CODE),
+        stage: closedField(value.stage, OUTCOME_LOWER) ?? closedField(error?.stage, OUTCOME_LOWER),
+        // The native DeepSeek adapter classifies a failed call (network, timeout, http_4xx, http_5xx, protocol, unknown).
+        cause: closedField(value.cause, OUTCOME_CAUSE) ?? closedField(error?.cause, OUTCOME_CAUSE),
+        reason: causeOf(details) ?? closedField(details?.browserJobRejection?.reason, OUTCOME_CAUSE) ?? causeOf(isObject(item?.details) ? item.details : item),
+        bridgeCode: closedField(details?.bridgeCode, OUTCOME_CODE),
+        refusalCode: closedField(details?.refusalCode, OUTCOME_CODE),
+        systemCode: closedField(details?.systemCode, OUTCOME_CODE),
+        marketplaceErrorCode: int32(details?.marketplaceErrorCode),
+        stopReason: closedField(value.stopReason, OUTCOME_LOWER),
+        itemCode: closedField(item?.code, OUTCOME_CODE),
+        itemStage: closedField(item?.stage, OUTCOME_LOWER),
+    };
+    return Object.fromEntries(Object.entries(fields).filter(([, field]) => field !== undefined));
+};
 
 /**
  * Projects one tool result onto its closed outcome fields. The first text that parses as a JSON
  * object supplies them; free text, foreign shapes and out-of-grammar values contribute nothing.
- * `status`, `code`, `stage` and `cause` are read only when the call names an e-Comet tool, local or remote; any
+ * The fields other than `ok` are read only when the call names an e-Comet tool, local or remote; any
  * other tool contributes `ok` and the host's error flag, which cannot carry a value we did not define.
  */
 export const projectFeedbackToolOutcome = (content, isError = false, toolName = undefined) => {
@@ -144,18 +188,7 @@ export const projectFeedbackToolOutcome = (content, isError = false, toolName = 
         if (!parsed) continue;
         const { value, isError: envelopeError } = unwrapEnvelope(parsed);
         if (typeof value.ok === 'boolean') outcome.ok = value.ok;
-        if (ours) {
-            const status = closedField(value.status, OUTCOME_LOWER);
-            if (status) outcome.status = status;
-            const error = isObject(value.error) ? value.error : undefined;
-            const code = closedField(value.code, OUTCOME_CODE) ?? closedField(error?.code, OUTCOME_CODE);
-            if (code) outcome.code = code;
-            const stage = closedField(value.stage, OUTCOME_LOWER) ?? closedField(error?.stage, OUTCOME_LOWER);
-            if (stage) outcome.stage = stage;
-            // The native DeepSeek adapter classifies a failed call (network, timeout, http_4xx, http_5xx, protocol, unknown).
-            const cause = closedField(value.cause, OUTCOME_CAUSE) ?? closedField(error?.cause, OUTCOME_CAUSE);
-            if (cause) outcome.cause = cause;
-        }
+        if (ours) Object.assign(outcome, closedOutcomeFields(value));
         if (envelopeError) outcome.isError = true;
         break;
     }

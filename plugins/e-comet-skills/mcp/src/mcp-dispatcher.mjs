@@ -9,15 +9,16 @@ import {
     IMAGE_CONCURRENCY,
     LATEST_MCP_PROTOCOL_VERSION,
     MAX_IMAGE_BASKET,
+    RUN_RESULT_RETENTION_MS,
+    RUN_WAIT_MS,
     SUPPORTED_MCP_PROTOCOL_VERSIONS,
 } from './config.mjs';
 import { createArtifactWriter } from './artifact-store.mjs';
 import { BRIDGE_CODES, bridgeCauseError } from './bridge-cause.mjs';
-import { prepareECometFeedback, submitECometCloudFeedback, submitECometFeedback } from './feedback-tools.mjs';
+import { prepareECometFeedback, submitECometFeedback } from './feedback-tools.mjs';
 import { FeedbackPreparationError, feedbackPreparationFailure, feedbackSubmissionFailure } from './feedback-errors.mjs';
-import { feedbackHostResultUnavailable, hasFeedbackCloudTransport, hasFeedbackHostAdapterMarker, isValidFeedbackCloudSubmitInput, isValidFeedbackHostAdapterInput } from './feedback-host-adapter.mjs';
-import { feedbackDeviceDiagnosticsFailure, selectFeedbackDeviceSnapshot } from './feedback-device-diagnostics.mjs';
 import { collectFeedbackDeviceEvidence } from './feedback-device-evidence.mjs';
+import { collectExtensionLog as collectExtensionLogFromDisk, readExtensionLogRows as readExtensionLogRowsFromDisk } from './extension-log.mjs';
 import { feedbackDiagnostics, safeFeedbackProperty, withFeedbackOperation } from './feedback-diagnostics.mjs';
 import { feedbackArtifactIdSchema, feedbackDiagnosticsSchema, validateSchemaValue } from './tool-schemas.mjs';
 import { executeAuthorizedBrowserJob, executeSellerReviewsJob, extractBrowserJobToken, validateAuthorizedJobLimits } from './browser-job.mjs';
@@ -29,6 +30,7 @@ import {
     OZON_ANALYTICS_CAPABILITY,
     OZON_PROMOTION_PACKAGE_CAPABILITY,
     OZON_SEARCH_POSITIONS_CAPABILITY,
+    PENDING_UPDATE_VERSION_PATTERN,
 } from './extension-vocabulary.mjs';
 import {
     executeOzonPromotionJob,
@@ -39,24 +41,35 @@ import { executeOzonAnalyticsJob, safeOzonAnalyticsToolError } from './ozon-anal
 import { getOzonReportPackageArtifactResources } from './ozon-report-package-job.mjs';
 import { rejectedOzonPackage } from './ozon-report-package-result.mjs';
 import { parsePromotionPeriods } from './ozon-report-package-domain.mjs';
-import { canonicalSearchPositionsRequest, maxSearchPositionsQueries } from './ozon-search-positions-domain.mjs';
+import { canonicalSearchPositionsRequest } from './ozon-search-positions-domain.mjs';
 import { executeOzonSearchPositionsJob, rejectedOzonSearchPositions } from './ozon-search-positions-job.mjs';
 import { parseAnalyticsDateRange } from './ozon-analytics-domain.mjs';
 import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
-import { serverInstructions, toolsForClient, validateToolArguments } from './tool-catalog.mjs';
+import { invalidArgumentsMessage, serverInstructions, tools, validateToolArguments } from './tool-catalog.mjs';
 import {
     ozonExtensionOutdatedError,
     browserJobRejectionDetails,
+    failureDetails,
+    LOCAL_STORAGE_MESSAGES,
+    OZON_EXTENSION_OUTDATED_REASON,
     ozonRouteUnavailableError,
+    rejectionGuidance,
     safeOzonPromotionToolError,
     ToolExecutionError,
     toolFailure,
+    withPendingUpdate,
 } from './tool-errors.mjs';
 import { createConcurrencyLimiter, discoverImageBasket, imageExists, runWithConcurrency } from './wb-domain.mjs';
 import { sanitizeClientInfo } from './diagnostic-facts.mjs';
 import { collectDiagnosis } from './diagnose.mjs';
 import { createOperationDiagnostics, decorateOperationResult, operationFactsFromResult } from './operation-diagnostics.mjs';
 import { describeToolContract } from './tool-contracts.mjs';
+import { createRunRegistry } from './run-registry.mjs';
+
+// No automatic repeat: the original call may have created marketplace reports (product principle 4).
+const RUN_RESULT_UNAVAILABLE_MESSAGE = 'This run\'s result is no longer on this device: the run expired or e-Comet restarted. ' +
+    'The original operation\'s outcome is unknown, which is not the same as failed. ' +
+    'Do not repeat it automatically: tell the user, and run the original tool again only if the user asks.';
 
 const OZON_AUTHORIZATION_ROUTE_CODES = new Set([
     'EXTENSION_DISCONNECTED',
@@ -66,16 +79,7 @@ const OZON_AUTHORIZATION_ROUTE_CODES = new Set([
 
 const storageCreationEvidence = new WeakMap();
 const resultCreationFailure = (cause) => {
-    const messages = {
-        EBUSY: 'Local output storage is busy. Let any other pending work finish, then retry; report a persistent failure to e-Comet.',
-        EEXIST: 'A local output path conflicts with an existing entry. Check the configured output location.',
-        EACCES: 'The agent process cannot access local output storage. Restore access to the configured output location.',
-        EPERM: 'The operating system denied access to local output storage. Check access or a file sharing lock.',
-        ENOSPC: 'Local output storage has no free space. Free space before requesting the report again.',
-        EDQUOT: 'The local output storage quota is exhausted. Restore available quota before requesting the report again.',
-        EROFS: 'Local output storage is read-only. Use a writable output location.',
-        ENOTDIR: 'A local output path contains an entry that is not a directory. Check the configured output location.',
-    };
+    const messages = LOCAL_STORAGE_MESSAGES;
     const code = safeFeedbackProperty(cause, 'code');
     const known = typeof code === 'string' && Object.hasOwn(messages, code);
     const error = new ToolExecutionError('LOCAL_STORAGE_FAILED', known ? messages[code] : 'The local result file could not be created.',
@@ -83,6 +87,20 @@ const resultCreationFailure = (cause) => {
     if (known) storageCreationEvidence.set(error, { operation: 'create_result', systemCode: code });
     return error;
 };
+
+// The authorization lease is built by this process; a wrong shape is an e-Comet defect, not the seller's.
+const leaseInvalid = () => new ToolExecutionError('BROWSER_JOB_LEASE_INVALID',
+    'The local MCP received an invalid browser job authorization lease; this is an e-Comet defect. Offer to report it; do not repeat browser_job.',
+    'local', false);
+const OZON_LEASE_DEFECT = 'This is an e-Comet defect: offer to report it; do not request another authorization.';
+// The one closed `details` a WB or Seller tool failure carries.
+const errorDetails = (error) => {
+    const details = storageCreationEvidence.get(error) ?? browserJobRejectionDetails(error) ?? failureDetails(error);
+    return details ? { details } : {};
+};
+
+// A failing call waits at most this long for the snapshot that may name a downloaded update.
+const PENDING_UPDATE_SNAPSHOT_TIMEOUT_MS = 3000;
 
 // The e-Comet signer issues filters_by_query, so an extension refusing that job type (invalid_job/job_type) predates it. Without
 // this an outdated extension reads as our defect. Older WB jobs are known to every supported extension. The refusal details are
@@ -128,7 +146,19 @@ const ozonPackageCapabilityFailure = (family, status) => {
     return error;
 };
 
+// The host hook failed, not the marketplace: another browser_job only spends one more authorization the same way.
+const missingHandoff = () => new ToolExecutionError('BROWSER_JOB_HANDOFF_REQUIRED',
+    'Browser authorization handoff is required: the host plugin hook did not pass the signed authorization to this tool. ' +
+    'In Codex this usually means the e-Comet hooks await approval again after a plugin update. ' +
+    'For an mcp__remote-devices__ tool, pass trigger_url from the same browser_job result, unchanged, as triggerUrl and call this tool once more. ' +
+    'Do not repeat browser_job until that is resolved.', 'handoff', false);
+
 export const classifyOzonAuthorizationFailure = (error, status, packageFamily) => {
+    // A trigger URL that is not a browser job is the same failed handoff as a missing one.
+    if (error instanceof ToolExecutionError && error.code === 'BROWSER_JOB_HANDOFF_REQUIRED') {
+        return new ToolExecutionError('OZON_AUTHORIZATION_REJECTED', 'The trusted browser-job hook did not provide Ozon authorization.',
+            'authorization', false, { cause: error });
+    }
     // No broker answered, or the broker refused the authorization frame: nothing reached Ozon. The contract pins only
     // the authorization stage, so the cause and its step ride in details.bridgeCode and the message.
     if (error instanceof ToolExecutionError && BRIDGE_CODES.includes(error.code)) {
@@ -177,14 +207,14 @@ export const classifyOzonAuthorizationFailure = (error, status, packageFamily) =
     } else if (error instanceof ToolExecutionError && error.code === 'BROWSER_JOB_ACCOUNT_MISMATCH') {
         message = 'The e-Comet extension is signed in to a different e-Comet account. Open the e-Comet extension and sign in to the same e-Comet account used for this request.';
     }
+    const rejection = browserJobRejectionDetails(error);
     const classified = new ToolExecutionError(
         'OZON_AUTHORIZATION_REJECTED',
-        message,
+        rejectionGuidance(rejection?.browserJobRejection) ?? message,
         'authorization',
         false,
         { cause: error }
     );
-    const rejection = browserJobRejectionDetails(error);
     if (rejection) classified.details = rejection;
     return classified;
 };
@@ -202,18 +232,21 @@ export const createMcpMessageHandler = ({
     kick = () => undefined,
     requestBrowserJobAuthorization,
     requestExtensionDiagnosticSnapshot = undefined,
+    // Whether the connected extension announced diagnostic_snapshot_v2.
+    diagnosticSnapshotV2Ready = () => false,
     artifactStorageTarget = ARTIFACT_STORAGE,
     reportOutputDirectory = undefined,
     createSellerArtifactWriter = createArtifactWriter,
     createOzonArtifactWriter = createArtifactWriter,
     renderOzonResult = resourceLinkResult,
     sendError = mcpError,
-    sendResult = mcpResult,
+    sendResult: sendMcpResult = mcpResult,
+    runWaitMs = RUN_WAIT_MS,
+    runRetentionMs = RUN_RESULT_RETENTION_MS,
     createJobWriter: createWriter = createJobWriter,
     probeImageExists = imageExists,
     prepareFeedback = prepareECometFeedback,
     submitFeedback = submitECometFeedback,
-    submitCloudFeedback = submitECometCloudFeedback,
     shutdownSignal,
     log = (..._args) => undefined,
     now = Date.now,
@@ -222,22 +255,56 @@ export const createMcpMessageHandler = ({
     collectInstallation = undefined,
     probeExtensionInstall = undefined,
     collectHookPermissions = undefined,
+    collectExtensionLog = undefined,
+    readExtensionLogRows = undefined,
+    extensionLogTarget = () => ({}),
+    // A runtime diagnosis's fresh read of the extension's log, which status then judges instead of the one it kept.
+    replaceExtensionLog = (_evidence) => undefined,
 }) => {
     let clientInfo = null;
     let negotiatedProtocolVersion = null;
     let clientObservedAt = null;
     const currentBridgeStatus = () => getBridgeStatus({ clientInfo, protocolVersion: negotiatedProtocolVersion, clientObservedAt });
+    // The extension's own log is found through the same profile probe, so an injected probe keeps it off this machine. It
+    // is the log of the browser the runtime names: the connected extension's own, else the chooser's pick under the policies.
+    const logReaderOptions = () => ({ now, ...(probeExtensionInstall ? { probeExtensionInstall } : {}), ...extensionLogTarget() });
+    const collectLog = collectExtensionLog ?? (() => collectExtensionLogFromDisk(logReaderOptions()));
+    const readLogRows = readExtensionLogRows ?? (() => readExtensionLogRowsFromDisk(logReaderOptions()));
     // Feedback preparation carries the passive status plus bounded read-only evidence; every probe is
     // injectable so tests never read this machine's packages, profiles or Codex configuration.
     const collectDeviceEvidence = () => collectFeedbackDeviceEvidence({
-        getBridgeStatus: currentBridgeStatus, requestExtensionDiagnosticSnapshot, now,
+        getBridgeStatus: currentBridgeStatus, requestExtensionDiagnosticSnapshot, now, collectExtensionLog: collectLog,
         ...(collectInstallation ? { collectInstallation } : {}),
         ...(probeExtensionInstall ? { probeExtensionInstall } : {}),
         ...(collectHookPermissions ? { collectHookPermissions } : {}),
     });
     const operationDiagnostics = createOperationDiagnostics({ now, randomUUID: createUuid });
+    // A capability the extension lacks while its update is downloaded: the version 2 snapshot names that update.
+    const withDownloadedUpdate = async (error) => {
+        const missingCapability = error instanceof ToolExecutionError && (error.code === 'EXTENSION_UPDATE_REQUIRED' ||
+            ozonPackageCapabilityErrors.has(error) || error.details?.reason === OZON_EXTENSION_OUTDATED_REASON);
+        // Only a version 2 snapshot can name the update; an older extension is not asked.
+        if (!missingCapability || !diagnosticSnapshotV2Ready() || typeof requestExtensionDiagnosticSnapshot !== 'function') return error;
+        try {
+            const version = (await requestExtensionDiagnosticSnapshot(PENDING_UPDATE_SNAPSHOT_TIMEOUT_MS))?.pendingUpdateVersion;
+            return typeof version === 'string' && PENDING_UPDATE_VERSION_PATTERN.test(version) ? withPendingUpdate(error, version) : error;
+        } catch {
+            return error;
+        }
+    };
+    const runs = createRunRegistry({ now, randomUUID: createUuid, waitMs: runWaitMs, retentionMs: runRetentionMs });
+    // A bridge tool's handler answers to its run key; every other answer goes out as before.
+    const sendResult = (id, result) => runs.settle(id, result) || sendMcpResult(id, result);
+    // The captured answer goes out unchanged. A handler failure is rethrown, so the transport answers -32603 as it
+    // would without the wait.
+    // Resolves true when the final answer went out, false for a "running" answer.
+    const answerRun = async (id, run) => {
+        const outcome = await runs.wait(run);
+        if (outcome?.error) throw outcome.error;
+        sendMcpResult(id, outcome ? outcome.result : textResult(runs.runningAnswer(run)));
+        return Boolean(outcome);
+    };
     const sendOperationResult = async (id, toolName, result) => {
-        if (result?.structuredContent?.status === 'host_result_unavailable') return sendResult(id, result);
         let decorated = result;
         try {
             const receipt = operationDiagnostics.record(operationFactsFromResult(toolName, result));
@@ -273,7 +340,8 @@ export const createMcpMessageHandler = ({
             productLimitPerScope = args.productLimitPerSource ?? DEFAULT_RETURNED_PRODUCTS;
         }
         const productNmIds = args.productNmIds;
-        if (!validateToolArguments(toolName, args)) {
+        const validation = validateToolArguments(toolName, args);
+        if (!validation.ok) {
             await sendOperationResult(
                 id,
                 toolName,
@@ -281,7 +349,7 @@ export const createMcpMessageHandler = ({
                     toolFailure(
                         new ToolExecutionError(
                             'INVALID_TOOL_ARGUMENTS',
-                            `Invalid ${toolName} arguments.`,
+                            invalidArgumentsMessage(toolName, validation),
                             'arguments',
                             false
                         )
@@ -296,14 +364,7 @@ export const createMcpMessageHandler = ({
                 id,
                 toolName,
                 textResult(
-                    toolFailure(
-                        new ToolExecutionError(
-                            'BROWSER_JOB_HANDOFF_REQUIRED',
-                            'Browser authorization handoff is required.',
-                            'handoff',
-                            true
-                        )
-                    ),
+                    toolFailure(missingHandoff()),
                     true
                 )
             );
@@ -322,22 +383,18 @@ export const createMcpMessageHandler = ({
             if (!route.ok) throw bridgeCauseError(route);
             const token = extractBrowserJobToken(triggerUrl);
             authorizationLease = await requestBrowserJobAuthorization(token);
+            const authorization = authorizationLease?.authorization;
             if (
                 !authorizationLease ||
                 typeof authorizationLease.requestWbFetch !== 'function' ||
-                typeof authorizationLease.release !== 'function'
-            ) {
-                throw new Error('Extension returned an invalid browser job authorization lease');
-            }
-            const authorization = authorizationLease.authorization;
-            if (
+                typeof authorizationLease.release !== 'function' ||
                 !authorization ||
                 typeof authorization.authorizationId !== 'string' ||
                 typeof authorization.jobType !== 'string' ||
                 !authorization.job ||
                 typeof authorization.job !== 'object'
             ) {
-                throw new Error('Extension returned an invalid browser job authorization');
+                throw leaseInvalid();
             }
             if (authorization.jobType !== expectedJobType) {
                 throw new ToolExecutionError(
@@ -377,8 +434,8 @@ export const createMcpMessageHandler = ({
                 )
             );
         } catch (caught) {
-            const error = outdatedExtensionForJobType(toolName, caught);
             releaseAuthorization('after job failure');
+            const error = await withDownloadedUpdate(outdatedExtensionForJobType(toolName, caught));
             let partialResult = {};
             if (writer) {
                 const writeErrors = await writer.close().catch(() => []);
@@ -403,10 +460,7 @@ export const createMcpMessageHandler = ({
                         }),
                         // Public-only evidence: shared toolFailure is a strict serializer and
                         // must not gain these extra keys.
-                        ...(storageCreationEvidence.has(error) ? { details: storageCreationEvidence.get(error) } : {}),
-                        ...(!storageCreationEvidence.has(error) && browserJobRejectionDetails(error)
-                            ? { details: browserJobRejectionDetails(error) }
-                            : {}),
+                        ...errorDetails(error),
                         ...partialResult,
                     },
                     true
@@ -425,28 +479,13 @@ export const createMcpMessageHandler = ({
     };
 
     const handleFeedbackPrepare = async (id, args = {}) => {
-        if (hasFeedbackHostAdapterMarker(args)) {
-            if (!validateToolArguments('prepare_e_comet_feedback', args) || !isValidFeedbackHostAdapterInput('prepare_e_comet_feedback', args)) {
-                sendOperationResult(id, 'prepare_e_comet_feedback', textResult(feedbackPrepareFailure(new FeedbackPreparationError('FEEDBACK_INPUT_INVALID')), true));
-                return;
-            }
-            let bridgeStatus;
-            try {
-                bridgeStatus = selectFeedbackDeviceSnapshot(await collectDeviceEvidence());
-                if (!Object.keys(bridgeStatus).length) bridgeStatus = { diagnostics: feedbackDeviceDiagnosticsFailure(undefined) };
-            } catch (error) {
-                bridgeStatus = { diagnostics: feedbackDeviceDiagnosticsFailure(error) };
-            }
-            sendResult(id, textResult(feedbackHostResultUnavailable('prepare_e_comet_feedback', args.feedbackAdapter, bridgeStatus)));
-            return;
-        }
-        if (!validateToolArguments('prepare_e_comet_feedback', args)) {
+        if (!validateToolArguments('prepare_e_comet_feedback', args).ok) {
             sendOperationResult(id, 'prepare_e_comet_feedback', textResult(feedbackPrepareFailure(new FeedbackPreparationError('FEEDBACK_INPUT_INVALID')), true));
             return;
         }
         let operation = 'prepare';
         try {
-            const prepared = await prepareFeedback(args, { getBridgeStatus: collectDeviceEvidence });
+            const prepared = await prepareFeedback(args, { getBridgeStatus: collectDeviceEvidence, readExtensionLogRows: readLogRows, clientName: clientInfo?.name });
             operation = 'prepare_result';
             const reportResource = prepared?.reportResource;
             if (!reportResource || reportResource.name !== 'report.md') throw new Error('missing report resource');
@@ -456,58 +495,29 @@ export const createMcpMessageHandler = ({
         }
     };
 
-    // Every submit route refuses malformed input the same way, before any grant, artifact or upload work.
-    // The authored artifactId is carried through when it is usable: a caller holding an upload attempt for
-    // that artifact — the cloud hook, or a newer plugin talking to an older one — can only attribute the
-    // refusal to its own call when the refusal names the artifact.
-    const invalidSubmitGrantResult = (args) => textResult(
-        {
-            ok: false,
-            status: 'failed',
-            ...(validateSchemaValue(safeFeedbackProperty(args, 'artifactId'), feedbackArtifactIdSchema) ? { artifactId: args.artifactId } : {}),
-            error: { code: 'UPLOAD_GRANT_INVALID', message: 'The feedback upload grant is invalid or has expired.', stage: 'grant', retryable: false, details: feedbackDiagnostics(undefined, 'input_validation') },
-        },
-        !hasFeedbackCloudTransport(args)
-    );
-
-    // One result-and-log tail for both submit routes: a reported failure is logged from its own
-    // diagnostics, a thrown one is projected into the same failure shape first.
-    const completeFeedbackSubmit = async (id, args, submit) => {
+    const handleFeedbackSubmit = async (id, args = {}) => {
+        if (!validateToolArguments('submit_e_comet_feedback', args).ok) {
+            // The authored artifactId is carried through when it is usable, so a caller can attribute the refusal.
+            sendOperationResult(id, 'submit_e_comet_feedback', textResult({
+                ok: false,
+                status: 'failed',
+                ...(validateSchemaValue(safeFeedbackProperty(args, 'artifactId'), feedbackArtifactIdSchema) ? { artifactId: args.artifactId } : {}),
+                error: { code: 'UPLOAD_GRANT_INVALID', message: 'The feedback upload grant is invalid or has expired.', stage: 'grant', retryable: false, details: feedbackDiagnostics(undefined, 'input_validation') },
+            }, true));
+            return;
+        }
         try {
-            const submitted = await submit(args);
+            const submitted = await submitFeedback(args);
             if (!submitted.ok) {
                 const details = safeFeedbackProperty(safeFeedbackProperty(submitted, 'error'), 'details');
                 if (validateSchemaValue(details, feedbackDiagnosticsSchema)) console.error('[McpDispatcher] Feedback submission failed:', JSON.stringify(details));
             }
-            // Cowork routes isError to PostToolUseFailure without the structured result. Cloud
-            // outcomes must reach PostToolUse to record the receipt or release a no-request refusal.
-            // Domain failures remain ok:false; native consumers keep ordinary MCP error semantics.
-            const result = textResult(submitted, !submitted.ok && !hasFeedbackCloudTransport(args));
-            if (hasFeedbackCloudTransport(args)) sendResult(id, result); else sendOperationResult(id, 'submit_e_comet_feedback', result);
+            sendOperationResult(id, 'submit_e_comet_feedback', textResult(submitted, !submitted.ok));
         } catch (error) {
             const failure = feedbackSubmissionFailure(error, args.artifactId);
             console.error('[McpDispatcher] Feedback submission failed:', JSON.stringify(failure.error));
-            const result = textResult(failure, !hasFeedbackCloudTransport(args));
-            if (hasFeedbackCloudTransport(args)) sendResult(id, result); else sendOperationResult(id, 'submit_e_comet_feedback', result);
+            sendOperationResult(id, 'submit_e_comet_feedback', textResult(failure, true));
         }
-    };
-
-    const handleFeedbackSubmit = async (id, args = {}) => {
-        if (hasFeedbackCloudTransport(args)) {
-            // Input carrying a second transport marker identifies no route: refuse it here rather than
-            // hand a mixed input to the cloud submitter.
-            if (!validateToolArguments('submit_e_comet_feedback', args) || !isValidFeedbackCloudSubmitInput(args)) {
-                sendResult(id, invalidSubmitGrantResult(args));
-                return;
-            }
-            await completeFeedbackSubmit(id, args, submitCloudFeedback);
-            return;
-        }
-        if (!validateToolArguments('submit_e_comet_feedback', args)) {
-            sendOperationResult(id, 'submit_e_comet_feedback', invalidSubmitGrantResult(args));
-            return;
-        }
-        await completeFeedbackSubmit(id, args, submitFeedback);
     };
 
     const handleProductImages = async (id, args = {}) => {
@@ -516,7 +526,8 @@ export const createMcpMessageHandler = ({
         const maxBasket = args.maxBasket ?? MAX_IMAGE_BASKET;
         const size = args.size ?? 'big';
         const timeout = args.timeout ?? 5000;
-        if (!validateToolArguments('wb_product_images', args)) {
+        const validation = validateToolArguments('wb_product_images', args);
+        if (!validation.ok) {
             await sendOperationResult(
                 id,
                 'wb_product_images',
@@ -524,7 +535,7 @@ export const createMcpMessageHandler = ({
                     toolFailure(
                         new ToolExecutionError(
                             'INVALID_TOOL_ARGUMENTS',
-                            'Invalid wb_product_images arguments.',
+                            invalidArgumentsMessage('wb_product_images', validation),
                             'arguments',
                             false
                         )
@@ -666,12 +677,13 @@ export const createMcpMessageHandler = ({
 
     const handleSellerReviewsExport = async (id, args = {}) => {
         const toolName = 'wb_seller_reviews';
-        if (!validateToolArguments(toolName, args)) {
+        const validation = validateToolArguments(toolName, args);
+        if (!validation.ok) {
             sendOperationResult(
                 id,
                 'wb_seller_reviews',
                 textResult(
-                    toolFailure(new ToolExecutionError('INVALID_TOOL_ARGUMENTS', `Invalid ${toolName} arguments.`, 'arguments', false)),
+                    toolFailure(new ToolExecutionError('INVALID_TOOL_ARGUMENTS', invalidArgumentsMessage(toolName, validation), 'arguments', false)),
                     true
                 )
             );
@@ -683,14 +695,7 @@ export const createMcpMessageHandler = ({
                 id,
                 'wb_seller_reviews',
                 textResult(
-                    toolFailure(
-                        new ToolExecutionError(
-                            'BROWSER_JOB_HANDOFF_REQUIRED',
-                            'Browser authorization handoff is required.',
-                            'handoff',
-                            true
-                        )
-                    ),
+                    toolFailure(missingHandoff()),
                     true
                 )
             );
@@ -724,7 +729,7 @@ export const createMcpMessageHandler = ({
                         false
                     );
                 }
-                throw new Error('Extension returned an invalid seller browser job authorization lease');
+                throw leaseInvalid();
             }
             sellerResult = await executeSellerReviewsJob({
                 authorization,
@@ -737,12 +742,13 @@ export const createMcpMessageHandler = ({
             );
             const summary = `Seller review export ${sellerResult.status}: ${sellerArtifacts.length} of ${sellerResult.exports.length} XLSX artifact(s) available.`;
             terminalResult = resourceLinkResult(sellerResult, summary, sellerArtifacts, !sellerResult.ok);
-        } catch (error) {
+        } catch (caught) {
+            const error = await withDownloadedUpdate(caught);
             terminalResult = textResult(
                 { ...toolFailure(error, {
                     code: 'SELLER_REVIEWS_EXPORT_FAILED', message: 'The authorized seller review export could not be completed.',
                     stage: 'execution', retryable: false,
-                }), ...(browserJobRejectionDetails(error) ? { details: browserJobRejectionDetails(error) } : {}) },
+                }), ...errorDetails(error) },
                 true
             );
         }
@@ -827,9 +833,8 @@ export const createMcpMessageHandler = ({
             };
         };
         try {
-            if (!validateToolArguments(toolName, args)) {
-                throw new ToolExecutionError('PREFLIGHT_FAILED', 'The Ozon promotion period is invalid.', 'preflight', false);
-            }
+            const validation = validateToolArguments(toolName, args);
+            if (!validation.ok) throw new ToolExecutionError('PREFLIGHT_FAILED', invalidArgumentsMessage(toolName, validation), 'preflight', false);
             try {
                 parseOzonPromotionPeriod(dateFrom, dateTo);
             } catch (error) {
@@ -871,7 +876,7 @@ export const createMcpMessageHandler = ({
             ) {
                 throw new ToolExecutionError(
                     'OZON_AUTHORIZATION_REJECTED',
-                    'The extension returned an invalid Ozon promotion authorization.',
+                    `The extension returned an invalid Ozon promotion authorization. ${OZON_LEASE_DEFECT}`,
                     'authorization',
                     false
                 );
@@ -892,7 +897,7 @@ export const createMcpMessageHandler = ({
                 [getOzonPromotionArtifactResource(result)]
             );
         } catch (error) {
-            terminalResult = textResult(failureResult(error), true);
+            terminalResult = textResult(failureResult(await withDownloadedUpdate(error)), true);
         } finally {
             const currentLease = authorizationLease;
             authorizationLease = undefined;
@@ -929,7 +934,7 @@ export const createMcpMessageHandler = ({
             releaseAuthorizationInBackground(lease, `after an invalid ${OZON_PACKAGE_FAMILIES[family].name} authorization`);
             throw new ToolExecutionError(
                 'OZON_AUTHORIZATION_REJECTED',
-                `The extension returned an invalid ${OZON_PACKAGE_FAMILIES[family].name} authorization.`,
+                `The extension returned an invalid ${OZON_PACKAGE_FAMILIES[family].name} authorization. ${OZON_LEASE_DEFECT}`,
                 'authorization',
                 false
             );
@@ -989,9 +994,8 @@ export const createMcpMessageHandler = ({
             return result;
         };
         try {
-            if (!validateToolArguments(toolName, args)) {
-                throw new ToolExecutionError('PREFLIGHT_FAILED', `The Ozon ${family} report package is invalid.`, 'preflight', false);
-            }
+            const validation = validateToolArguments(toolName, args);
+            if (!validation.ok) throw new ToolExecutionError('PREFLIGHT_FAILED', invalidArgumentsMessage(toolName, validation), 'preflight', false);
             try {
                 if (family === 'promotion') parsePromotionPeriods(items);
                 else items.forEach(({ dateFrom, dateTo }) => parseAnalyticsDateRange(dateFrom, dateTo));
@@ -1021,7 +1025,7 @@ export const createMcpMessageHandler = ({
                 !result.ok
             );
         } catch (error) {
-            terminalResult = textResult(failedPackage(error), true);
+            terminalResult = textResult(failedPackage(await withDownloadedUpdate(error)), true);
         } finally {
             const currentLease = authorizationLease;
             authorizationLease = undefined;
@@ -1036,9 +1040,10 @@ export const createMcpMessageHandler = ({
         let request;
         let result;
         try {
-            if (!validateToolArguments(toolName, args)) throw new TypeError('The Ozon search positions arguments are invalid.');
+            const validation = validateToolArguments(toolName, args);
+            if (!validation.ok) throw new TypeError(invalidArgumentsMessage(toolName, validation));
             const { queries, skus, region, platform } = args;
-            request = canonicalSearchPositionsRequest({ queries, skus, region, platform }, maxSearchPositionsQueries(clientInfo?.name));
+            request = canonicalSearchPositionsRequest({ queries, skus, region, platform });
         } catch (error) {
             // Domain messages name the broken rule, never the rejected values.
             result = { ok: false, status: 'failed', jobType: toolName,
@@ -1055,7 +1060,7 @@ export const createMcpMessageHandler = ({
                     now,
                 });
             } catch (error) {
-                result = rejectedOzonSearchPositions(request, error);
+                result = rejectedOzonSearchPositions(request, await withDownloadedUpdate(error));
             } finally {
                 releaseAuthorizationInBackground(authorizationLease, 'after Ozon search positions completion');
             }
@@ -1076,38 +1081,46 @@ export const createMcpMessageHandler = ({
         [
             'e_comet_diagnose',
             { needsBridge: false, run: async (id, args) => {
-                if (!validateToolArguments('e_comet_diagnose', args)
-                    || (args.scope === 'last_operation' && (typeof args.operationHandle !== 'string' || !args.operationHandle))) {
-                    sendResult(id, textResult(toolFailure(new ToolExecutionError('INVALID_TOOL_ARGUMENTS', 'Invalid e_comet_diagnose arguments.', 'arguments', false)), true));
+                const validation = validateToolArguments('e_comet_diagnose', args);
+                const invalid = !validation.ok ? validation
+                    : args.scope === 'last_operation' && (typeof args.operationHandle !== 'string' || !args.operationHandle)
+                        ? { property: 'operationHandle' } : undefined;
+                if (invalid) {
+                    sendResult(id, textResult(toolFailure(new ToolExecutionError('INVALID_TOOL_ARGUMENTS',
+                        invalidArgumentsMessage('e_comet_diagnose', invalid), 'arguments', false)), true));
                     return;
                 }
                 // A diagnosis must never fail because a refresh did.
                 // Profile reads obey the same explicit probe contract as the collector; passive diagnoses keep stored facts.
-                const withProbe = args.scope === 'installation' && args.mode === 'safe_probes'
-                    && args.probes?.includes('extension_install') === true;
+                // A runtime extension_log probe reads the profiles too: status judges the fresh log against the profile
+                // probe, which macOS never reads at start or in the background and elsewhere can be 30 s old.
+                const withProbe = args.mode === 'safe_probes'
+                    && ((args.scope === 'installation' && args.probes?.includes('extension_install') === true)
+                        || (args.scope === 'runtime' && args.probes?.includes('extension_log') === true));
                 const extensionInstall = await Promise.resolve().then(() => refreshBridgeFacts({ withProbe })).catch(() => undefined);
                 const diagnosis = await collectDiagnosis({ ...args, operationDiagnostics, getBridgeStatus: currentBridgeStatus,
                     requestExtensionDiagnosticSnapshot, storageLayout, now, clientName: clientInfo?.name,
                     randomUUID: createUuid, ...(collectInstallation ? { collectInstallation } : {}),
                     ...(extensionInstall ? { probeExtensionInstall: async () => extensionInstall }
                         : probeExtensionInstall ? { probeExtensionInstall } : {}),
-                    ...(collectHookPermissions ? { collectHookPermissions } : {}) });
+                    ...(collectHookPermissions ? { collectHookPermissions } : {}), collectExtensionLog: collectLog, replaceExtensionLog });
                 sendResult(id, textResult(diagnosis));
             } },
         ],
         [
             'describe_e_comet_tool',
             { needsBridge: false, run: async (id, args) => {
-                if (!validateToolArguments('describe_e_comet_tool', args)) {
+                const validation = validateToolArguments('describe_e_comet_tool', args);
+                if (!validation.ok) {
                     sendResult(id, textResult(toolFailure(new ToolExecutionError(
                         'INVALID_TOOL_ARGUMENTS',
-                        'Invalid describe_e_comet_tool arguments.',
+                        invalidArgumentsMessage('describe_e_comet_tool', validation),
                         'arguments',
                         false
                     )), true));
                     return;
                 }
-                sendResult(id, textResult(describeToolContract(args.name, { clientName: clientInfo?.name })));
+                sendResult(id, textResult(describeToolContract(args.name)));
             } },
         ],
         [
@@ -1147,6 +1160,24 @@ export const createMcpMessageHandler = ({
         ['prepare_e_comet_feedback', { needsBridge: false, run: (id, args) => handleFeedbackPrepare(id, args) }],
         ['submit_e_comet_feedback', { needsBridge: false, run: (id, args) => handleFeedbackSubmit(id, args) }],
         ['wb_product_images', { needsBridge: false, run: (id, args) => handleProductImages(id, args) }],
+        [
+            'e_comet_run_result',
+            { needsBridge: false, run: async (id, args) => {
+                const validation = validateToolArguments('e_comet_run_result', args);
+                if (!validation.ok) {
+                    sendResult(id, textResult(toolFailure(new ToolExecutionError('INVALID_TOOL_ARGUMENTS',
+                        invalidArgumentsMessage('e_comet_run_result', validation), 'arguments', false)), true));
+                    return;
+                }
+                const run = runs.get(args.runId);
+                if (!run) {
+                    sendResult(id, textResult(toolFailure(new ToolExecutionError(
+                        'RUN_RESULT_UNAVAILABLE', RUN_RESULT_UNAVAILABLE_MESSAGE, 'result', false)), true));
+                    return;
+                }
+                await answerRun(id, run);
+            } },
+        ],
     ]);
 
     return async (message) => {
@@ -1177,7 +1208,7 @@ export const createMcpMessageHandler = ({
             return;
         }
         if (method === 'tools/list') {
-            sendResult(id, { tools: toolsForClient(clientInfo?.name) });
+            sendResult(id, { tools });
             return;
         }
         if (method !== 'tools/call') {
@@ -1190,9 +1221,17 @@ export const createMcpMessageHandler = ({
             sendError(id, -32602, `Unknown tool: ${params?.name}`);
             return;
         }
+        if (!tool.needsBridge) {
+            await tool.run(id, params?.arguments ?? {});
+            return;
+        }
         // Before the handler runs, so the first call starts a connect attempt rather than waiting for the next
         // re-list — including the signed-call forms that return early, before they ever reach ensureBroker.
-        if (tool.needsBridge) kick();
-        await tool.run(id, params?.arguments ?? {});
+        kick();
+        // Any bridge job may outlast a host's call deadline: past the wait it answers "running" and keeps working.
+        const run = runs.start(params.name, (key) => tool.run(key, params?.arguments ?? {}));
+        let delivered = true;
+        // A run answered in full here never showed its runId, so nobody can fetch it later.
+        try { delivered = await answerRun(id, run); } finally { if (delivered) runs.forget(run); }
     };
 };

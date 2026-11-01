@@ -66,7 +66,8 @@ const copyReport = async (artifact, directory, stage) => {
             outputPath = path.join(child, `${artifact.name.slice(0, -5)}-${randomUUID()}.xlsx`);
             destination = await open(outputPath, 'wx+');
         }
-        owned = await destination.stat();
+        // NTFS file IDs exceed 2^53, so only bigint stats tell neighbouring files apart.
+        owned = await destination.stat({ bigint: true });
         if (await digest(source, artifact.size, destination) !== artifact.sha256) throw new Error('integrity_mismatch');
         stage('verification');
         await destination.sync();
@@ -84,7 +85,7 @@ const copyReport = async (artifact, directory, stage) => {
             .map(handle => Promise.resolve().then(() => handle.close())));
         const closeFailure = closed.find(result => result.status === 'rejected');
         if ((operationError || closeFailure) && owned) {
-            const current = await lstat(outputPath).catch(() => undefined);
+            const current = await lstat(outputPath, { bigint: true }).catch(() => undefined);
             if (current?.ino === owned.ino && current?.dev === owned.dev) await unlink(outputPath).catch(() => undefined);
         }
         if (!operationError && closeFailure) throw closeFailure.reason;

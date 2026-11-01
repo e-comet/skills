@@ -212,6 +212,8 @@ export function createBrokerClient({ rendezvousDir, platform, pluginVersion, ins
             // A length-prefixed stream cannot resynchronise after a bad frame.
             onError: (error) => {
                 log(`e-comet broker client: closing a broker connection (${error.code})`);
+                // Kept on the session, so whoever holds it can name why it ended.
+                if (session) session.endCode = error.code;
                 socket.destroy();
             },
         });
@@ -236,7 +238,7 @@ export function createBrokerClient({ rendezvousDir, platform, pluginVersion, ins
         const dialled = await dial(entry.endpoint);
         if (!dialled.socket) {
             if (STALE_CONNECT_CODES.has(dialled.code)) return stale(dialled.code);
-            return { result: 'unresponsive', note: `broker ${pid} did not accept (${dialled.code})` };
+            return { result: 'unresponsive', code: dialled.code, note: `broker ${pid} did not accept (${dialled.code})` };
         }
         const outcome = await handshake(dialled.socket, entry.brokerNonce, pid);
         if (outcome.result === 'stale') return stale(outcome.detail);
@@ -248,6 +250,8 @@ export function createBrokerClient({ rendezvousDir, platform, pluginVersion, ins
         const candidates = await readEntries();
         const notes = [];
         let unresponsive = false;
+        // The system code of an endpoint that refused the dial, for the caller's record; never a path.
+        let code;
         for (const candidate of candidates) {
             if (stopped) break;
             const outcome = await tryEntry(candidate);
@@ -264,13 +268,14 @@ export function createBrokerClient({ rendezvousDir, platform, pluginVersion, ins
             }
             outcome.session?.close();
             if (outcome.result === 'unresponsive') unresponsive = true;
+            code ??= outcome.code;
         }
         if (stopped) throw stoppedError();
         const failure = notes.join('\n');
         if (failure !== lastFailure) for (const note of notes) log(note);
         lastFailure = failure;
         if (candidates.length === 0) return { ok: false, reason: 'no_entries' };
-        return { ok: false, reason: unresponsive ? 'unresponsive' : 'stale_only' };
+        return { ok: false, reason: unresponsive ? 'unresponsive' : 'stale_only', ...(code ? { code } : {}) };
     };
 
     /**

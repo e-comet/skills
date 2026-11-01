@@ -10,6 +10,16 @@ export const sanitizeClientInfo = (value) => value && safeText(value.name) && sa
 // The DeepSeek Harness runtime version the native adapter passes to the local module: one bounded version grammar
 // shared by the adapter that reads it from the resolved peer manifest and the server that admits it into facts.
 export const isHostRuntimeVersion = (value) => typeof value === 'string' && /^[0-9A-Za-z.+-]{1,64}$/.test(value);
+// The operating system's own release string (os.release()): Windows `10.0.26200`, macOS `24.1.0`, Linux kernels with a
+// vendor suffix. The same bounded grammar, plus the underscore some kernels carry.
+export const isOsRelease = (value) => typeof value === 'string' && /^[0-9A-Za-z._+-]{1,64}$/.test(value);
+// What the native DeepSeek adapter passes about the local module it restarted: the closed class of the last failure
+// (runtime.mjs localFailureOf) and how many times it started the module again.
+export const HOST_LAST_FAILURES = Object.freeze(['spawn_failed', 'timeout', 'exited', 'protocol', 'unknown']);
+export const hostRestartFacts = (/** @type {Record<string, string | undefined>} */ env) => ({
+    ...(HOST_LAST_FAILURES.includes(/** @type {string} */ (env.ECOMET_HOST_LAST_FAILURE)) ? { hostLastFailure: env.ECOMET_HOST_LAST_FAILURE } : {}),
+    ...(/^\d{1,6}$/.test(env.ECOMET_HOST_RESTARTS ?? '') ? { hostRestarts: Number(env.ECOMET_HOST_RESTARTS) } : {}),
+});
 
 export const diagnosticCheck = (/** @type {any} */ input) => {
     const { check, state, observedAt, source, executionPlane, facts, cause, evidenceRefs, nextCheck } = input;
@@ -29,6 +39,7 @@ export const collectStaticFacts = (/** @type {any} */ input) => {
         diagnosticCheck({ check: 'runtime', state: 'passed', observedAt, source: 'node_process', executionPlane: 'device', facts: {
             nodeVersion: versions.node, platform, arch, ...(versions.bridge ? { bridgeVersion: versions.bridge } : {}),
             ...(versions.mcp ? { mcpProtocolVersion: versions.mcp } : {}),
+            ...(isOsRelease(versions.os) ? { osRelease: versions.os } : {}),
         } }),
         diagnosticCheck({ check: 'storage', state: 'passed', observedAt, source: 'resolved_configuration', executionPlane: 'device', facts: {
             scope: 'configuration', targets: Object.fromEntries(Object.entries(storageLayout).map(([name, target]) => [name,
@@ -58,7 +69,7 @@ const enumeration = (values) => ({ type: 'string', enum: [...values] });
 export const HOOK_PERMISSIONS_VOCABULARY = Object.freeze({
     events: Object.freeze(['preToolUse', 'postToolUse', 'postToolUseFailure', 'unknown']),
     families: Object.freeze(['browser_authorization_restore', 'browser_authorization_capture', 'update_check', 'feedback_authorization_restore',
-        'feedback_authorization_capture', 'feedback_cloud_processing', 'feedback_failure_recovery', 'plugin_hook']),
+        'feedback_authorization_capture', 'plugin_hook']),
     trust: Object.freeze(['trusted', 'untrusted', 'modified', 'managed', 'unknown']),
     trustCounters: Object.freeze(['trusted', 'untrusted', 'modified', 'managed']),
     statuses: Object.freeze(['ready', 'disabled', 'review_required', 'missing', 'incomplete_inventory', 'unsupported']),
@@ -134,15 +145,20 @@ export const extensionInstallFactsSchema = closed({
 // protocol admits any short strings for the time and version and an unbounded capability list; here
 // the canonical time and a non-empty version are optional, so a looser extension build keeps its
 // activation, storage and port facts in a report instead of losing the whole observation.
+// Version 2 adds `tabs` (readiness: a port of that type answered its last ping) and `pendingUpdateVersion`.
 export const EXTENSION_SNAPSHOT_VOCABULARY = Object.freeze({
-    keys: Object.freeze(['protocolVersion', 'observedAt', 'extensionVersion', 'capabilities', 'activationIdentity', 'storageRead', 'ports']),
+    keys: Object.freeze(['protocolVersion', 'observedAt', 'extensionVersion', 'capabilities', 'activationIdentity', 'storageRead', 'ports',
+        'tabs', 'pendingUpdateVersion']),
     activation: Object.freeze(['present', 'absent', 'unknown']),
     storageRead: Object.freeze(['passed', 'failed', 'unknown']),
     ports: Object.freeze(['wb', 'wbSeller', 'ozon']),
 });
 const portSchema = { oneOf: [boolean, { const: 'unknown' }] };
+const tabReadinessSchema = closed({ ready: boolean, lastPingAgeMs: nonNegativeInteger }, ['ready']);
 export const extensionSnapshotFactsSchema = closed({
-    protocolVersion: { const: 1 },
+    protocolVersion: { type: 'integer', minimum: 1, maximum: 2 },
+    tabs: closed(Object.fromEntries(EXTENSION_SNAPSHOT_VOCABULARY.ports.map((key) => [key, tabReadinessSchema])), [...EXTENSION_SNAPSHOT_VOCABULARY.ports]),
+    pendingUpdateVersion: { type: 'string', pattern: '^\\d{1,9}(\\.\\d{1,9}){0,3}$' },
     observedAt: { type: 'string', minLength: 24, maxLength: 24 },
     extensionVersion: { type: 'string', minLength: 1, maxLength: 128 },
     capabilities: list({ type: 'string', minLength: 1, maxLength: 128 }),
@@ -150,3 +166,30 @@ export const extensionSnapshotFactsSchema = closed({
     storageRead: closed({ state: enumeration(EXTENSION_SNAPSHOT_VOCABULARY.storageRead) }, ['state']),
     ports: closed(Object.fromEntries(EXTENSION_SNAPSHOT_VOCABULARY.ports.map((key) => [key, portSchema])), [...EXTENSION_SNAPSHOT_VOCABULARY.ports]),
 }, ['protocolVersion', 'capabilities', 'activationIdentity', 'storageRead', 'ports']);
+
+// The extension_log check (extension-log.mjs): how the reader fared, and Chrome's native-port close text reduced to a
+// class, so the text itself never reaches a result, a status or a report.
+export const EXTENSION_LOG_VOCABULARY = Object.freeze({
+    readerStates: Object.freeze(['read', 'no_log', 'no_profile', 'unreadable', 'format_unknown', 'truncated']),
+    closeClasses: Object.freeze(['host_not_found', 'host_forbidden', 'host_blocked', 'host_exited', 'start_failed', 'communication_error', 'other']),
+});
+// Published as it is in the local_bridge_status output schema, so every node carries its description.
+const described = (schema, description) => ({ ...schema, description });
+const secondsAgo = (what) => described(nonNegativeInteger, `Whole seconds before the observation since ${what}.`);
+export const extensionLogFactsSchema = closed({
+    reader: described(enumeration(EXTENSION_LOG_VOCABULARY.readerStates), 'How the reader fared: read, no_log, no_profile, unreadable, format_unknown or truncated.'),
+    browser: described(enumeration(EXTENSION_INSTALL_VOCABULARY.browsers), 'Browser whose profile held the log that decided.'),
+    lastTriggerAgoS: secondsAgo('something last asked the extension to open the connector'),
+    lastHandshakeAgoS: secondsAgo('the connector last answered the extension'),
+    lastClose: described(closed({
+        class: described(enumeration(EXTENSION_LOG_VOCABULARY.closeClasses), 'The browser close reason reduced to a closed class; its text is never returned.'),
+        agoS: secondsAgo('that close'),
+        handshaken: described(boolean, 'Whether the connector had answered before the close.'),
+    }, ['class', 'agoS', 'handshaken']), 'The last time the browser closed the connector port.'),
+    missingStreak: described(closed({
+        open: described(boolean, 'Whether the run of not-found or forbidden closes is still going on.'),
+        startedAgoS: secondsAgo('the run began'),
+    }, ['open', 'startedAgoS']), 'The run of not-found or forbidden closes the extension retries every 15 s.'),
+    startFailures: described(nonNegativeInteger, 'Failed connector starts since the browser started, or all of them when that start is unknown.'),
+    refused: described({ const: 'extension_id_mismatch' }, 'The extension refused to open the connector because its own ID is not the one it was built for.'),
+}, ['reader', 'startFailures']);

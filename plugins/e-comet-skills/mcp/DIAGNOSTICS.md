@@ -15,6 +15,8 @@ Negotiated browser-job refusals may include a versioned, closed browser-job reje
 | `invalid_job` (optional `diagnostic`) | our defect (agent input or contract) | Report; when present, `diagnostic` names the offending field. |
 | `public_key_not_configured`, `invalid_signature`, `issuer_mismatch`, `audience_mismatch`, `invalid_format`, `invalid_algorithm` | our infrastructure | Report; do not ask the user to change anything. |
 | `user_not_available` | e-Comet session inside the extension | Check activation with the API key; report if it repeats. |
+| `device_clock_ahead`, `device_clock_behind` (with integer `skewMinutes`) | user | This computer's clock differs from e-Comet's by more than a minute; the message names the skew. The user syncs the system clock, then one fresh authorization on the user's decision. |
+| `storage_unavailable` | user, then e-Comet | The browser could not read or write the extension storage. The user restarts the browser, then one fresh authorization; if it repeats, offer a report. |
 | `unknown` | — | Report. |
 
 `errorDetails.code:"WB_NOT_AUTHENTICATED"` on a buyer product unit (`products[].units[].errorDetails`)
@@ -25,7 +27,7 @@ does not produce this code.
 
 ## Missing authorization handoff
 
-A signed local tool answers `code:"BROWSER_JOB_HANDOFF_REQUIRED"` (`stage:"handoff"`, `retryable:true`) when it was called without `triggerUrl`; the Ozon tools answer `OZON_AUTHORIZATION_REJECTED` with the message "The trusted browser-job hook did not provide Ozon authorization." for the same condition. Model-authored arguments must omit `triggerUrl`, so this means the host `PreToolUse` hook did not run or did not rewrite the input: the plugin hooks are not trusted, are disabled, changed after a plugin update, or the host does not run plugin hooks in this task. It is not a marketplace, extension or e-Comet account failure, and `browser_job` was already called once. Do not call `browser_job` or the local tool again until the hook condition is resolved: each repeat spends one signed authorization and fails the same way. On an observed Codex host, run installation `hook_permissions` (`safe_probes`) and follow its `disabled`, `review_required` and `not_checked` guidance below; the user action is Settings → Plugins → Personal → e-Comet MCP Tools → Hooks. On Claude Code, `/hooks` lists the configured hooks. On Cowork there is no hook-trust control. A Claude conversation runs plugin hooks only after its sandbox starts, and a new task starts without it: when the local tools are named `mcp__remote-devices__...` and no shell command has run in the conversation, run one no-op shell command (`true`), then call `browser_job` once and the local tool once. Otherwise verify that the plugin is installed and enabled in Customize → Plugins → Yours. The receipt is `outcome:"failed"`, `retryDisposition:"unknown"`.
+A signed local tool answers `code:"BROWSER_JOB_HANDOFF_REQUIRED"` (`stage:"handoff"`, `retryable:false`) when it was called without `triggerUrl` (the message names Codex hooks awaiting approval as the usual Codex cause), or with one that is not a browser job (the message then says the trigger URL is not usable, or too large); the Ozon tools answer `OZON_AUTHORIZATION_REJECTED` with the message "The trusted browser-job hook did not provide Ozon authorization." for the same condition. Outside Cowork, model-authored arguments must omit `triggerUrl`, so this means the host `PreToolUse` hook did not run or did not rewrite the input: the plugin hooks are not trusted, are disabled, changed after a plugin update, or the host does not run plugin hooks in this task. It is not a marketplace, extension or e-Comet account failure, and `browser_job` was already called once. Do not call `browser_job` or the local tool again until the hook condition is resolved: each repeat spends one signed authorization and fails the same way. On an observed Codex host, run installation `hook_permissions` (`safe_probes`) and follow its `disabled`, `review_required` and `not_checked` guidance below; the user action is to enable and trust all e-Comet hooks at once in Settings → Plugins → Personal → e-Comet MCP Tools → Hooks, since Codex asks again after every plugin update. On Claude Code, `/hooks` lists the configured hooks. On Cowork, where the local tools are named `mcp__remote-devices__...`, the host refuses a device call whose arguments a hook changed, so the model passes `triggerUrl` itself there and this code means the call lacked it: pass `trigger_url` from the same `browser_job` result, unchanged, as `triggerUrl` and call the local tool once more, without a new `browser_job`. The receipt is `outcome:"failed"`, `retryDisposition:"unknown"`. A hook that refuses the call itself answers with a `HANDOFF_*` denial instead; see Hook denials below.
 
 ## Seller cabinet codes
 
@@ -33,9 +35,13 @@ A signed local tool answers `code:"BROWSER_JOB_HANDOFF_REQUIRED"` (`stage:"hando
 browser where the extension is connected. `SELLER_LOGIN_REQUIRED` (`stage:"execution"`, `retryable:false`) means the
 extension found no signed-in cabinet tab: the user opens the cabinet there and signs in; the package aborts, and one
 fresh `browser_job` follows on the user's decision. `SELLER_AUTH_UNAVAILABLE` with the same stage means a cabinet tab was
-selected but the extension could not read the page's own request credentials within its bounded wait. With
-`browserContext.sellerTabConnected:true` that is an e-Comet defect to report, never a user action; repeating spends
-authorizations without changing the outcome.
+selected but the extension could not read the page's own request credentials within its bounded wait; the
+`reason` in the error's details says which. For a missing token (`access_token_missing`, `seller_token_missing`, `both_missing`)
+the user reloads the seller portal tab and signs in if it asks, then one fresh `browser_job` for the remaining exports
+on the user's decision. If the same reason comes back, it is an e-Comet defect to report (the extension reads the
+tokens from the page's storage, whose keys Wildberries has renamed before): repeating again spends authorizations
+without changing the outcome. `header_too_long` (the sign-in data exceeds the extension's own limit) and
+`reader_failed` are e-Comet defects to report at once.
 
 ## Existing status contract
 
@@ -61,25 +67,33 @@ waits to produce it.
 | Field | Producer and exact meaning | Inference boundary / next discriminating check |
 | --- | --- | --- |
 | `code` | Cause classification set by the bridge. `connected`: an extension route is observed. `connecting`: the bridge is still starting, or a tool call is waiting up to 30 s for a broker about to appear. The other values are the causes from the table below; `BRIDGE_NO_BROWSER` is the one used when nothing more specific was observed. A route lost mid-job is the failing tool call's EXTENSION_DISCONNECTED, never a status code: status then names the cause found since. | It classifies the bridge, not a marketplace, a login or a particular operation. A value that is not listed is kept as data and given no invented meaning. |
-| `registration.state`, `registration.version`, `registration.runtime`, `registration.manifestWrittenAt`, `registration.error`, `registration.error.name`, `registration.error.code` | The last browser-host registration check made by this process; `registration` is null until one ran. State is `registered` (something was written), `current` (already up to date), `disabled` (this run registers nothing), `failed` (a step failed) or `denied` (macOS refused a browser folder). Any other refused browser folder makes it `failed` only when no folder holds the manifest; otherwise it stays `registered` or `current` with the refusal in `registration.error`. Runtime is `path_node` (Node found on PATH) or `host_executable` (the host application's own executable), null when none was resolved. `registration.manifestWrittenAt` is the ISO time of the newest host manifest, null when unknown. `registration.error` names the failed step and its system code, null without a failure. | Registration says where the browser would start the broker from, not that a browser did. The error carries a step name and a code, never a message or a path. |
+| `registration.state`, `registration.version`, `registration.runtime`, `registration.manifestWrittenAt`, `registration.error`, `registration.error.name`, `registration.error.code` | The last browser-host registration check made by this process; `registration` is null until one ran. State is `registered` (something was written), `current` (already up to date), `disabled` (this run registers nothing), `failed` (a step failed) or `denied` (macOS refused a browser folder). Any other refused browser folder makes it `failed` only when no folder holds the manifest; otherwise it stays `registered` or `current` with the refusal in `registration.error`. Runtime is `path_node` (Node found on PATH) or `host_executable` (the host application's own executable), null when none was resolved. `registration.manifestWrittenAt` is the ISO time of the newest host manifest, null when unknown. `registration.verifiedSinceAt` is the ISO time since which what the browser reads (the manifest, the launcher and, on Windows, the registry key) has stayed unchanged: rewriting identical content keeps it, and a key that a repair found missing or different starts it again; null when unknown. `registration.runtimeRecheck` is `not_run` (no repair, or the launcher was just written), `passed` (a repair started the launcher's runtime with -v and it answered as Node 22 or newer), `repaired` (it was missing or answered an older version, and the launcher now names another runtime), `failed` (it was missing or older and no other runtime was found; the launcher is left as it is) or `inconclusive` (the answer proved nothing: a start this process may not make, such as another host's packaged executable, a timeout, an exit or no version; the launcher is left as it is). `registration.error` names the failed step and its system code, null without a failure. | Registration says where the browser would start the broker from, not that a browser did. The error carries a step name and a code, never a message or a path. |
 | `userLevelHosts` | One item per browser: the browser; `allowed`, whether its NativeMessagingUserLevelHosts policy allows hosts registered per user (true, false, or null when no policy is set); and `hostBlocked`, whether its NativeMessagingBlocklist and NativeMessagingAllowlist policies block the e-Comet host io.ecomet.bridge (true when the block list holds `*` or the host and the allow list does not name it, false when the lists do not block it, null when no block list is set). Only mandatory policies count, as in the browser; recommended ones are ignored. Empty when no policy was read. Read at start, on a tool call that finds no broker and in a diagnosis, not in the background, so between them it can be out of date. | A false `allowed` or a true `hostBlocked` is a policy somebody set, not a fault of the installation. |
 | `extensionInstall` | The facts the extension_install probe returns, in the shape documented for e_comet_diagnose; null until a probe ran. | Profile metadata only. It never proves that the extension is connected. |
 | `brokers` | Live broker entries, newest first. Each item has the process id, the browser the extension reported, the extension and broker versions, the ISO start time, and whether this process is connected to it. Empty when none runs. | An entry never carries the nonce or the endpoint. A listed broker does not prove that a job will succeed. |
-| `lastFailureRecord`, `lastFailureRecord.name`, `lastFailureRecord.code`, `lastFailureRecord.at` | The newest broker failure record that is newer than every live entry, the newest manifest write and this process's last good session; older records are ignored and deleted. Null when there is none. | A record names an error and its code, never a message or a path. It counts toward a cause only while the probe shows an install enabled on a native-capable extension build. |
+| `lastFailureRecord`, `lastFailureRecord.name`, `lastFailureRecord.code`, `lastFailureRecord.at` | The newest broker failure record that is newer than every live entry, the newest manifest write and this process's last good session; older records are ignored and deleted. Null when there is none. | A record names an error and its code, never a message or a path. It counts toward a cause while the probe shows an install enabled on a native-capable extension build, or when it is newer than the registration's last change. |
+| `policyReadFailed` | The browsers whose native messaging policy read observed nothing: a timeout, or a reader that did not start. Their `userLevelHosts` values are null because nothing was seen, not because no policy is set. Empty when every read worked; the bug report's bridge block carries the same list when it is not empty. | An unread policy is a possible cause, not a proven one: a browser whose policy was read and admits the host is chosen first. |
+| `owner` | Who can act on the cause in `code`, by the assignment in the table below: `user`, `administrator` (whoever manages the computer), `e_comet`, or `unknown`. Absent while `connected` or `connecting`. | The failing tool call carries the owner in its message wording only. `unknown` is a start failure no fact narrowed: follow the guided steps, then report. |
+| `comspec` | `valid`, `invalid` or `unknown`: whether the Windows ComSpec environment variable names an existing cmd.exe, which the browser needs to start the connector. Read in-process by the last tool call that found no broker or runtime `extension_log` probe; present only on Windows while the code is `BRIDGE_HOST_START_FAILED`. `unknown` means this process has no ComSpec: it sees its host's environment, not the browser's, and a host may leave the variable out. | `invalid` makes the owner `administrator`. `valid` rules this one cause out and nothing more; `unknown` rules nothing in or out. |
 | `clientProtocolVersion`, `brokerProtocolVersion`, `brokerVersion` | The client protocol version this plugin speaks, the one the connected broker reported, and that broker's plugin version. The last two are null without a broker session. | Different versions are a fact to report, not a reason to retry. |
+| `transportEvents` | The last 32 transport events this process saw, oldest first, each with `at` (when it was first seen), `kind` and `code`. Kinds: late_answer (an answer arrived for a request that had already settled, usually after its timeout; the code is the answer's own typed code or what kind of answer it was), connect_failed (a broker entry exists but the connect failed; the code is the system code or the closed outcome), session_end (the session ended; the code is the broker's reason, the broken stream's code, or closed), registration_step_failed (the failed step and its system code joined, such as ManifestWrite_EPERM) and failure_record_seen (a broker failure record, named the same way, seen before a later start deletes it). A repeat of the newest event is not listed again. The bug report carries the same list within its own 4 KiB. | Codes are short identifiers, never a request id, a path or a message. An event is a fact about the transport; it names no cause by itself. |
 
 | Cause | Observed condition | Owner and supported next step |
 | --- | --- | --- |
 | `BRIDGE_NO_BROWSER` | No live broker entry and none of the more specific causes below was observed, including no install observed or an unreadable profile. | User: open the browser that has the e-Comet extension (the named browser when the probe saw one; install it from the Chrome Web Store if it is missing), click the e-Comet icon, accept the permission the browser asks for, then repeat the request; if it still fails, apply the extension update or restart the browser, then report it. |
-| `BRIDGE_HOST_NOT_STARTED` | No live broker entry, and the browser that would be chosen has the extension enabled on a native-capable build, a policy that admits the host, and a process singleton showing it running for at least 30 s: its extension had the time to start the connector and did not. | User: click the e-Comet icon in the profile where e-Comet is installed (open that profile if it is closed), then repeat the request; if it still fails, report it and also write to e-Comet support in the chat on app.e-comet.io from that profile, which can attach the extension's log. |
+| `BRIDGE_HOST_NOT_STARTED` | No live broker entry, and the browser that would be chosen has the extension enabled on a native-capable build, a policy that admits the host, and a process singleton showing it running for at least 30 s: its extension had the time to start the connector and did not. The extension's own log, when it could be read, names none of the log causes below (`BRIDGE_HOST_NOT_FOUND`, `BRIDGE_HOST_FORBIDDEN`, `BRIDGE_HOST_START_FAILED`, `BRIDGE_BROKER_NOT_VISIBLE`, or a policy block as `BRIDGE_HOST_BLOCKED`), or the browser lists the profile it was read from as closed. When that browser's policy could not be read (`policyReadFailed`), the message adds that an administrator policy on this computer may block the connector. | User: click the e-Comet icon in the profile where e-Comet is installed (open that profile if it is closed), then repeat the request; if it still fails, report it and also write to e-Comet support in the chat on app.e-comet.io from that profile, which can attach the extension's log. |
+| `BRIDGE_HOST_NOT_FOUND` | For the browser that would be chosen, the extension's own log (the extension log check) shows the browser answering "not found" for the connector in this run of the browser, with no connection since, while the registration had stayed unchanged for at least 20 s when the log was read, longer than the extension's 15 s search interval. A registration this call has just restored is decided by a later read of the log, never by status on its own clock. | e-Comet: the browser does not see the connector's registration, and repeating does not help. Report it. |
+| `BRIDGE_HOST_FORBIDDEN` | The extension's log for that browser shows a "forbidden" answer since the registration last changed and no connection since, or a run of "forbidden" answers still open in this run of the browser while the registration had stayed unchanged for at least 20 s when the log was read (the extension writes only a run's first answer, so a later registration change does not end it), or the extension refused to open the connector because its own ID is not the one it was built for, with no connection since. | e-Comet: this copy of the extension is not from the Chrome Web Store, or an e-Comet defect. Report it. |
+| `BRIDGE_HOST_START_FAILED` | The extension's log for that browser shows the connector started after the registration last changed and after the browser started, and ending before it answered (the browser's "exited", "failed to start" or "communication" answer, or the extension's own handshake timeout), with no connection since, while no broker entry and no failure record exist: something stopped it before e-Comet's code ran. On Windows, a ComSpec environment variable that does not name an existing cmd.exe narrows it, and the message then names that variable. | Unknown: ask which security program is installed and to check its quarantine or blocked list for e-Comet, then click the e-Comet icon in that browser and repeat (after failed starts the extension waits for an icon click or a browser start); if that does not help, follow the doctor's guided steps and report. With ComSpec: whoever manages the computer restores it, then the user restarts the browser and the agent app and repeats; not a fault of e-Comet or the user. |
+| `BRIDGE_BROKER_NOT_VISIBLE` | The extension's log for that browser shows the connector answered in this run of the browser and nothing closed it since, but this process finds no broker entry or none it can connect to: the profile with e-Comet may have been closed (that writes no row), or the connector runs under another user account or app. | User: click the e-Comet icon in the profile where e-Comet is installed (open that profile if it is closed), then repeat the request; if it still fails, the connector may run under another user account or app: report it. |
 | `BRIDGE_PERMISSION_REQUIRED` | The browser keeps the native-capable extension disabled until the user accepts its new permission. | User: accept the permission in the named browser, then repeat the request. |
 | `BRIDGE_EXTENSION_OUTDATED` | No enabled install runs a native-capable extension build. | User: apply the extension update offered on app.e-comet.io or restart the browser, accept the new permission, repeat; report if the version stays old. |
 | `BRIDGE_EXTENSION_DISABLED` | At least one install was observed and every observed install is disabled for a reason other than the permission. | User: turn e-Comet on in the extensions page of the browser. |
-| `BRIDGE_USER_HOSTS_DISABLED` | The NativeMessagingUserLevelHosts policy is false for every browser that would otherwise be chosen, and none of them blocks the host. | Whoever manages the computer: allow hosts registered per user. |
-| `BRIDGE_HOST_BLOCKED` | No browser that would otherwise be chosen admits the host, and in at least one of them NativeMessagingBlocklist holds `*` or io.ecomet.bridge while NativeMessagingAllowlist does not name it. The browser then refuses to start the connector ("Access to the native messaging host was disabled by the system administrator."). | Whoever manages the computer: allow io.ecomet.bridge in NativeMessagingAllowlist. Not a fault of e-Comet or the user. |
-| `BRIDGE_BROKER_UNRESPONSIVE` | A live broker entry exists, and its endpoint did not accept within 2 s, failed with an error that does not prove the entry stale, or accepted and then closed or sent no hello reply within 5 s. | User: restart the browser; report if it repeats. |
-| `BRIDGE_BROKER_FAILED` | The registration is `failed`, or, with an install enabled on a native-capable extension build, a broker failure record is newer than every live entry, the newest manifest write and this process's last good session. | Report it to e-Comet without naming a cause: the registration error or the failure record carries the step and code. Neither alone names the owner: a broker failure record keeps the system code, such as ENOSPC or EPERM, when the computer refused a startup step. |
-| `BRIDGE_FRAME_TOO_LARGE` | The broker refused a message for the extension, or the client refused an oversize one before writing; the tool error's message names the refusal code in parentheses (FRAME_TOO_LARGE, FRAME_MALFORMED, AUTHORIZATION_NOT_OWNED, ID_TOO_LONG, SESSION_CONTROL_FORBIDDEN). | Our defect: report it. |
+| `BRIDGE_USER_HOSTS_DISABLED` | The NativeMessagingUserLevelHosts policy is false for every browser that would otherwise be chosen, and none of them blocks the host. | Whoever manages the computer: allow hosts registered per user; after that the user restarts the browser and repeats the request. |
+| `BRIDGE_HOST_BLOCKED` | No browser that would otherwise be chosen admits the host, and in at least one of them NativeMessagingBlocklist holds `*` or io.ecomet.bridge while NativeMessagingAllowlist does not name it. The browser then refuses to start the connector ("Access to the native messaging host was disabled by the system administrator."); that close in the extension's log, current in this run of the browser, gives the same code when the registry read saw no such policy (a cloud-managed browser). | Whoever manages the computer: allow io.ecomet.bridge in NativeMessagingAllowlist; after that the user restarts the browser and repeats the request. Not a fault of e-Comet or the user. |
+| `BRIDGE_BROKER_UNRESPONSIVE` | A live broker entry exists, and its endpoint did not accept within 2 s, failed with an error that does not prove the entry stale, or accepted and then closed or sent no hello reply within 5 s. | e-Comet: the first step is asking the user to restart the browser and repeat the request; if it repeats, report it. |
+| `BRIDGE_BROKER_FAILED` | The registration is `failed`, or a broker failure record is newer than every live entry, the newest manifest write and this process's last good session, and either an install is enabled on a native-capable extension build or the record is newer than the registration's last change (`registration.verifiedSinceAt`): that registration's broker ran and failed. | e-Comet: report it without naming a cause: the message names the failed step and its system code, as in "failed at RegistryWrite, code WMI_CREATE_5", from the registration error or the failure record (UNKNOWN when there was none). Neither alone names the owner: a broker failure record keeps the system code, such as ENOSPC or EPERM, when the computer refused a startup step. |
+| `BRIDGE_FRAME_TOO_LARGE` | The broker refused a message for the extension, or the client refused an oversize one before writing; the tool error's message names the refusal code in parentheses (FRAME_TOO_LARGE, FRAME_MALFORMED, AUTHORIZATION_NOT_OWNED, ID_TOO_LONG, SESSION_CONTROL_FORBIDDEN). | e-Comet: our defect; report it. |
 | `BRIDGE_MACOS_FOLDER_ACCESS` | macOS denied the manifest write into a browser folder. | User: in System Settings under Privacy and Security, Files and Folders, allow the browser for the application that runs the agent, then repeat. |
 | `BRIDGE_UNAVAILABLE_IN_WSL` | The MCP process runs inside WSL. | User: run the agent on Windows; in Codex Desktop turn off running the agent in WSL. |
 | `BRIDGE_UNSUPPORTED_PLATFORM` | The MCP process runs on an operating system that registration does not cover: neither Windows, macOS nor Linux. | User: use the agent on Windows, macOS or Linux. |
@@ -91,10 +105,11 @@ Every check has `check`, `state`, `observedAt`, `source`, and `executionPlane`. 
 | Field | Exact meaning and producer | Boundary / next check |
 | --- | --- | --- |
 | `diagnostics.snapshot` | MCP status observation time | It dates this response, not every nested source observation. |
-| `diagnostics.runtime.facts.nodeVersion`, `diagnostics.runtime.facts.platform`, `diagnostics.runtime.facts.arch`, `diagnostics.runtime.facts.bridgeVersion`, `diagnostics.runtime.facts.mcpProtocolVersion` | Current Node process and negotiated MCP metadata | It does not identify a hook process or host UI. |
-| `diagnostics.client.facts.name`, `diagnostics.client.facts.version`, `diagnostics.client.facts.provenance`, `diagnostics.client.facts.hostRuntimeVersion` | Bounded strings retained from MCP initialize; provenance is `client_reported`. The host runtime version is present only under the native DeepSeek adapter: the DeepSeek Harness runtime version it resolved its declared peers against, passed through the local module's environment; never the Desktop product version | It is not a trusted host-session identity or proof of hook support. Malformed/oversized input is omitted. |
-| `diagnostics.routeFreshness.facts.lastObservedAt` | Time of an actually observed route response, when a producer supplies it | No current producer supplies a freshness time, so the check is `unknown` with next check `observe_extension_heartbeat`; `browserContext.changedAt` is never substituted. |
+| `diagnostics.runtime.facts.nodeVersion`, `diagnostics.runtime.facts.platform`, `diagnostics.runtime.facts.arch`, `diagnostics.runtime.facts.bridgeVersion`, `diagnostics.runtime.facts.mcpProtocolVersion`, `diagnostics.runtime.facts.osRelease` | Current Node process and negotiated MCP metadata; the OS release is the kernel release os.release() reports, kept only in a bounded version grammar | It does not identify a hook process or host UI. |
+| `diagnostics.client.facts.name`, `diagnostics.client.facts.version`, `diagnostics.client.facts.provenance`, `diagnostics.client.facts.hostRuntimeVersion`, `diagnostics.client.facts.hostLastFailure`, `diagnostics.client.facts.hostRestarts` | Bounded strings retained from MCP initialize; provenance is `client_reported`. The host runtime version is present only under the native DeepSeek adapter: the DeepSeek Harness runtime version it resolved its declared peers against, passed through the local module's environment; never the Desktop product version. The same adapter passes, after it started the module again, the closed class of the last failure (`spawn_failed`, `timeout`, `exited`, `protocol` or `unknown`) and how many times it started it again | It is not a trusted host-session identity or proof of hook support. Malformed/oversized input is omitted. A restart count says the module stopped before, not why this call failed. |
+| `diagnostics.routeFreshness.facts.lastObservedAt` | Time of the last frame the extension sent over a session; frames the broker writes itself are not counted | Without a frame since this process started the check is `unknown` with next check `observe_extension_heartbeat`; `browserContext.changedAt` is never substituted. A recent frame does not prove the next request will be answered. |
 | `diagnostics.storage.facts.scope`, `diagnostics.storage.facts.targets` | Sanitized copy of resolved targets; scope is `configuration` | It does not establish writability. A future explicit storage I/O fact is the discriminating check. |
+| `diagnostics.extensionLog`, `diagnostics.extensionLog.facts.reader`, `diagnostics.extensionLog.facts.browser`, `diagnostics.extensionLog.facts.lastTriggerAgoS`, `diagnostics.extensionLog.facts.lastHandshakeAgoS`, `diagnostics.extensionLog.facts.lastClose.class`, `diagnostics.extensionLog.facts.lastClose.agoS`, `diagnostics.extensionLog.facts.lastClose.handshaken`, `diagnostics.extensionLog.facts.missingStreak.open`, `diagnostics.extensionLog.facts.missingStreak.startedAgoS`, `diagnostics.extensionLog.facts.startFailures`, `diagnostics.extensionLog.facts.refused` | The `extension_log` check the last tool call that found no broker, or the last runtime `extension_log` probe made while no extension was connected, read from the browser profile on disk, described with its probe below: reader `read`, `no_log`, `no_profile`, `unreadable`, `format_unknown` or `truncated`; browser `chrome`, `edge`, `brave`, `yandex` or `opera`; close class `host_not_found`, `host_forbidden`, `host_blocked`, `host_exited`, `start_failed`, `communication_error` or `other`; refused `extension_id_mismatch`. Ages are whole seconds before this status observation. Present only after such a read, and dropped once a broker connects. | Status never reads the disk for it. The cause in `code` weighs the read it keeps as of when it was read, so after the user's step run the runtime `extension_log` probe, which re-judges `code` while no extension is connected, or repeat the request that failed; the facts tell what the browser last answered and when. |
 
 Unknown future fields and enum values must be preserved as data by consumers but must not receive an invented interpretation. Raw paths, secrets, environment values, browser payloads, and error messages are outside this contract.
 
@@ -134,7 +149,8 @@ agent's host context and is not accepted through ordinary process environment or
 
 `e_comet_diagnose` accepts `scope` (`installation`, `runtime`, or `last_operation`) and `mode` (`passive` or
 `safe_probes`). `operationHandle` is required only for `last_operation`. `probes` is an allowlisted array containing
-`storage_write`, `extension_snapshot`, `hook_permissions`, `extension_install`, and/or `codex_mcp_auth`; a probe runs only in `safe_probes` and only in its applicable scope.
+`storage_write`, `extension_snapshot`, `extension_log`, `hook_permissions`, `extension_install`, and/or `codex_mcp_auth`; a probe runs only in `safe_probes` and only in its applicable scope
+(`extension_snapshot` and `extension_log` in runtime, the others in installation).
 The response fields are `schemaVersion:1`, the echoed `scope` and `mode`, `checks: DiagnosticCheck[]`, and optional
 `operation`. Passive installation checks are the in-process doctor checks above, with the same package-metadata and
 host-observation limitations even though this response does not repeat the doctor's `limitations` object. They do not
@@ -181,10 +197,9 @@ not that a hook ran in the current task. Successful `facts.hooks[]` contains onl
 state, and trust status; commands, paths, hashes, raw warnings and errors, and unrelated hooks are not returned.
 `installationMatch` and `currentApplicationMatch` remain `not_verified`: reading local configuration does not identify
 the installed package copy or the application that owns the current task.
-`status:"ready"` requires the seven Codex-supported e-Comet handlers to be present exactly once, enabled, and trusted
-or managed. `disabled` and `review_required` are separate failures; missing, partial, duplicate, and unknown inventories
-do not pass. Codex currently omits the packaged `PostToolUseFailure` handler because this native host version does not
-support that event. If the inspector cannot return a snapshot, the check is `not_checked` and inventory fields are omitted.
+`status:"ready"` requires the five e-Comet handlers to be present exactly once, enabled, and trusted or managed.
+`disabled` and `review_required` are separate failures; missing, partial, duplicate, and unknown inventories do not
+pass. If the inspector cannot return a snapshot, the check is `not_checked` and inventory fields are omitted.
 When the device stops waiting on its own inspector instead, the check is `unknown` with cause `unavailable` and source
 `device_process`, the same way an abandoned snapshot request is recorded: our own deadline is never a Codex fault.
 Its separate `configuration_probe` facts contain only `status:"failed"` and a closed failure `{reason,phase}`: reason is
@@ -223,9 +238,11 @@ browser has fetched and not yet applied. Either is omitted when the files give n
 The fact shape is
 `extension_install.facts.{extensionId,browsers[].{browser,profileSource,readFailures,profiles[].{profile,state,disableReasons[],permissionsIncrease,version?,pendingVersion?,lastUsedDaysAgo?},running?,runningSince?}}`.
 `running` tells whether that browser runs, from the process singleton in its user-data folder, read with plain file
-calls: on Windows the `lockfile` the browser holds open and the system removes when it exits, even after a crash; on
-macOS and Linux the `SingletonLock` link to `<host>-<pid>`, which counts only when it names this computer and a live
-process, because a crash leaves the link behind. It is `true`, `false`, or `null` when the singleton could not be read
+calls: on Windows the `lockfile` the browser holds open and the system removes when it exits, even after a crash, and
+one written before the system last booted (a power loss leaves it behind) counts as not running; on
+macOS and Linux the `SingletonLock` link to `<host>-<pid>`, which counts only when it was made since the system last
+booted and its process is alive, whatever the host name (macOS changes it with the network), because a crash or a power
+loss leaves the link behind. It is `true`, `false`, or `null` when the singleton could not be read
 or understood; a probe that predates it omits it. `runningSince`, present only with `running:true`, is the singleton's
 modification time, which is when the browser started. A running browser does not say which profile is open: the
 profile with e-Comet can still be closed. The singleton is no profile metadata, so it never counts as a read failure.
@@ -249,6 +266,50 @@ in checked browsers and profiles when metadata reads succeeded; partial or faile
 names a candidate browser, not the browser the user works in; the probe never proves that the extension is connected or
 activated. Activation of a connected extension is observed by the runtime `extension_snapshot` probe
 (`activationIdentity.state`), because an unactivated extension still connects to the local bridge.
+
+The `extension_log` check (source `browser_profile_storage`, plane `device`) is the extension's own record of its
+native connection, read from the browser profile on disk when no broker answers; it needs neither the broken link nor
+the user. Three readers produce it: a tool call that finds no broker (status keeps that check), the runtime
+`extension_log` probe of `e_comet_diagnose`, which reads again, refreshes the profile facts status shows as
+`extensionInstall` and, while no extension is connected, replaces the kept check, so status judges `code` and `owner`
+again from both, and feedback preparation while no extension is connected,
+whose read status does not keep. A reader that throws gives `unreadable`. It never proves a connection: it tells
+what the browser last told the extension and when. It reads only the e-Comet extension's storage folder of one profile:
+the enabled profile of the browser the cause names that the browser's `Local State` lists as focused last
+(`profile.last_used`), else one it lists with an open window (`profile.last_active_profiles`), else the one whose
+preference files changed last (one whose last use is unknown comes last). While that browser runs and lists the profile
+read as closed, its rows name no cause: a closed profile writes no row. The browser is the first in the bridge's own order,
+a running browser before a closed one, with the extension enabled on a native-capable build and a policy that does not forbid or block the host. A tool call
+that found no broker passes the browser it judged after reading the policies; with no such browser it reads nothing.
+The diagnosis probe and feedback preparation apply the policies the bridge last read the same way, and while an
+extension is connected they read the browser that extension reports.
+One read-only pass over that folder's database files serves both log keys, within 8 MiB per file, 32 MiB in all and
+2 s for every file read; past a limit it reports `truncated`. It decodes only the extension's connection log: the key
+`ecomet_native_connection_log`, and only when that key is absent (an extension that does not write it), the
+`native-connection` rows of `ecomet_request_logs`; the report's log file takes the rows of both. Only rows with a
+known connection action count; a row stamped more than 60 s ahead of this computer's clock, or without a numeric
+time, is ignored. The fact shape is
+`extension_log.facts.{reader,browser?,lastTriggerAgoS?,lastHandshakeAgoS?,lastClose?.{class,agoS,handshaken},missingStreak?.{open,startedAgoS},startFailures,refused?}`.
+`reader` is `read`, `no_log` (no log key: an extension build that predates native messaging, or a log cleared), `no_profile`
+(no browser with an enabled, native-capable install whose policy admits the host), `unreadable`, `format_unknown` (the database or the value is in a form this reader does
+not know) or `truncated` (a size or time limit was hit, or some database file could not be read or parsed or vanished during the read, so a value
+found in another file may be stale: file numbers do not order the data). Ages are whole seconds before the observation, never negative. `lastTriggerAgoS` is the last time
+something asked the extension to open the connector (a browser or worker start, the popup); `lastHandshakeAgoS` the
+last time the connector answered. `lastClose` is the last time the browser closed the connector's port: `class` is the
+browser's reason reduced to `host_not_found` (the browser does not see the connector's registration),
+`host_forbidden` (the registration does not allow this extension), `host_blocked` (an administrator policy blocks
+the connector, including a cloud policy the registry read misses), `host_exited`, `start_failed` (also the
+extension's own handshake timeout: a started connector that did not answer within 15 s),
+`communication_error` or `other`, and `handshaken` tells whether the connector had answered first. The browser's own
+text is never returned. `missingStreak` is the run of "not found" or "forbidden" closes the extension retries every
+15 s; it writes the run's first close and its end only, so an open streak has one row that may be days old.
+`startFailures` counts failed starts since the browser started (all of them when that start is unknown).
+`refused:"extension_id_mismatch"` means the extension build refused to open the connector because its own ID is not
+the one it was built for. States: `passed` for `read` and `no_log`, `not_checked` with cause `directory_absent` for
+`no_profile`, `failed` with cause `permission_denied` or `io_error` for `unreadable`, `unknown` with cause `corrupt`
+for `format_unknown` and with cause `unavailable` for `truncated`. A check whose facts leave this shape is `unknown`
+with cause `unknown` and no facts. Other keys of the extension's storage, other extensions and other profile files are
+never opened or decoded beyond what the database format needs to skip them.
 
 The installation `codex_mcp_auth` probe makes one bounded native `codex mcp list --json` call. It reports a
 configuration snapshot, not the current Desktop runtime connection, and selects exact configured names from our
@@ -277,7 +338,10 @@ The extension fact shape is
 `extension_snapshot.facts.{protocolVersion,observedAt,extensionVersion,capabilities[],activationIdentity.state,storageRead.state,ports.wb,ports.wbSeller,ports.ozon}`.
 The nested time is the extension observation time. Activation is `present`, `absent`, or `unknown`; storage is
 `passed`, `failed`, or `unknown`; every port is `true`, `false`, or `unknown`. Capabilities are extension-reported.
-Ports describe in-memory registration rather than login or operation readiness.
+Ports describe in-memory registration rather than login or operation readiness. An extension that announces
+`diagnostic_snapshot_v2` is asked for version 2, whose facts add `tabs.{wb,wbSeller,ozon}.{ready,lastPingAgeMs?}` (a port of
+that type answered its last ping; the age of the newest answer) and `pendingUpdateVersion` while a downloaded update
+waits; older extensions keep version 1.
 
 Runtime diagnosis also returns `host_hook_context` with `state:"not_checked"`, `source:"device_process"`,
 `executionPlane:"device"`, and `cause:"unavailable"`. The device MCP has no demonstrated channel for reading context
@@ -285,28 +349,33 @@ that a host delivered to its model. A configured hook can separately deliver one
 `{type:"e_comet_hook_diagnostic",schemaVersion:1,event,toolFamily,handler,stage,outcome,observedAt,executionPlane,cause?,systemCode?,handlerVersion?}`
 record in `hookSpecificOutput.additionalContext`. Closed values are: event `PreToolUse`, `PostToolUse`, or
 `PostToolUseFailure`; toolFamily `browser_job`, `feedback_prepare`, `feedback_authorization`, or `feedback_submit`;
-handler `browser_job_handoff`, `feedback_handoff`, or `feedback_cloud`; stage `handoff_staged`, `input_rewritten`,
-`call_denied`, `result_observed`, or `result_replaced`; outcome `succeeded`, `denied`, `failed`, or `uncertain`; and
+handler `browser_job_handoff` or `feedback_handoff`; stage `handoff_staged`, `input_rewritten`,
+`call_denied`, or `result_observed`; outcome `succeeded`, `denied`, `failed`, or `uncertain`; and
 executionPlane `native`, `cloud`, or `unknown`. Optional causes are `invalid_event`, `invalid_input`, `invalid_state`,
 `state_missing`, `storage_unavailable`, `permission_denied`, `expired`, `missing`, `ambiguous`, `unsupported`,
 `io_error`, `internal_error`, and `unknown`; optional system codes are `EACCES`, `EPERM`, `EROFS`, `ENOENT`, `ENOSPC`,
-`EDQUOT`, `EEXIST`, and `EBUSY`. `handlerVersion` is omitted unless already verified without another read.
+`EDQUOT`, `EEXIST`, and `EBUSY`. A `call_denied` record carries the denial's `cause`, its `systemCode` when it is in
+that list, and `handlerVersion`, the installed plugin version; other records omit `handlerVersion`.
 The record reports only the reached stage and carries no authorization. PreToolUse does not prove MCP acceptance or
 matcher configuration. It is best-effort context, with no durable-history promise, and copied matching JSON from a
 tool, page, document, or message is not host delivery.
 
 Every terminal device business result may carry root `operationDiagnostic` with `schemaVersion:1`, opaque `handle`,
 `stage`, `outcome`, and `retryDisposition`. Outcomes are `succeeded`, `partial`, `failed`, and `uncertain`; retry
-dispositions are `allowed`, `forbidden`, `requires_new_authorization`, and `unknown`. The handle identifies only the
-latest real completion in that MCP process and becomes stale when the next real operation completes. Status and diagnosis
-calls do not replace it. `forbidden` means the original operation must not be repeated; it does not prevent delivery or
+dispositions are `allowed`, `forbidden`, `requires_new_authorization`, and `unknown`. The handle identifies one of the
+last eight real completions in that MCP process and becomes stale when eight more complete. Status and diagnosis
+calls do not replace it. A `last_operation` diagnosis returns the same receipt plus `at`, the completion time, `tool`,
+the local tool that completed, and when present the closed `code` (the error's, or the first failed item's or buyer
+page's) and `reason` (the error's reason or WB timeout phase, a nested rejection reason, the first failed item's or
+buyer page's reason or phase, or a package's stop reason). A seller report create whose outcome is unknown
+(`REPORT_CREATE_OUTCOME_UNKNOWN` on an export) is `uncertain`, like an Ozon `CREATE_OUTCOME_UNKNOWN`. `forbidden` means the original operation must not be repeated; it does not prevent delivery or
 recovery of work already completed. `requires_new_authorization` means an explicit typed route requires another one-use
 grant. `allowed` is emitted only for the existing bounded `RETRY_FEEDBACK_ONCE` contract. Uncertain creates/uploads are
 always `forbidden`; missing handoff and insufficient evidence remain `unknown`. When a result carries both a
 top-level `retryable` flag and `operationDiagnostic.retryDisposition`, the `retryDisposition` governs repeats:
 `retryable:true` only says the failure class can clear once its prerequisite is fixed, never that the same call may
 be repeated without a user decision. Receipts never enter
-authorization input, nested errors, cloud-only adapter markers, or cloud-only preparation/finalization results.
+authorization input or nested errors.
 
 For decorated results, the JSON text representation is the same value as `structuredContent`; existing resource links
 remain attached. If receipt construction or decoration fails, the original business result is delivered unchanged.
@@ -325,15 +394,17 @@ fields; route freshness retains
 only a valid observed timestamp; storage retains only path-free configuration targets. The client check retains the
 bounded name and version the host sent in MCP initialize with `client_reported` provenance: it names the Claude or
 Codex runtime, or the DeepSeek adapter (`e-comet-deepseek-harness`, with the plugin package version) plus, under that
-adapter only, `hostRuntimeVersion`: the DeepSeek Harness runtime version the adapter resolved its declared peers against.
-The Desktop product version is not available to plugins. This is not a trusted host identity. The report's `## Host` section repeats it next to the preparation `route`,
-`native` for the device dispatcher and `cloud` for the Cowork hook, which is what tells a Cowork archive from a Claude
-Code archive prepared on the same device.
+adapter only, `hostRuntimeVersion`: the DeepSeek Harness runtime version the adapter resolved its declared peers against,
+and after a restart `hostLastFailure` and `hostRestarts`. Runtime also keeps `osRelease`.
+The Desktop product version is not available to plugins. This is not a trusted host identity. The report's `## Host` section repeats it next to the preparation `route`:
+`native` when a trusted hook signed the preparation, `unsigned` when none could (Cowork, whose host refuses a device call
+a hook changed). That line is what tells a Cowork archive from a Claude Code archive prepared on the same device.
 
 Preparation additionally collects, in parallel, one read-only `extension_snapshot`, recorded as `not_checked` with
 cause `unavailable` without any request when no extension route is connected; the passive installation checks
 `package_layout`, `package_metadata` or `codex_manifest`, `mcp_configuration`, and `entrypoint`; the `extension_install`
-probe; and, only when the client name is `codex-mcp-client`, the `hook_permissions` probe. Every probe is abandoned at the
+probe; the `extension_log` check while no extension is connected; and, only when the client name is
+`codex-mcp-client`, the `hook_permissions` probe. Every probe is abandoned at the
 same five-second evidence deadline instead of the business deadline, so a stalled read or inspector can cost seconds
 but never the report; an abandoned snapshot request is the `unknown` observation with cause `unavailable` above. Each
 probe result is the same closed check the doctor and `e_comet_diagnose` produce, admitted through the producer's own
@@ -343,15 +414,34 @@ probe that throws contributes nothing; one that observes a failure contributes t
 and the snapshot and `hook_permissions` probes record the device's own abandonment rather than vanishing. No probe
 blocks preparation. The remote sign-in and storage-write probes are not collected: `report_issue` is itself a
 remote call, and preparation already writes the archive. Paths, URLs, tokens, free-form errors, arbitrary facts,
-evidence references, suggested next checks, unknown slots, and future properties are excluded. Cowork carries this
-projection, bounded at 16 KiB, in the nonce-bound versioned prepare response and validates the complete response
-before creating the immutable archive. Mixed adapter versions fail closed and require updating the older plugin half
-and starting a fresh cloud task; the upload transport and archive bytes are unchanged.
+evidence references, suggested next checks, unknown slots, and future properties are excluded.
+
+The report's `bridge` block keeps, beside the cause `code` and the registration and broker facts, the cause's `owner`,
+the `comspec` state of a start failure on Windows, the registration's `runtimeRecheck`, the browsers whose policy read
+failed (`policyReadFailed`), every live broker's version (`brokerVersions`), the serving broker's version
+(`servingBrokerVersion`), the extension version behind the serving broker or the newest one (`extensionVersion`) and
+when the failure record was written (`lastFailureRecordAt`); each field only in its closed list or version grammar, and
+omitted when unknown. The report also carries the `transportEvents` ring beside the diagnostics, outside their 12 KiB
+cap, within its own 4 KiB: the newest events are kept, and the oldest leave until the whole projection fits 16 KiB.
+
+Every archive may hold `extension-log.json` after `report.md`, `metadata.json` and `transcript.jsonl`: the e-Comet
+extension's own log, read from the same profile the `extension_log` check reads, whether or not the extension is
+connected. With the history included it holds every row; without it, only the native connection rows. Each string
+value of a row passes the report redaction on its own, and a value under a credential name is replaced whole.  The file
+keeps the newest rows within 4 MiB in the order the extension stored them, and the archive drops it whole before it
+would shorten `report.md` or `metadata.json`. `metadata.json` says what it holds: `extensionLog` with `included`,
+`rows`, `scope` (`all` with the history, `connection` without) and `trimmed` (rows were left out to fit a limit). The file never
+appears in a tool result: the prepare result names the archive, not its contents.
 
 The report's `## Tool calls` section lists the newest hundred calls of the session in call order, each with the host's
 record time when it wrote one, the safe tool name, and the closed outcome read from the correlated result: `ok`,
 `status`, the `code`, `stage` and `cause` in their identifier grammars from the top level of a failure envelope or from its
-`error` object, and `is_error` when the host flagged the result. `status`, `code`, `stage` and `cause` are read only for an
+`error` object, the nested causes under the error's `details` (`reason`: its reason or WB timeout phase, or a
+rejection's reason; `bridgeCode`, `refusalCode`, `systemCode`, and the numeric `marketplaceErrorCode`), a package's
+`stopReason`, the code and stage of the first failed item or buyer page (`itemCode`, `itemStage`; a page keeps them in
+`errorDetails`), whose reason or phase fills `reason` when the error has none, and `is_error` when the host flagged the
+result. A line's outcome stays within
+256 bytes: a field that no longer fits is left out whole, in the order listed. All fields but `ok` are read only for an
 e-Comet tool — this server's own, and the remote MCP's recognized by its whole name — while any other server's call
 keeps `ok` and the host flag alone. The fields come from whichever
 text block of the result parses as a JSON object, including a recorded CallToolResult envelope and the exec wrapper of
@@ -364,6 +454,91 @@ errors, the extractor removes the exact `Error: ` wrapper and prefers the bridge
 `Structured MCP evidence: ` JSON object over rendered summaries and resource links. It bounds the whole text block
 before locating that delimiter and applies the same whole-object parsing and closed-field rules; malformed evidence
 contributes only the host error flag. Claude and Codex parsing is unchanged.
+
+## Failure details and the next step
+
+Each failure below gives its next step and owner in the message; the closed fields beside it are for receipts and
+reports. An extension or answer without the field keeps the earlier message. No field carries a token, header value,
+marketplace body or seller data.
+
+- `BROWSER_JOB_REAUTHORIZATION_REQUIRED` has `details.reason`: `expired` (one authorization lasts at most 10 minutes for
+  WB jobs, so split the remaining work into smaller jobs, one authorization each), `route_changed` (the bridge
+  connection changed: one fresh authorization for the remaining work), or `released` (the job had already ended).
+- A WB job stopped mid-run by an authorization or extension failure adds `details.completed` (WB requests answered;
+  their rows are in `resultPath` when it is present) and `details.pending` (signed requests not answered; an upper bound
+  for `wb_check_by_query` and `wb_recommendations_by_product`, which stop early on empty pages, and for
+  `wb_filters_by_query`, which asks for a full list only when a phrase has lists to expand).
+- `WB_FETCH_TIMEOUT` on a buyer item has `errorDetails.phase`: `no_tab` (the extension had to open a Wildberries tab;
+  the user keeps one open), `tab_loading` (the user waits until the page has loaded), `reload_backoff` or `reload_failed`
+  (the user opens the Wildberries tab and checks that it loads), `not_sent` (it waited behind other requests: retry with
+  fewer queries or pages), `sent_no_answer` (Wildberries did not answer: retry later, report if it repeats).
+- A failed buyer page during which the Wildberries page ran its anti-bot recovery has `errorDetails.recovery`:
+  `proactive_refresh_started`, `refreshed_and_retried`, `refresh_failed`, `service_unavailable`,
+  `retry_skipped_aborted`, `retried_after_shared_refresh` or `page_throttled` (Chrome throttles a Wildberries tab hidden
+  for long, and renewing the token in a fresh tab did not help or is paused for five minutes; it is not a Wildberries
+  rate limit: the user keeps one Wildberries store tab, closes the other store tabs but not the seller portal, and
+  switches to that tab so it is in front, then retry); such a page without another code reads
+  `errorDetails.code:"WB_REQUEST_FAILED"`. A failed `wb_check_by_query` or `wb_filters_by_query` row keeps the answer's `httpStatus`.
+- A Seller export `error.details.reason` is, for `SELLER_STATE_UNAVAILABLE`: `probe_cooling_down` (wait a few seconds,
+  then one fresh authorization), `restore_unresolved` (the user checks which company is selected in the seller portal)
+  or `storage_failed` (the user restarts the browser; report if it repeats, since a full extension storage quota
+  survives a restart); for `SELLER_AUTH_UNAVAILABLE`: `access_token_missing`, `seller_token_missing`, `both_missing`,
+  `header_too_long` or `reader_failed`, with the steps in Seller cabinet codes above.
+- A Seller failure the cabinet page classified has `error.details.class`: `network` (no answer from Wildberries),
+  `status` (with `httpStatus`), `envelope` (with `wbRefused:true` when Wildberries answered `error:true`) or `script`,
+  and `wbRefused`. A create Wildberries refused that way is a known failure, not `REPORT_CREATE_OUTCOME_UNKNOWN`.
+- A Seller workbook the local disk refused is `LOCAL_STORAGE_FAILED` (`stage:"storage"`) with `details.class:"disk"`
+  and `systemCode`, and the message names the step. Only `ENOSPC` and `EDQUOT` (free space) are the user's own; for
+  `EACCES`, `EPERM`, `EROFS`, `ENOTDIR` and `EEXIST` the user checks access only to a custom e-Comet output folder they
+  set, and otherwise the agent offers a report: e-Comet chooses the folder, and a seller cannot see it. `JOB_ARTIFACT_QUOTA_EXCEEDED` is `retryable:false` with
+  `details.class:"limit"` and stops the remaining exports: the same request cannot fit, so the agent splits it into
+  smaller jobs.
+- A Seller status poll Wildberries answered in an unrecognized shape stops the export at once:
+  `stopReason:"unrecognized_response"` and `SELLER_RESPONSE_INVALID` (`retryable:false`), an e-Comet defect to report.
+- Ozon `ARTIFACT_REJECTED` from a local workbook write has `details.class` and a message with its step: `disk` (with
+  `systemCode` and the same steps as a Seller `LOCAL_STORAGE_FAILED`), `limit` (the job's workbooks exceed
+  the per-job storage limit: the agent splits it into smaller jobs), `integrity` or `format` (an e-Comet defect: report).
+- `BROWSER_JOB_DESCRIPTOR_INVALID` has `details.rule`, the closed name of the local limit the signed job broke, and a
+  message that calls it an e-Comet defect. Ozon tools answer `OZON_AUTHORIZATION_REJECTED` with the same `details.rule`
+  and say it is an e-Comet defect, not a request that differs from its signature. Report; do not request another
+  authorization for the same job.
+- `BROWSER_JOB_LEASE_INVALID` (`stage:"local"`): this process received an authorization lease of the wrong shape, an
+  e-Comet defect. Report; do not repeat `browser_job`.
+- A signed tool still working after 30 s answers `ok:true`, `status:"running"` with `runId`, `tool`, `elapsedSeconds`
+  and, when the job counts its units, `progress`. It is not a failure: the job continues on this device, and
+  `e_comet_run_result` with that `runId` waits up to 30 s and returns the tool's own final answer unchanged, or
+  `running` again. `RUN_RESULT_UNAVAILABLE` (`stage:"result"`, `retryable:false`) means the result is no longer on this
+  device: it expired 30 minutes after the job ended, or e-Comet restarted. The outcome is unknown, not failed, and has
+  no user step: the agent tells the user and runs the original tool again only if the user asks, since it may create
+  reports again.
+- `INVALID_TOOL_ARGUMENTS`, and the Ozon `PREFLIGHT_FAILED` of a schema failure, name the failing property of the
+  tool's own input schema; an argument outside the schema is never echoed. For `triggerUrl` the message says to omit it,
+  because the host hook supplies it after `browser_job`; only an `mcp__remote-devices__` tool gets the `browser_job`
+  `trigger_url` unchanged. Ozon period rules keep their own text.
+- A missing extension capability (`EXTENSION_UPDATE_REQUIRED`, or an Ozon capability refusal) while a version 2
+  snapshot reports `pendingUpdateVersion` says the update is already downloaded: the user restarts the browser or
+  applies it on app.e-comet.io; the Chrome Web Store page has no button for it.
+
+### Hook denials
+
+When the hook itself refuses the local call, the host shows a `PreToolUse` denial whose reason starts with the code below,
+and its trailing hook record carries the closed `cause` (and `systemCode` for a filesystem failure).
+
+| Hook denial | `cause` | Owner and action |
+| --- | --- | --- |
+| `HANDOFF_MISSING`, `HANDOFF_TOOL_MISMATCH` | `missing` | Agent flow: no authorization was waiting for this tool in this conversation. After a `HANDOFF_MISSING` from a local call made in the same parallel step as `browser_job`, retry the local tool alone once. Otherwise call `browser_job` once for the intended tool, then the local tool without authorization fields. |
+| `HANDOFF_EXPIRED` | `expired` | Agent flow: the waiting authorization outlived its 90 seconds. One fresh `browser_job` for that tool, then call the local tool right away. |
+| `HANDOFF_MODEL_AUTHORIZATION`, `HANDOFF_INVALID_INPUT` | `invalid_input` | Agent flow: the call itself carried `triggerUrl` or `trigger_url`, or arguments that are not an object; nothing was spent. Remove the field or fix the arguments and call the same local tool again, without a new `browser_job`. |
+| `HANDOFF_COPY_REQUIRED` | `invalid_input` | Agent flow, Cowork only: the device call lacked `triggerUrl`, and the host refuses arguments a hook changed; nothing was spent. Pass `trigger_url` from the same `browser_job` result, unchanged, as `triggerUrl` and call the same local tool again, without a new `browser_job`. |
+| `HANDOFF_INVALID_ENTRY`, `HANDOFF_INVALID_TOKEN` | `invalid_state` | e-Comet: the waiting authorization could not be read and is used up. One fresh `browser_job` for that tool, then the local tool; report if it repeats. |
+| `HANDOFF_INVALID_SESSION` | `invalid_event` | Host: its hook event carried no usable conversation identifier. Another `browser_job` cannot fix it; follow the host skill's plugin check, and report if it persists. |
+| `HANDOFF_DATA_DIR_UNAVAILABLE` | `storage_unavailable` | Host: it gave the hook no plugin storage. Another `browser_job` cannot fix it; follow the host skill's plugin check, and report if it persists. |
+| `HANDOFF_STORAGE_ERROR` | `io_error` | `ENOSPC` or `EDQUOT`: the user frees space; `EACCES`, `EPERM` or `EROFS`: the user restores access to the plugin storage; any other code: report. Another `browser_job` cannot fix it. |
+
+`HANDOFF_TOKEN_NOT_FOUND` is not a denial but a hook error the host shows beside the `browser_job` result: the hook
+found no authorization in the result the host handed it, and its `Diagnostics.responseShape` names that form (types,
+field names and lengths only). Nothing was staged, so the local call then answers `HANDOFF_MISSING`, which here does not
+mean a wrong call order. Another `browser_job` gets the same; owner e-Comet: report it with that form.
 
 ## Native DeepSeek failures
 
@@ -395,7 +570,9 @@ when the handshake deadline passed, `protocol` when the handshake answered with 
 The adapter restarts the module by itself (after 5 s, 15 s, 60 s, then every five minutes for consecutive start
 failures; about every 5 s when it crashes after a successful handshake), so the state is usually
 brief; a DeepSeek restart is the user step only when it stays unavailable. The feedback tools are local, so no report
-can be prepared from that state.
+can be prepared from that state. The module the adapter starts again receives the last failure's class and the
+restart count in its environment and reports them as `hostLastFailure` and `hostRestarts` in the client check, so a
+report prepared after the restart shows that the module had stopped and how, next to the `MCP_CALL_FAILED` line.
 
 The adapter's runtime context (a line beginning `e-Comet plugin status`, after the host's own snapshot header) carries the account,
 update and local-module state to the model and is empty while everything is connected. It is host context, not a

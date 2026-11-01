@@ -3,7 +3,8 @@ import { isValidOzonSearchPositionsDetails } from './extension-protocol.mjs';
 import { OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES } from './extension-vocabulary.mjs';
 import { ozonPackageDeadline, ozonPackageStopReason } from './ozon-report-package-result.mjs';
 import { canonicalSearchPositionsRequest, sameSearchPositionsRequest } from './ozon-search-positions-domain.mjs';
-import { bridgeCodeDetails, browserJobRejectionDetails, ToolExecutionError } from './tool-errors.mjs';
+import { countRunProgress } from './run-registry.mjs';
+import { bridgeCodeDetails, browserJobRejectionDetails, descriptorRuleDetails, ozonDescriptorRejected, ToolExecutionError } from './tool-errors.mjs';
 
 const JOB_TYPE = 'ozon_search_positions';
 const POSITIONS_STOP_REASONS = Object.freeze({
@@ -29,7 +30,7 @@ export const safeOzonSearchPositionsError = (error) => {
         typeof error.message !== 'string' || error.message.length < 1 || error.message.length > 500) {
         return interrupted('The Ozon search positions operation stopped; its failure could not be classified.');
     }
-    const details = browserJobRejectionDetails(error) ?? bridgeCodeDetails(error) ??
+    const details = browserJobRejectionDetails(error) ?? bridgeCodeDetails(error) ?? descriptorRuleDetails(error) ??
         (isValidOzonSearchPositionsDetails(error.code, error.details) ? error.details : undefined);
     return { code: error.code, stage, retryable: false, message: error.message, ...(details ? { details } : {}) };
 };
@@ -75,7 +76,7 @@ export const executeOzonSearchPositionsJob = async ({ authorization, request, re
         if (!sameSearchPositionsRequest(signed, authorization.job)) throw new Error('Signed Ozon search positions request does not match');
         if (typeof requestOzonReportPackage !== 'function') throw new Error('Ozon search positions execution dependencies are unavailable');
     } catch (error) {
-        throw new ToolExecutionError('OZON_AUTHORIZATION_REJECTED',
+        throw ozonDescriptorRejected(error) ?? new ToolExecutionError('OZON_AUTHORIZATION_REJECTED',
             'The signed Ozon search positions authorization does not match this request.', 'authorization', false, { cause: error });
     }
     const rows = new Array(signed.queries.length);
@@ -86,7 +87,7 @@ export const executeOzonSearchPositionsJob = async ({ authorization, request, re
             { family: 'positions', items: signed.queries, deadlineAt: ozonPackageDeadline(authorization, now()) },
             {
                 // The broker has already checked each result against the signed queries and SKUs.
-                onItemResult: async (itemIndex, result) => {
+                onItemResult: countRunProgress(signed.queries.length, async (itemIndex, result) => {
                     const query = signed.queries[itemIndex];
                     if (result.ok) {
                         systemicStreak = 0;
@@ -106,7 +107,7 @@ export const executeOzonSearchPositionsJob = async ({ authorization, request, re
                     }
                     systemicStreak = SYSTEMIC_CODES.has(error.code) ? systemicStreak + 1 : 0;
                     rows[itemIndex] = { itemIndex, query, status: 'failed', error };
-                },
+                }),
             }
         );
     } catch (error) {

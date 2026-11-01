@@ -1,7 +1,5 @@
 import { toolInputSchemas, toolOutputSchemas, validateSchemaValue } from './tool-schemas.mjs';
 import { FEEDBACK_CONTRACT_TOOL_NAMES, SIGNED_CONTRACT_TOOL_NAMES } from './tool-contracts.mjs';
-import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
-import { maxSearchPositionsQueries } from './ozon-search-positions-domain.mjs';
 
 const liveToolAnnotations = {
     readOnlyHint: true,
@@ -21,9 +19,9 @@ const feedbackContractTargets = FEEDBACK_CONTRACT_TOOL_NAMES.join(' or ');
 const signedContractTargets = SIGNED_CONTRACT_TOOL_NAMES.join(', ');
 
 const signedDiscovery = (name, type) =>
-    `If its complete contract is not already in the current task, call describe_e_comet_tool({name:"${name}"}) and await it before browser_job. ` +
-    `Then call browser_job once with the matching ${type} descriptor and immediately this local tool exactly once; do not insert discovery between them. ` +
-    'Omit triggerUrl and trigger_url; the trusted hook injects authorization. Never decode, print, edit, copy, or expose it. ';
+    `Unless its complete contract is already in this task, call describe_e_comet_tool({name:"${name}"}) and await it before browser_job. ` +
+    `Then call browser_job once with the matching ${type} descriptor and, after it returns, this local tool exactly once; do not insert discovery between them. ` +
+    'Omit triggerUrl and trigger_url; the trusted hook injects authorization. Only for mcp__remote-devices__ tools pass the browser_job trigger_url yourself, unchanged, as triggerUrl. Never decode, print, edit, or expose it. ';
 
 const completeContractGuidance = 'Follow the returned complete contract for exact descriptors, defaults, fields and recovery.';
 
@@ -43,10 +41,12 @@ const directMarketplaceGuidance =
 
 export const serverInstructions =
     directMarketplaceGuidance +
-    'Choose the typed local tool by intent; do not start with browser_job. For a selected signed tool, get its full contract via describe_e_comet_tool unless already in this task, before browser_job; then immediately call the local tool. For images, call wb_product_images directly. ' +
+    'Choose the typed local tool by intent; do not start with browser_job. For a selected signed tool, get its full contract via describe_e_comet_tool unless already in this task, before browser_job; call the local tool once browser_job returns, not in parallel. For images, call wb_product_images directly. ' +
     'Live WB stock/sizes/price/card/description/characteristics: wb_product_card; search ranking/top: wb_search_by_query; search filters: wb_filters_by_query; one article for queries: wb_check_by_query; recommendations: wb_recommendations_by_product; review export: wb_seller_reviews. Ozon promotion: ozon_seller_promotion_report (one) or ozon_seller_promotion_reports (package); analytics by period/day: ozon_seller_analytics_report; позиции/места товаров в поиске Ozon по фразам: ozon_search_positions. ' +
     proactiveFeedbackOffer + updateNoticeGuidance + hookDiagnosticGuidance +
-    'If remote e-Comet tools are missing, ask the host or use codex_mcp_auth only in Codex before any authorization claim.';
+    'If remote e-Comet tools are missing, ask the host or use codex_mcp_auth only in Codex before any authorization claim. ' +
+    // Last, so hosts that cut instructions at 2,048 keep the safety text above; each signed contract repeats it.
+    'A long e-Comet tool may answer status "running" with a runId: not a failure and no reason for another browser_job; tell the user the progress in one line, then call e_comet_run_result with that runId until it returns the final answer.';
 
 export const tools = [
     {
@@ -80,7 +80,7 @@ export const tools = [
     {
         name: 'e_comet_diagnose',
         description:
-            'Collect scoped technical evidence for installation, current runtime, or the exact last operation handle. Diagnosis never pre-approves or repeats a business tool. A passed check applies only to its named observation plane and time. Never repeat an indeterminate create or upload. Safe probes run only when explicitly requested and do not obtain authorization or call a marketplace. The installation extension_install probe reads Chromium profile metadata to report where the e-Comet extension is installed and enabled; it never proves the extension is connected. The installation hook_permissions and codex_mcp_auth probes read native Codex configuration state (hook trust; remote-server sign-in status); they do not prove that a hook ran or that the current task is authorized, and answer unsupported under any client other than Codex (Cowork, DeepSeek). For exact input, output, field, and enum semantics, load the packaged mcp/DIAGNOSTICS.md reference.',
+            'Collect scoped technical evidence for installation, current runtime, or the exact last operation handle. Diagnosis never pre-approves or repeats a business tool. A passed check applies only to its named observation plane and time. Never repeat an indeterminate create or upload. Safe probes run only when explicitly requested and do not obtain authorization or call a marketplace. The installation extension_install probe reads Chromium profile metadata to report where the e-Comet extension is installed and enabled; it never proves the extension is connected. The runtime extension_log probe reads the e-Comet extension\'s own connection log from the browser profile to tell why no connector answers; it never proves a connection. The installation hook_permissions and codex_mcp_auth probes read native Codex configuration state (hook trust; remote-server sign-in status); they do not prove that a hook ran or that the current task is authorized, and answer unsupported under any client other than Codex (Cowork, DeepSeek). For exact input, output, field, and enum semantics, load the packaged mcp/DIAGNOSTICS.md reference.',
         inputSchema: toolInputSchemas.e_comet_diagnose,
         outputSchema: toolOutputSchemas.e_comet_diagnose,
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -178,7 +178,7 @@ export const tools = [
         description:
             'Upload one prepared e-Comet feedback archive only after remote report_issue returns the trusted upload grant. Before the first feedback tool, call describe_e_comet_tool({name:"submit_e_comet_feedback"}) once and follow the returned complete contract; do not insert it between successful prepare, report_issue, and submit stages. ' +
             'Preserve the explicit report consent and resolved history choice and the order prepare_e_comet_feedback, report_issue, then submit_e_comet_feedback. ' +
-            'Model-authored input must omit every hook-only transport, claim, and cloud field and alias; provide only artifactId. ' +
+            'Model-authored input must omit every hook-only transport, claim, and cloud field and alias; provide only artifactId, except for an mcp__remote-devices__ tool, which also gets the report_issue grant fields the contract names. ' +
             'Never automatically retry an uncertain upload or restart the flow; preserve explicit authorization.',
         inputSchema: toolInputSchemas.submit_e_comet_feedback,
         outputSchema: toolOutputSchemas.submit_e_comet_feedback,
@@ -206,7 +206,7 @@ export const tools = [
             'Download one Ozon Seller promotion report XLSX for one requested period. ' +
             signedDiscovery('ozon_seller_promotion_report', 'ozon_seller_promotion_report') +
             'May create a saved report. CREATE_OUTCOME_UNKNOWN means creation may have succeeded: obtain a separate retry decision. Never automatically repeat uncertain creates, rate-limited work or completed reports for delivery failure; preserve the private resource link and recover the same workbook. ' +
-            'An unready route does not establish its cause; extension_outdated details require an extension update. Never use WB-tab recovery or local_bridge_status to gate Ozon. ' +
+            'An unready route\'s message names its step when the extension knows the cause; extension_outdated details require an extension update. Never use WB-tab recovery or local_bridge_status to gate Ozon. ' +
             completeContractGuidance,
         inputSchema: toolInputSchemas.ozon_seller_promotion_report,
         outputSchema: toolOutputSchemas.ozon_seller_promotion_report,
@@ -246,23 +246,32 @@ export const tools = [
         // docs/local-agent-architecture.md#accepted-residuals.
         annotations: liveToolAnnotations,
     },
+    {
+        name: 'e_comet_run_result',
+        description:
+            'Get the final answer of a long e-Comet tool call that answered status "running" with a runId. ' +
+            'It never starts, repeats or authorizes marketplace work and needs no browser_job. ' +
+            'RUN_RESULT_UNAVAILABLE: the result is gone (expired or e-Comet restarted) and the outcome is unknown; tell the user, and run the original tool again only if the user asks. ' +
+            'It waits up to 30 s and returns that tool\'s own final answer unchanged, or "running" again with fresh progress: then tell the user the progress in one line and call it again.',
+        inputSchema: toolInputSchemas.e_comet_run_result,
+        outputSchema: toolOutputSchemas.e_comet_run_result,
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
 ];
 
-// Cowork gets the same search positions tool with its five-query job cap in the schema and the description.
-export const toolsForClient = (clientName) => {
-    const maxQueries = maxSearchPositionsQueries(clientName);
-    if (maxQueries >= MAX_OZON_REPORT_PACKAGE_ITEMS) return tools;
-    return tools.map((tool) => tool.name !== 'ozon_search_positions' ? tool : {
-        ...tool,
-        description: `${tool.description}In this app one job checks at most ${maxQueries} queries; run a longer list as consecutive jobs. `,
-        inputSchema: {
-            ...tool.inputSchema,
-            properties: { ...tool.inputSchema.properties, queries: { ...tool.inputSchema.properties.queries, maxItems: maxQueries } },
-        },
-    });
-};
-
+// `property` names the first failing property of our own schema; an unknown property is never echoed, it reads ''.
 export const validateToolArguments = (name, args) => {
-    const tool = tools.find((candidate) => candidate.name === name);
-    return Boolean(tool && validateSchemaValue(args, tool.inputSchema));
+    const schema = tools.find((candidate) => candidate.name === name)?.inputSchema;
+    if (schema && validateSchemaValue(args, schema)) return { ok: true };
+    const properties = schema?.properties ?? {};
+    const input = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+    const property = (schema?.required ?? []).find((key) => !Object.hasOwn(input, key)) ??
+        Object.keys(properties).find((key) => Object.hasOwn(input, key) && !validateSchemaValue(input[key], properties[key])) ?? '';
+    return { ok: false, property };
 };
+/** @param {string} name @param {{ property?: string }} validation */
+export const invalidArgumentsMessage = (name, { property }) => property === 'triggerUrl'
+    ? `Invalid ${name} argument: omit triggerUrl; the host hook supplies it after browser_job. Only for an mcp__remote-devices__ tool, pass the browser_job trigger_url unchanged.`
+    : property
+    ? `Invalid ${name} argument: ${property} is missing or does not match the tool's input schema. Correct it and retry.`
+    : `Invalid ${name} arguments: an argument is not in the tool's input schema. Send only the documented properties and retry.`;

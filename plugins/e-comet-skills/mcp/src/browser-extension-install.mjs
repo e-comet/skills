@@ -1,5 +1,5 @@
 import fs from 'node:fs/promises';
-import { homedir, hostname as osHostname } from 'node:os';
+import { homedir, uptime as osUptime } from 'node:os';
 import { posix, win32 } from 'node:path';
 import { compareBrokerVersions } from './bridge-registration.mjs';
 import { NATIVE_EXTENSION_MIN_VERSION } from './config.mjs';
@@ -117,7 +117,7 @@ const installedCopies = async (fileSystem, join, path, extensionId, facts) => {
 };
 
 // Chromium rewrites each profile's preference files while the browser runs, so their newest modification time is a
-// recency hint for that profile. The files are stat'ed, never read, and the result is a whole number of days, never a
+// recency hint for that profile. The files are stat'ed, never read, and the facts get a whole number of days, never a
 // timestamp. `Local State` is left out: it changes when any profile is used.
 const DAY_MS = 24 * 60 * 60 * 1000;
 const newestModification = async (fileSystem, paths) => {
@@ -130,13 +130,19 @@ const newestModification = async (fileSystem, paths) => {
 };
 const daysAgo = (mtimeMs, nowMs) => Math.max(0, Math.floor((nowMs - mtimeMs) / DAY_MS));
 
-// A profile is listed when its record or an installed copy shows the extension. `name` is its report label.
-const probeProfile = async (fileSystem, join, path, name, extensionId, facts, nowMs) => {
+// A profile is listed when its record or an installed copy shows the extension. `name` is its report label. Its path,
+// whether its window was focused last, whether it has an open window (only when the browser keeps that list) and its
+// last use in ms go only to `profilePaths`, never into the facts.
+const probeProfile = async (fileSystem, join, path, name, extensionId, facts, nowMs, profilePaths, { focused, open }) => {
     const copies = await installedCopies(fileSystem, join, path, extensionId, facts);
+    const recordIn = (read) => (read.ok && isRecord(read.value) ? read.value.extensions?.settings?.[extensionId] : undefined);
     let preferences = await readJson(fileSystem, join(path, 'Secure Preferences'));
-    if (!preferences.ok && preferences.absent) preferences = await readJson(fileSystem, join(path, 'Preferences'));
+    // Chromium protects the records only on Windows and macOS (chrome_pref_service_factory.cc): elsewhere `Secure
+    // Preferences` holds only `protection`, and the records are in `Preferences`. A protected file with records but none
+    // for e-Comet answers for the profile, so its `Preferences` is not read.
+    if (preferences.absent || (preferences.ok && !isRecord(preferences.value?.extensions?.settings))) preferences = await readJson(fileSystem, join(path, 'Preferences'));
     if (!preferences.ok && !preferences.absent) recordFailure(facts, preferences.cause);
-    const entry = preferences.ok && isRecord(preferences.value) ? preferences.value.extensions?.settings?.[extensionId] : undefined;
+    const entry = recordIn(preferences);
     if (!copies.present && !isRecord(entry)) return;
     // Command-line and unpacked extensions keep no manifest in their record (Chromium extension_prefs.cc), so the
     // installed copy's folder names their version. A stored manifest always wins, and an unusable stored version is dropped.
@@ -144,41 +150,58 @@ const probeProfile = async (fileSystem, join, path, name, extensionId, facts, no
     // A delayed install (an update waiting for the extension to become idle) keeps the new manifest under `idle_install_info`.
     const pendingVersion = safeExtensionVersion(entry?.idle_install_info?.manifest?.version);
     const newest = await newestModification(fileSystem, [join(path, 'Preferences'), join(path, 'Secure Preferences')]);
+    const settings = classifyExtensionSettings(entry);
+    const lastUsed = newest === undefined ? {} : { lastUsedDaysAgo: daysAgo(newest, nowMs) };
     facts.profiles.push({
         profile: name,
-        ...classifyExtensionSettings(entry),
+        ...settings,
         ...(version === undefined ? {} : { version }),
         ...(pendingVersion === undefined ? {} : { pendingVersion }),
-        ...(newest === undefined ? {} : { lastUsedDaysAgo: daysAgo(newest, nowMs) }),
+        ...lastUsed,
     });
+    profilePaths?.push({ browser: facts.browser, path, state: settings.state, ...lastUsed, ...(newest === undefined ? {} : { lastUsedAtMs: newest }),
+        lastFocused: focused, ...(open === undefined ? {} : { open }) });
 };
 
 // Whether the browser runs, from the process singleton Chromium keeps in its user-data folder, with plain reads and no
 // new process. Windows: a `lockfile` held open delete-on-close, so it exists only while the browser runs, even after a
-// crash, and its modification time is the start. Elsewhere: a `SingletonLock` symlink to `<hostname>-<pid>` that a crash
-// leaves behind, so the process is checked with signal 0 (EPERM: it exists). `running` is null when it cannot be told.
-const runningState = async ({ fileSystem, platform, path, hostname, kill }) => {
+// crash, and its modification time is the start; a power loss leaves it behind, so one written before the system booted
+// (`bootMs`) is no running browser. Elsewhere: a `SingletonLock` symlink to `<hostname>-<pid>` that a crash leaves
+// behind. One made before the system booted is no running browser, whatever process has its pid now; otherwise the
+// process is checked with signal 0 (EPERM: it exists), whatever the host name, which macOS changes with the network:
+// Chromium itself takes another host's lock as live while its pid runs (process_singleton_posix.cc); accepted residual
+// "Another computer's browser lock in a shared home folder". `running` is null when it cannot be told.
+const runningState = async ({ fileSystem, platform, path, kill, bootMs }) => {
     try {
-        if (platform === 'win32') return { running: true, runningSince: new Date((await fileSystem.stat(win32.join(path, 'lockfile'))).mtimeMs).toISOString() };
+        if (platform === 'win32') {
+            const { mtimeMs } = await fileSystem.stat(win32.join(path, 'lockfile'));
+            return mtimeMs < bootMs ? { running: false } : { running: true, runningSince: new Date(mtimeMs).toISOString() };
+        }
         const lock = posix.join(path, 'SingletonLock');
         const owner = /^(.*)-(\d+)$/.exec(await fileSystem.readlink(lock));
         const pid = Number(owner?.[2]);
         if (!owner || !Number.isSafeInteger(pid) || pid < 1) return { running: null };
-        if (owner[1] !== hostname) return { running: false };
+        const { mtimeMs } = await fileSystem.lstat(lock);
+        if (mtimeMs < bootMs) return { running: false };
         try {
             kill(pid, 0);
         } catch (error) {
             if (error?.code !== 'EPERM') return { running: false };
         }
-        return { running: true, runningSince: new Date((await fileSystem.lstat(lock)).mtimeMs).toISOString() };
+        return { running: true, runningSince: new Date(mtimeMs).toISOString() };
     } catch (error) {
         return { running: error?.code === 'ENOENT' ? false : null };
     }
 };
 
-const probeBrowser = async (fileSystem, join, target, extensionId, nowMs) => {
+const probeBrowser = async (fileSystem, join, target, extensionId, nowMs, profilePaths) => {
     const facts = { browser: target.browser, profileSource: 'local_state', readFailures: 0, profiles: [], failureCause: undefined };
     const local = await readJson(fileSystem, join(target.path, 'Local State'));
+    // Chromium's `profile.last_used` names the profile whose window was focused last, and `profile.last_active_profiles`
+    // the profiles with an open window; both followed the windows on Chrome 156 (stand, 2026-10-27).
+    const lastUsed = local.ok ? local.value?.profile?.last_used : undefined;
+    const lastActive = local.ok && Array.isArray(local.value?.profile?.last_active_profiles) ? local.value.profile.last_active_profiles : undefined;
+    const windowsOf = (name) => ({ focused: typeof lastUsed === 'string' && name === lastUsed, open: lastActive?.includes(name) });
     let names = [];
     if (local.ok && isRecord(local.value?.profile?.info_cache)) names = Object.keys(local.value.profile.info_cache);
     else {
@@ -200,10 +223,11 @@ const probeBrowser = async (fileSystem, join, target, extensionId, nowMs) => {
         if (result.exists) {
             // A directory the browser did not name by its own scheme is judged like any other, and reported as `other`
             // only if it holds the extension: its name may identify its owner and never reaches a report.
-            await probeProfile(fileSystem, join, path, EXTENSION_INSTALL_VOCABULARY.profile.test(name) ? name : 'other', extensionId, facts, nowMs);
+            await probeProfile(fileSystem, join, path, EXTENSION_INSTALL_VOCABULARY.profile.test(name) ? name : 'other', extensionId, facts, nowMs, profilePaths,
+                windowsOf(name));
         } else if (target.browser === 'opera') {
             // Opera keeps its one profile in the root folder, whatever `Local State` calls it.
-            await probeProfile(fileSystem, join, target.path, 'Default', extensionId, facts, nowMs);
+            await probeProfile(fileSystem, join, target.path, 'Default', extensionId, facts, nowMs, profilePaths, windowsOf(name));
             break;
         }
     }
@@ -211,19 +235,24 @@ const probeBrowser = async (fileSystem, join, target, extensionId, nowMs) => {
     return { facts: publicFacts, cause };
 };
 
+// `profilePaths`, when given, receives `{ browser, path, state, lastUsedDaysAgo?, lastUsedAtMs?, lastFocused, open? }` for
+// every listed profile: the extension log reader's input, kept out of the facts.
 export const probeBrowserExtensionInstall = async (/** @type {any} */ { observedAt, now = Date.now, platform = process.platform, env = process.env,
-    home = homedir(), fileSystem = fs, extensionId = EXTENSION_ID, hostname = osHostname(), kill = (pid, signal) => process.kill(pid, signal) } = {}) => {
+    home = homedir(), fileSystem = fs, extensionId = EXTENSION_ID, kill = (pid, signal) => process.kill(pid, signal), uptime = osUptime,
+    profilePaths } = {}) => {
     const base = { check: 'extension_install', observedAt: observedAt ?? new Date(now()).toISOString(), source: 'browser_profile_metadata', executionPlane: 'device' };
     const join = platform === 'win32' ? win32.join : posix.join;
+    // Accepted residual "A clock stepped forward after boot hides a running browser": docs/local-agent-architecture.md#accepted-residuals.
+    const bootMs = now() - uptime() * 1000;
     const browsers = [];
     let cause;
     for (const target of browserUserDataDirectories({ platform, env, home })) {
         const root = await directory(fileSystem, target.path);
         if (root.cause) { cause ??= root.cause; continue; }
         if (!root.exists) continue;
-        const result = await probeBrowser(fileSystem, join, target, extensionId, now());
+        const result = await probeBrowser(fileSystem, join, target, extensionId, now(), profilePaths);
         cause ??= result.cause;
-        browsers.push({ ...result.facts, ...(await runningState({ fileSystem, platform, path: target.path, hostname, kill })) });
+        browsers.push({ ...result.facts, ...(await runningState({ fileSystem, platform, path: target.path, kill, bootMs })) });
     }
     const facts = { extensionId, browsers };
     if (!validateSchemaValue(facts, extensionInstallFactsSchema)) return diagnosticCheck({ ...base, state: 'unknown', cause: 'unknown' });

@@ -7,16 +7,6 @@ export const OZON_SEARCH_POSITIONS_DEFAULT_REGION = 'Москва';
 export const OZON_SEARCH_POSITIONS_PLATFORMS = Object.freeze(['ozon', 'select']);
 const REQUEST_KEYS = ['queries', 'skus', 'region', 'platform'];
 
-// Claude Cowork abandons a device tool call after 60 s, so a job there checks at most five queries: about 42 s at
-// the extension's ten-second pace. Cowork names its device client `local-agent-mode-plugin:<plugin>:<server>`.
-// Accepted residual until results can span several calls, see docs/local-agent-architecture.md#accepted-residuals.
-export const OZON_SEARCH_POSITIONS_COWORK_MAX_QUERIES = 5;
-const COWORK_CLIENT_PREFIX = 'local-agent-mode-plugin:';
-export const maxSearchPositionsQueries = (clientName) =>
-    typeof clientName === 'string' && clientName.startsWith(COWORK_CLIENT_PREFIX)
-        ? OZON_SEARCH_POSITIONS_COWORK_MAX_QUERIES
-        : MAX_OZON_REPORT_PACKAGE_ITEMS;
-
 const trimmedText = (value, label) => {
     const text = typeof value === 'string' ? value.trim() : '';
     if (text.length < 1 || text.length > MAX_OZON_SEARCH_POSITIONS_TEXT_LENGTH) {
@@ -35,18 +25,13 @@ export const isSearchPositionsSkuList = (skus) =>
     new Set(skus).size === skus.length;
 
 // Model-authored local arguments omit region and platform; the signer materializes the same defaults.
-export const canonicalSearchPositionsRequest = (request, maxQueries = MAX_OZON_REPORT_PACKAGE_ITEMS) => {
+export const canonicalSearchPositionsRequest = (request) => {
     if (!request || typeof request !== 'object' || Array.isArray(request) || !Object.keys(request).every((key) => REQUEST_KEYS.includes(key))) {
         throw new TypeError('Ozon search positions request has invalid fields.');
     }
     const { queries, skus, region = OZON_SEARCH_POSITIONS_DEFAULT_REGION, platform = 'ozon' } = request;
-    if (!Array.isArray(queries) || queries.length < 1) {
-        throw new TypeError(`Ozon search positions queries must contain 1-${maxQueries} items.`);
-    }
-    if (queries.length > maxQueries) {
-        throw new TypeError(maxQueries < MAX_OZON_REPORT_PACKAGE_ITEMS
-            ? `This app checks at most ${maxQueries} Ozon search queries per job; run the list as consecutive jobs of up to ${maxQueries} queries.`
-            : `Ozon search positions queries must contain 1-${maxQueries} items.`);
+    if (!Array.isArray(queries) || queries.length < 1 || queries.length > MAX_OZON_REPORT_PACKAGE_ITEMS) {
+        throw new TypeError(`Ozon search positions queries must contain 1-${MAX_OZON_REPORT_PACKAGE_ITEMS} items.`);
     }
     const canonicalQueries = queries.map((query) => trimmedText(query, 'Ozon search query'));
     if (new Set(canonicalQueries).size !== canonicalQueries.length) {

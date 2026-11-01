@@ -5,11 +5,11 @@ import { isFeedbackCallTimestamp, isFeedbackToolName, isFeedbackToolOutcome } fr
 
 const FEEDBACK_KIND_SET = new Set(FEEDBACK_KINDS);
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
-// Where the archive was prepared: on the device by the native hook route, or by the Cowork cloud hook.
+// How the device prepared the archive: signed by a trusted hook, or unsigned where no hook can change the call (Cowork).
 // The device is the same either way, so this line is what tells the two hosts apart in a report.
-const ROUTES = new Set(['native', 'cloud']);
-// The newest calls are the ones around the failure. The cap bounds the report's share of the fixed
-// cloud archive reserve: one line is at most a timestamp, a 256-character name and a short outcome.
+const ROUTES = new Set(['native', 'unsigned']);
+// The newest calls are the ones around the failure. One line is at most a timestamp, a 256-character
+// name and a short outcome.
 export const FEEDBACK_TOOL_CALLS_MAX = 100;
 const TOOL_CALL_KEYS = new Set(['name', 'at', 'outcome']);
 
@@ -39,11 +39,13 @@ const redactCookieValues = (value) =>
         return `${header}: ${redacted}`;
     });
 
-const redactJsonCredentialValues = (value) =>
-    value.replace(
-        /("(?:authorization|proxy-authorization|(?:x-)?api[_-]?key|cookie|set-cookie)"\s*:\s*)"(?:\\.|[^"\\])*"/gi,
-        '$1"[REDACTED]"',
-    );
+// Field and header names whose whole value is a credential.
+const CREDENTIAL_NAMES = String.raw`authorization|proxy-authorization|(?:x-)?api[_-]?key|cookie|set-cookie`;
+const JSON_CREDENTIAL_VALUE = new RegExp(String.raw`("(?:${CREDENTIAL_NAMES})"\s*:\s*)"(?:\\.|[^"\\])*"`, 'gi');
+const CREDENTIAL_NAME = new RegExp(String.raw`^(?:${CREDENTIAL_NAMES})$`, 'i');
+export const isCredentialName = (/** @type {string} */ name) => CREDENTIAL_NAME.test(name);
+
+const redactJsonCredentialValues = (value) => value.replace(JSON_CREDENTIAL_VALUE, '$1"[REDACTED]"');
 
 const redactAuthorizationHeaders = (value) =>
     value.replace(/\b(proxy-authorization|authorization)\s*:\s*([^\n]*)/gi, (_match, header, headerValue) =>
@@ -83,16 +85,21 @@ const normalizeToolCalls = (toolCalls) => {
 
 // A call whose result carried no closed field says so: a line that read like a healthy call would
 // hide exactly the failures this list exists to show. `is_error` is the host's own flag on the result.
+// The rendered outcome stays within 256 bytes: the fields go in this order and one that no longer fits is
+// left out whole, so the cloud archive reserve for a hundred lines still holds.
+const OUTCOME_FIELDS = ['status', 'isError', 'code', 'stage', 'cause', 'reason', 'bridgeCode', 'refusalCode', 'systemCode', 'marketplaceErrorCode',
+    'stopReason', 'itemCode', 'itemStage'];
+const MAX_OUTCOME_BYTES = 256;
 const renderOutcome = (outcome) => {
     if (!outcome) return ': outcome unknown';
-    const parts = [];
-    if (outcome.ok !== undefined) parts.push(`ok=${outcome.ok}`);
-    if (outcome.status !== undefined) parts.push(`status=${outcome.status}`);
-    if (outcome.isError) parts.push('is_error');
-    if (outcome.code !== undefined) parts.push(`code=${outcome.code}`);
-    if (outcome.stage !== undefined) parts.push(`stage=${outcome.stage}`);
-    if (outcome.cause !== undefined) parts.push(`cause=${outcome.cause}`);
-    return `: ${parts.join(', ')}`;
+    let rendered = outcome.ok === undefined ? ':' : `: ok=${outcome.ok}`;
+    for (const field of OUTCOME_FIELDS) {
+        if (outcome[field] === undefined) continue;
+        const part = field === 'isError' ? 'is_error' : `${field}=${outcome[field]}`;
+        const next = `${rendered}${rendered === ':' ? ' ' : ', '}${part}`;
+        if (Buffer.byteLength(next, 'utf8') <= MAX_OUTCOME_BYTES) rendered = next;
+    }
+    return rendered;
 };
 
 const renderToolCalls = (toolCalls, toolCallsTruncated) => {
@@ -127,7 +134,7 @@ const renderClient = (selectedDiagnostics) => {
     return `client: ${facts.name}${facts.version ? ` ${facts.version}` : ''}${facts.hostRuntimeVersion ? ` (host runtime ${facts.hostRuntimeVersion})` : ''}`;
 };
 
-/** @param {{ kind?: string, summary?: string, details?: string, diagnostics?: unknown, includeTranscript?: boolean, route?: 'native' | 'cloud', toolCalls?: Array<string | { name: string, at?: string, outcome?: object }>, toolCallsTruncated?: boolean }} input */
+/** @param {{ kind?: string, summary?: string, details?: string, diagnostics?: unknown, includeTranscript?: boolean, route?: 'native' | 'unsigned', toolCalls?: Array<string | { name: string, at?: string, outcome?: object }>, toolCallsTruncated?: boolean }} input */
 export const renderFeedbackReport = ({ kind, summary, details, diagnostics, includeTranscript, route = 'native', toolCalls, toolCallsTruncated } = {}) => {
     // WHY: report validation owns this safe category before transcript or artifact I/O can begin.
     if (!FEEDBACK_KIND_SET.has(kind)) throw new FeedbackPreparationError('FEEDBACK_INPUT_INVALID');

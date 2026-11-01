@@ -76,7 +76,8 @@ export function createAdapter({ dataDirectory, now = Date.now, feedbackServices,
     const grantKey = key(sessionId(exec), exec.name);
     const pending = grants.get(grantKey) ?? [];
     grants.delete(grantKey); // A competing local body cannot claim these grants.
-    if (!pending.length) throw failure('HANDOFF_MISSING', 'Call browser_job once for this session and matching local tool.');
+    // browser_job registers its grant only after it returns, so a local call issued beside it finds none yet.
+    if (!pending.length) throw failure('HANDOFF_MISSING', 'If browser_job ran in the same parallel step as this call, retry this local tool alone once, without a new browser_job; otherwise call browser_job once for this session and matching local tool.');
     const nowMs = now();
     const fresh = pending.filter(grant => isEntryFresh({ createdAtMs: grant.createdAt }, nowMs));
     if (!fresh.length) throw failure('HANDOFF_EXPIRED', 'Call browser_job once for a fresh matching authorization.');

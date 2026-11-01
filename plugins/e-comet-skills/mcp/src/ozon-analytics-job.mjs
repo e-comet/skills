@@ -3,7 +3,7 @@ import { ozonAnalyticsArtifactName, parseAnalyticsReports } from './ozon-analyti
 import { executeOzonReportPackage } from './ozon-report-package-job.mjs';
 import { ozonPackageDeadline } from './ozon-report-package-result.mjs';
 import { StorageUnavailableError } from './storage-layout.mjs';
-import { bridgeCodeDetails, browserJobRejectionDetails, ToolExecutionError } from './tool-errors.mjs';
+import { artifactRejectedDetails, bridgeCodeDetails, browserJobRejectionDetails, descriptorRuleDetails, ozonDescriptorRejected, ToolExecutionError } from './tool-errors.mjs';
 import { OZON_ANALYTICS_TERMINAL_CODE_STAGES, isOzonAnalyticsTerminalDetails, isOzonExecutionInterruptionDetails } from './extension-vocabulary.mjs';
 
 const authorizationRejected = (cause) =>
@@ -24,7 +24,8 @@ export const safeOzonAnalyticsToolError = (error) => {
         // Local ToolExecutionError always owns an initially undefined details field.
         // Absence of evidence must not erase an otherwise known local failure.
         (error?.details !== undefined && !isOzonAnalyticsTerminalDetails(error?.code, error.details) &&
-            !isOzonExecutionInterruptionDetails(error?.code, error.details) && !browserJobRejectionDetails(error) && !bridgeCodeDetails(error)) ||
+            !isOzonExecutionInterruptionDetails(error?.code, error.details) && !browserJobRejectionDetails(error) && !bridgeCodeDetails(error) &&
+            !artifactRejectedDetails(error) && !descriptorRuleDetails(error)) ||
         stage === undefined ||
         error?.stage !== stage ||
         error?.retryable !== false ||
@@ -39,7 +40,9 @@ export const safeOzonAnalyticsToolError = (error) => {
         ...(isOzonExecutionInterruptionDetails(error.code, error.details)
             ? { details: { phase: error.details.phase, createOutcome: error.details.createOutcome } } : {}),
         ...(browserJobRejectionDetails(error) ? { details: browserJobRejectionDetails(error) } : {}),
-        ...(bridgeCodeDetails(error) ? { details: bridgeCodeDetails(error) } : {}) };
+        ...(bridgeCodeDetails(error) ? { details: bridgeCodeDetails(error) } : {}),
+        ...(artifactRejectedDetails(error) ? { details: artifactRejectedDetails(error) } : {}),
+        ...(descriptorRuleDetails(error) ? { details: descriptorRuleDetails(error) } : {}) };
 };
 
 export const executeOzonAnalyticsJob = async ({
@@ -61,7 +64,7 @@ export const executeOzonAnalyticsJob = async ({
             throw new Error('Ozon analytics execution dependencies are unavailable');
         }
     } catch (error) {
-        throw authorizationRejected(error);
+        throw ozonDescriptorRejected(error) ?? authorizationRejected(error);
     }
     return executeOzonReportPackage({
         family: 'analytics',

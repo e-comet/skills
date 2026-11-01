@@ -7,8 +7,7 @@ import { queryCodexAppServer } from './codex-app-server.mjs';
 const PLUGIN_ID = 'e-comet-skills';
 const EXPECTED_HOOKS = new Set([
     'preToolUse:browser_authorization_restore', 'preToolUse:update_check', 'preToolUse:feedback_authorization_restore',
-    'preToolUse:feedback_cloud_processing', 'postToolUse:browser_authorization_capture',
-    'postToolUse:feedback_authorization_capture', 'postToolUse:feedback_cloud_processing',
+    'postToolUse:browser_authorization_capture', 'postToolUse:feedback_authorization_capture',
 ]);
 const isPluginHook = (hook) => hook?.pluginId === PLUGIN_ID || hook?.pluginId?.startsWith(`${PLUGIN_ID}@`);
 const hookFamily = (hook) => {
@@ -19,9 +18,6 @@ const hookFamily = (hook) => {
         'preToolUse:Checking e-Comet MCP Tools plugin version': 'update_check',
         'preToolUse:Restoring e-Comet feedback authorization': 'feedback_authorization_restore',
         'postToolUse:Securing e-Comet feedback authorization': 'feedback_authorization_capture',
-        'preToolUse:Processing e-Comet cloud feedback': 'feedback_cloud_processing',
-        'postToolUse:Processing e-Comet cloud feedback': 'feedback_cloud_processing',
-        'postToolUseFailure:Checking e-Comet preparation failure': 'feedback_failure_recovery',
     };
     if (Object.hasOwn(families, key)) return families[key];
     return 'plugin_hook';

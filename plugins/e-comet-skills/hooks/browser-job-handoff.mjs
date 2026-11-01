@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { feedbackDiagnostics } from '../mcp/src/feedback-diagnostics.mjs';
 import { sweepExpired } from '../mcp/src/file-retention.mjs';
 import { retryTransientFileOperation } from './transient-file-operation.mjs';
-import { withHookDiagnostic } from './hook-diagnostics.mjs';
+import { denialEvidence, withHookDiagnostic } from './hook-diagnostics.mjs';
 
 const MAX_HOOK_EVENT_BYTES = 1024 * 1024;
 export const MAX_SESSION_ID_BYTES = 512;
@@ -43,10 +43,11 @@ const OWN_STATE_FILE = new RegExp(
 );
 
 class HandoffError extends Error {
-    constructor(code, message) {
+    constructor(code, message, recovery) {
         super(message);
         this.name = 'HandoffError';
         this.code = code;
+        this.recovery = recovery;
     }
 }
 
@@ -213,7 +214,9 @@ export const claimTriggerUrl = async ({
         candidates.push(name);
     }
     if (candidates.length === 0) {
-        throw new HandoffError('HANDOFF_MISSING', 'No browser authorization is waiting for this conversation.');
+        // browser_job stages its authorization only after it returns, so a local call issued beside it finds none yet.
+        throw new HandoffError('HANDOFF_MISSING', 'No browser authorization is waiting for this conversation.',
+            'If browser_job ran in the same parallel step as this call, retry this local tool alone once, without a new browser_job; otherwise call browser_job once for the intended local tool, then retry without model-authored authorization fields.');
     }
     if (candidates.length > 1) {
         // Authorizations are sequential, so two waiting ones cannot both be the intended job. Neither is
@@ -290,6 +293,9 @@ const collectTriggerUrlCandidates = (toolResponse) => {
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
         return typeof parsed.trigger_url === 'string' ? [parsed.trigger_url] : [];
     }
+    // Claude hands over a result of several blocks, and Cowork since 2026-10-31 also one of a single block, as the bare
+    // block array.
+    if (Array.isArray(toolResponse)) return collectTriggerUrlCandidates({ content: toolResponse });
     if (!toolResponse || typeof toolResponse !== 'object' || toolResponse.isError === true) return [];
     const candidates = [];
     for (const structured of [toolResponse.structuredContent, toolResponse.structured_content]) {
@@ -314,6 +320,19 @@ const collectTriggerUrlCandidates = (toolResponse) => {
     return candidates;
 };
 
+// The form the host handed over when no token was found: types, field names and lengths, never a value.
+const responseShape = (value, depth = 0) => {
+    if (Array.isArray(value)) {
+        return depth > 2 ? `array[${value.length}]` : `array[${value.length}](${value.slice(0, 3).map((item) => responseShape(item, depth + 1)).join(',')})`;
+    }
+    if (value && typeof value === 'object') {
+        const keys = Object.keys(value);
+        if (depth > 2) return `object{${keys.length}}`;
+        return `{${keys.slice(0, 12).map((key) => (/^[A-Za-z_]{1,40}$/.test(key) ? `${key}:${responseShape(value[key], depth + 1)}` : '?')).join(',')}}`;
+    }
+    return value === null ? 'null' : typeof value === 'string' ? `string(${value.length})` : typeof value;
+};
+
 export const extractTriggerUrl = (toolResponse) => {
     const candidates = collectTriggerUrlCandidates(toolResponse);
     if (candidates.length === 0) return null;
@@ -335,6 +354,7 @@ const preToolUseOutput = (updatedInput) =>
 
 const handoffRecovery = (code) => {
     // Refusals before claim consumption must not manufacture a second pending authorization.
+    if (code === 'HANDOFF_COPY_REQUIRED') return 'Pass trigger_url from the same browser_job result, unchanged, as triggerUrl and retry the same local tool once; do not call browser_job again.';
     if (code === 'HANDOFF_MODEL_AUTHORIZATION') return 'Remove triggerUrl and trigger_url from the model-authored arguments and retry the same local tool. The hook must inject authorization; do not request a new browser_job for this argument correction.';
     if (code === 'HANDOFF_INVALID_INPUT') return 'Correct the local tool arguments and retry the same local tool; do not request another authorization just to repair arguments.';
     if (code === 'HANDOFF_DATA_DIR_UNAVAILABLE') return 'The host did not provide plugin storage. Check the installed plugin and host hook integration; requesting another browser_job cannot fix missing host storage.';
@@ -354,9 +374,27 @@ const deniedPreToolUseOutput = (error) =>
             permissionDecision: 'deny',
             permissionDecisionReason:
                 `${error.code}: e-Comet could not safely hand off the browser authorization. ${error.message} ` +
-                (handoffStorageRecovery(error.details) ?? handoffRecovery(error.code)) + (error.details ? ` Diagnostics: ${JSON.stringify(error.details)}` : ''),
+                (handoffStorageRecovery(error.details) ?? error.recovery ?? handoffRecovery(error.code)) + (error.details ? ` Diagnostics: ${JSON.stringify(error.details)}` : ''),
         },
     });
+
+// The closed cause each denial code reports in its hook diagnostic record.
+const HANDOFF_CAUSES = Object.freeze({
+    HANDOFF_MISSING: 'missing',
+    HANDOFF_TOOL_MISMATCH: 'missing',
+    HANDOFF_EXPIRED: 'expired',
+    HANDOFF_DATA_DIR_UNAVAILABLE: 'storage_unavailable',
+    HANDOFF_STORAGE_ERROR: 'io_error',
+    HANDOFF_INVALID_INPUT: 'invalid_input',
+    HANDOFF_MODEL_AUTHORIZATION: 'invalid_input',
+    HANDOFF_COPY_REQUIRED: 'invalid_input',
+    HANDOFF_INVALID_SESSION: 'invalid_event',
+    HANDOFF_INVALID_EVENT: 'invalid_event',
+    HANDOFF_INVALID_ENTRY: 'invalid_state',
+    HANDOFF_INVALID_TOKEN: 'invalid_state',
+    HANDOFF_INVALID_TOOL: 'unsupported',
+    HANDOFF_AMBIGUOUS_TOKEN: 'ambiguous',
+});
 
 const safeHookError = (error, operation = 'handoff_authorize') => {
     if (error instanceof HandoffError) return error;
@@ -377,7 +415,7 @@ const browserJobTargetTool = (event) => {
     return validateTargetTool(LOCAL_TOOL_BY_BROWSER_JOB_TYPE[job.type]);
 };
 
-const processHookEventAuthoritative = async (event, { env = process.env, nowMs = Date.now(), fileNow = Date.now } = {}) => {
+const processHookEventAuthoritative = async (event, { env = process.env, nowMs = Date.now(), fileNow = Date.now } = {}, observed = {}) => {
     if (!event || typeof event !== 'object') {
         const error = new HandoffError('HANDOFF_INVALID_EVENT', 'The desktop hook event is invalid.');
         return { exitCode: 2, stdout: '', stderr: `${error.code}: ${error.message}` };
@@ -388,12 +426,15 @@ const processHookEventAuthoritative = async (event, { env = process.env, nowMs =
     const sessionId = event.session_id ?? event.sessionId;
     if (eventName === 'PostToolUse' && REMOTE_BROWSER_JOB_TOOL.test(toolName)) {
         try {
-            const triggerUrl = extractTriggerUrl(event.tool_response ?? event.toolResponse);
+            const toolResponse = event.tool_response ?? event.toolResponse;
+            const triggerUrl = extractTriggerUrl(toolResponse);
             if (triggerUrl === null) {
-                throw new HandoffError(
+                const error = new HandoffError(
                     'HANDOFF_TOKEN_NOT_FOUND',
                     'The browser authorization result did not contain a usable token.'
                 );
+                error.details = { responseShape: responseShape(toolResponse).slice(0, 400) };
+                throw error;
             }
             await stageTriggerUrl({
                 dataDirectory: resolveStoreDirectory(env),
@@ -405,6 +446,12 @@ const processHookEventAuthoritative = async (event, { env = process.env, nowMs =
             });
             return { exitCode: 0, stdout: '', stderr: '' };
         } catch (error) {
+            // In Claude's cloud sandbox a Cowork device call takes trigger_url from the model, so an error staging it here
+            // must not stop the flow; a cloud session whose local tools claim it gets HANDOFF_MISSING there instead.
+            if (env.CLAUDE_CODE_REMOTE === 'true') {
+                observed.unstaged = true;
+                return { exitCode: 0, stdout: '', stderr: '' };
+            }
             const safeError = safeHookError(error);
             return { exitCode: 2, stdout: '', stderr: `${safeError.code}: ${safeError.message}${safeError.details ? ` Diagnostics: ${JSON.stringify(safeError.details)}` : ''}` };
         }
@@ -418,6 +465,16 @@ const processHookEventAuthoritative = async (event, { env = process.env, nowMs =
                 throw new HandoffError('HANDOFF_INVALID_INPUT', 'The local browser-job arguments are invalid.');
             }
             const targetTool = toolName.slice(toolName.lastIndexOf('__') + 2);
+            // WHY: since 2026-10-30 Cowork refuses a device call whose input a cloud hook changed, so there the model
+            // copies trigger_url itself and the call passes untouched; the signed token, not its carrier, is the check.
+            // Accepted residual "Cowork: the model carries the browser authorization".
+            if (toolName.startsWith('mcp__remote-devices__')) {
+                if (typeof toolInput.triggerUrl === 'string' && toolInput.triggerUrl) return { exitCode: 0, stdout: '', stderr: '' };
+                throw new HandoffError(
+                    'HANDOFF_COPY_REQUIRED',
+                    'This host refuses a local call whose arguments a plugin hook changed, so the hook cannot add the authorization.'
+                );
+            }
             if (
                 Object.prototype.hasOwnProperty.call(toolInput, 'triggerUrl') ||
                 Object.prototype.hasOwnProperty.call(toolInput, 'trigger_url')
@@ -441,6 +498,7 @@ const processHookEventAuthoritative = async (event, { env = process.env, nowMs =
             };
         } catch (error) {
             const safeError = safeHookError(error, 'claim_consume');
+            observed.denial = safeError;
             return { exitCode: 0, stdout: deniedPreToolUseOutput(safeError), stderr: '' };
         }
     }
@@ -449,12 +507,14 @@ const processHookEventAuthoritative = async (event, { env = process.env, nowMs =
 };
 
 export const processHookEvent = async (event, options = {}) => {
-    const result = await processHookEventAuthoritative(event, options);
+    const observed = {};
+    const result = await processHookEventAuthoritative(event, options, observed);
     const eventName = event?.hook_event_name ?? event?.hookEventName;
     const toolName = event?.tool_name ?? event?.toolName;
     const isPost = eventName === 'PostToolUse' && REMOTE_BROWSER_JOB_TOOL.test(toolName);
     const isPre = eventName === 'PreToolUse' && LOCAL_BROWSER_TOOL.test(toolName);
-    if ((!isPost && !isPre) || result.exitCode !== 0) return result;
+    // A Cowork call that passes untouched, or a cloud token left unstaged, has nothing to record.
+    if ((!isPost && !isPre) || result.exitCode !== 0 || (isPre && result.stdout === '') || observed.unstaged) return result;
     let decision;
     if (result.stdout) {
         try { decision = JSON.parse(result.stdout).hookSpecificOutput?.permissionDecision; }
@@ -466,6 +526,7 @@ export const processHookEvent = async (event, options = {}) => {
         outcome: decision === 'deny' ? 'denied' : 'succeeded',
         observedAt: new Date(options.nowMs ?? Date.now()).toISOString(),
         executionPlane: typeof toolName === 'string' && toolName.startsWith('mcp__remote-devices__') ? 'cloud' : 'native',
+        ...(decision === 'deny' && observed.denial ? denialEvidence(HANDOFF_CAUSES[observed.denial.code], observed.denial.details?.systemCode) : {}),
     }));
 };
 

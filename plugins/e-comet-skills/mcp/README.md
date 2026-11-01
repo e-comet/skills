@@ -18,7 +18,8 @@ not a Wildberries tab or a specific promotion-overview page. Ozon company contex
 `sc_company_id` cookie; the extension does not depend on Vue, Vuex, Axios defaults, or a visible company label.
 Feedback is independent of bridge
 and extension readiness; its optional history is bounded current-session history supplied by
-the trusted host hook. The explicit history choice and protected handoff remain required.
+the trusted host hook. The explicit history choice remains required. Cowork gives plugins no history, so a Cowork
+report goes without it and its upload grant is copied by the agent, accepted only for e-Comet storage.
 
 Feedback failures provide only closed diagnostic evidence in `error.details`: the operation, reason,
 system code, HTTP status, and optional public module/line context. No raw paths, messages, stacks,
@@ -85,7 +86,9 @@ Local tools:
   table through one `browser_job` authorization and one local call; the connected extension must advertise the search
   positions capability;
 - `local_bridge_status` — reports whether the extension is connected, and the observed cause when it is not;
-- `wb_product_images` — public WB image-CDN lookup; this tool does not require the extension.
+- `wb_product_images` — public WB image-CDN lookup; this tool does not require the extension;
+- `e_comet_run_result` — returns the final answer of a signed tool call that answered `status:"running"` with a `runId`;
+  each call waits up to 30 s, needs no `browser_job`, and never starts marketplace work.
 
 ## Workflow contract lookup
 
@@ -100,7 +103,7 @@ The same lookup also supports `prepare_e_comet_feedback` and `submit_e_comet_fee
 
 Choose the matching signed tool first. If its full contract is not already available in the current task, look it up once before remote `browser_job`; reuse the known contract for another call of the same tool and look up a different selected tool separately. Follow the returned business arguments and safety limits, then await exactly one `browser_job` authorization and immediately call the matching local tool once. No discovery, status probe, prose, or other call belongs between a successful `browser_job` and that dependent local call. Preserve partial/completed results and do not automatically retry uncertain creates or rate-limited work. The [authorization handoff](#authorization-handoff) below and packaged [hook implementation](../hooks/) define the trusted transport boundary.
 
-Feedback is separate: only after explicit user agreement to report an e-Comet problem, retrieve the full feedback contract before the first feedback tool and resolve the history choice as it directs. The consented dependent sequence is local `prepare_e_comet_feedback` → remote `report_issue` → local `submit_e_comet_feedback`, awaiting each stage and inserting no discovery between successful stages. It needs no `browser_job` or extension. Do not author hook-only transport fields or retry an uncertain upload. The packaged [feedback hooks](../hooks/) implement the host-specific handoff; the full native versus Cowork cloud boundary is maintained in the private architecture document.
+Feedback is separate: only after explicit user agreement to report an e-Comet problem, retrieve the full feedback contract before the first feedback tool and resolve the history choice as it directs. The consented dependent sequence is local `prepare_e_comet_feedback` → remote `report_issue` → local `submit_e_comet_feedback`, awaiting each stage and inserting no discovery between successful stages. It needs no `browser_job` or extension. Do not author hook-only transport fields or retry an uncertain upload. The packaged [feedback hooks](../hooks/) implement the host-specific handoff; the full native versus Cowork boundary is maintained in the private architecture document.
 
 `wb_product_images` is not a lookup target. Call it directly for public CDN image URLs; it needs no describe call, `browser_job`, or Chrome extension. A failed/rate-limited probe is not proof that a product or its photos do not exist.
 

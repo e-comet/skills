@@ -3,11 +3,12 @@
 import { randomUUID } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import net from 'node:net';
+import { release } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { pruneArtifacts } from './artifact-store.mjs';
-import { detectPlatformCause } from './bridge-cause.mjs';
+import { detectPlatformCause, readComspecState } from './bridge-cause.mjs';
 import { createBridgeClientRuntime } from './bridge-client-runtime.mjs';
 import { deriveBridgeDiagnostics } from './bridge-diagnostics.mjs';
 import { ensureRegistration, readUserLevelHostsPolicy, resolveNativeHostName, runBounded } from './bridge-registration.mjs';
@@ -22,7 +23,9 @@ import {
     STORAGE_LAYOUT,
 } from './config.mjs';
 import { ConnectionState } from './connection-state.mjs';
-import { collectStaticFacts, diagnosticCheck, isHostRuntimeVersion } from './diagnostic-facts.mjs';
+import { collectStaticFacts, diagnosticCheck, hostRestartFacts, isHostRuntimeVersion } from './diagnostic-facts.mjs';
+import { BRIDGE_IDENTIFIER } from './bridge-codes.mjs';
+import { createTransportEvents } from './transport-events.mjs';
 import { createExtensionProtocol, extensionDisconnectedError } from './extension-protocol.mjs';
 import { maintainFeedbackArtifacts } from './feedback-artifact-store.mjs';
 import { localMessage, MESSAGE_TYPES } from './extension-vocabulary.mjs';
@@ -32,6 +35,7 @@ import { CLIENT_PROTOCOL_VERSION, EXTENSION_ORIGIN } from './native-framing.mjs'
 import { RequestBroker } from './request-broker.mjs';
 import { pruneResults } from './result-store.mjs';
 import { createDiagnosticSnapshotRoute, createOzonPromotionRoute } from './server-routing.mjs';
+import { collectExtensionLog } from './extension-log.mjs';
 import { attachStdioTransport } from './stdio-transport.mjs';
 import { ToolExecutionError } from './tool-errors.mjs';
 import { storageStatus } from './storage-layout.mjs';
@@ -50,6 +54,8 @@ const registrationOrigin = EXTENSION_ID_OVERRIDE_ENABLED && ALLOWED_EXTENSION_ID
     ? `chrome-extension://${[...ALLOWED_EXTENSION_IDS][0]}/`
     : EXTENSION_ORIGIN;
 const connections = new ConnectionState();
+// Transport events that otherwise reach only stderr, shared by the request broker (late answers) and the bridge runtime.
+const transportEvents = createTransportEvents();
 // A spawned test server never reads this machine's browser policies or profiles: it reports no install observed.
 const readsDevice = process.env.NODE_ENV !== 'test';
 let runtime;
@@ -58,9 +64,12 @@ const sendExtension = (message) => runtime.sendExtension(message);
 
 const requestBroker = new RequestBroker({
     // Ответ, приехавший после того, как запрос уже завершился по таймауту. Раньше
-    // терялся молча вместе с типизированным кодом отказа.
-    onUnsettled: ({ kind, requestId, detail }) =>
-        log(`late ${kind} for settled request ${requestId}${detail ? `: ${detail}` : ''}`),
+    // терялся молча вместе с типизированным кодом отказа. В статус и отчёт идёт только
+    // этот код или вид ответа, без id запроса.
+    onUnsettled: ({ kind, requestId, detail }) => {
+        log(`late ${kind} for settled request ${requestId}${detail ? `: ${detail}` : ''}`);
+        transportEvents.add({ kind: 'late_answer', code: typeof detail === 'string' && BRIDGE_IDENTIFIER.test(detail) ? detail : kind.replaceAll('-', '_') });
+    },
     routeWbFetch: ({ requestId, url, timeout, authorizationId }) =>
         sendExtension(localMessage(requestId, MESSAGE_TYPES.wbFetch, { url, timeout, authorizationId })),
     routeSellerOperation: ({ requestId, sellerOperation, timeout, authorizationId }) =>
@@ -126,6 +135,9 @@ runtime = createBridgeClientRuntime({
     readPolicy: async () => (readsDevice
         ? readUserLevelHostsPolicy({ platform: process.platform, run: runBounded, hostName: resolveNativeHostName({ env: process.env }) }) : null),
     probe: async () => (readsDevice ? probeBrowserExtensionInstall() : null),
+    readExtensionLog: async (options) => (readsDevice ? collectExtensionLog(options) : null),
+    comspec: () => readComspecState({ platform: process.platform, env: process.env }),
+    transportEvents,
 });
 
 const requestBrowserJobAuthorization = (...args) => requestBroker.requestAuthorization(...args);
@@ -134,18 +146,23 @@ const shutdownController = new AbortController();
 // Anything outside the version grammar is dropped here rather than carried into a report. A foreign parent environment
 // that sets it is "Native DeepSeek host runtime version from the environment" in docs/local-agent-architecture.md#accepted-residuals.
 const hostRuntimeVersion = isHostRuntimeVersion(process.env.ECOMET_HOST_RUNTIME_VERSION) ? process.env.ECOMET_HOST_RUNTIME_VERSION : undefined;
+// The same adapter's account of the module it restarted: the last failure class and the restart count, closed values only.
+const hostRestarts = hostRestartFacts(process.env);
+const osRelease = release();
 
 const handleMcpMessage = createMcpMessageHandler({
     reportOutputDirectory: process.env.CLAUDE_PROJECT_DIR,
     getBridgeStatus: (/** @type {any} */ metadata = {}) => {
         const { clientInfo, protocolVersion, clientObservedAt } = metadata;
-        const rawStatus = runtime.status();
+        // The extension log evidence becomes the closed extension_log check and the last frame time the route_freshness
+        // check; their times and system code stay here.
+        const { extensionLog, routeLastObservedAtMs, ...rawStatus } = runtime.status();
         const observedAt = new Date().toISOString();
         const storage = storageStatus(STORAGE_LAYOUT);
-        const derived = deriveBridgeDiagnostics({ ...rawStatus, observedAt });
+        const derived = deriveBridgeDiagnostics({ ...rawStatus, extensionLog, routeLastObservedAtMs, observedAt });
         const staticChecks = Object.fromEntries(collectStaticFacts({
             platform: process.platform, arch: process.arch,
-            versions: { node: process.version, bridge: BRIDGE_VERSION, mcp: protocolVersion },
+            versions: { node: process.version, bridge: BRIDGE_VERSION, mcp: protocolVersion, os: osRelease },
             storageLayout: storage, observedAt,
         }).map((check) => [check.check, check]));
         return ({
@@ -161,13 +178,16 @@ const handleMcpMessage = createMcpMessageHandler({
                 runtime: staticChecks.runtime,
                 client: diagnosticCheck({ check: 'client', state: clientInfo ? 'passed' : 'not_checked', observedAt: clientObservedAt ?? observedAt,
                     source: 'mcp_initialize', executionPlane: 'client',
-                    ...(clientInfo ? { facts: { ...clientInfo, provenance: 'client_reported', ...(hostRuntimeVersion ? { hostRuntimeVersion } : {}) } } : {}) }),
+                    ...(clientInfo ? { facts: { ...clientInfo, provenance: 'client_reported', ...(hostRuntimeVersion ? { hostRuntimeVersion } : {}), ...hostRestarts } } : {}) }),
                 storage: staticChecks.storage,
             },
         });
     },
     ensureBroker: () => runtime.ensureBroker(),
     refreshBridgeFacts: (options) => runtime.refreshDeviceFacts(options),
+    // A diagnosis and a report read the log of the browser the runtime names; a diagnosis's read becomes the kept one.
+    extensionLogTarget: () => runtime.extensionLogTarget(),
+    replaceExtensionLog: (evidence) => runtime.replaceExtensionLog(evidence),
     // Discovery and registration start once the host has its handshake answer, so neither delays it.
     onInitialized: () => runtime.onInitialized(),
     // A tool that needs the extension starts a connect attempt at once instead of waiting for the next re-list.
@@ -175,6 +195,7 @@ const handleMcpMessage = createMcpMessageHandler({
     requestBrowserJobAuthorization,
     // Diagnosis uses the broker's business deadline; feedback preparation passes its own shorter one.
     requestExtensionDiagnosticSnapshot: (timeoutMs) => requestBroker.requestDiagnosticSnapshot(timeoutMs),
+    diagnosticSnapshotV2Ready: () => connections.extensionDiagnosticSnapshotV2Ready,
     shutdownSignal: shutdownController.signal,
     log,
 });

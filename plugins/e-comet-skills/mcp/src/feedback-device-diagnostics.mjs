@@ -1,16 +1,12 @@
-import { BRIDGE_REGISTRATION_STATES, BRIDGE_RUNTIMES, BRIDGE_STATUS_CODES } from './bridge-codes.mjs';
-import { EXTENSION_INSTALL_VOCABULARY, EXTENSION_SNAPSHOT_VOCABULARY, MCP_CONFIGURATION_FACTS as MCP_CONFIGURATION, extensionInstallFactsSchema, extensionSnapshotFactsSchema, hookPermissionsFactsSchema, isCanonicalTimestamp } from './diagnostic-facts.mjs';
+import { BRIDGE_COMSPEC_STATES, BRIDGE_IDENTIFIER, BRIDGE_OWNERS, BRIDGE_REGISTRATION_STATES, BRIDGE_RUNTIME_RECHECKS, BRIDGE_RUNTIMES, BRIDGE_STATUS_CODES } from './bridge-codes.mjs';
+import { EXTENSION_INSTALL_VOCABULARY, EXTENSION_SNAPSHOT_VOCABULARY, HOST_LAST_FAILURES, MCP_CONFIGURATION_FACTS as MCP_CONFIGURATION, extensionInstallFactsSchema, extensionLogFactsSchema, extensionSnapshotFactsSchema, hookPermissionsFactsSchema, isCanonicalTimestamp, isOsRelease } from './diagnostic-facts.mjs';
+import { TRANSPORT_EVENT_KINDS } from './transport-events.mjs';
 import { validateSchemaValue } from './schema-validation.mjs';
 
 const STATES = new Set(['passed', 'failed', 'unknown', 'not_checked', 'unsupported']);
 const MAX_TEXT_LENGTH = 128;
-// The cloud hook validates the device projection before it can enter an archive; these caps bound that
-// untrusted input. The full projection with every evidence check measured about 6 KiB, so both keep
-// twofold headroom without admitting an unbounded placeholder. The margin is measured, not enforced on
-// the device: see the accepted residual "Device projection caps are a measured margin, not an enforced
-// one" in docs/local-agent-architecture.md#accepted-residuals before reporting the gate again.
-export const FEEDBACK_DEVICE_DIAGNOSTICS_MAX_BYTES = 12 * 1024;
-export const FEEDBACK_DEVICE_SNAPSHOT_MAX_BYTES = 16 * 1024;
+// The full projection with every evidence check measured about 6 KiB; the report keeps it within twice that and more.
+const FEEDBACK_DEVICE_SNAPSHOT_MAX_BYTES = 16 * 1024;
 
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = value => typeof value === 'string' && value.length > 0 && Buffer.byteLength(value, 'utf8') <= MAX_TEXT_LENGTH
@@ -47,6 +43,8 @@ const extensionSnapshotFacts = value => {
         activationIdentity: { state: value.activationIdentity.state },
         storageRead: { state: value.storageRead.state },
         ports: Object.fromEntries(EXTENSION_SNAPSHOT_VOCABULARY.ports.map(key => [key, value.ports[key]])),
+        tabs: value.tabs,
+        pendingUpdateVersion: value.pendingUpdateVersion,
     });
     return validateSchemaValue(normalized, extensionSnapshotFactsSchema) ? normalized : undefined;
 };
@@ -64,14 +62,16 @@ const specs = {
         if (!record(value)) return undefined;
         const core = { nodeVersion: text(value.nodeVersion), platform: text(value.platform), arch: text(value.arch), bridgeVersion: text(value.bridgeVersion) };
         if (Object.values(core).some(item => item === undefined)) return undefined;
-        return compact({ ...core, mcpProtocolVersion: text(value.mcpProtocolVersion) });
+        return compact({ ...core, mcpProtocolVersion: text(value.mcpProtocolVersion), osRelease: isOsRelease(value.osRelease) ? value.osRelease : undefined });
     } },
     // The host that runs the plugin is the first triage fact: Cowork, Claude Code, Codex and DeepSeek differ in
     // hooks, transports and budgets. The values are the bounded strings the client sent in MCP initialize, plus
-    // the Harness runtime version the native DeepSeek adapter passes through the local module's environment.
+    // what the native DeepSeek adapter passes through the local module's environment: its Harness runtime version,
+    // and the closed class of the module's last failure and how often it was started again.
     client: { check: 'client', sources: ['mcp_initialize'], planes: ['client'], causes: ['unknown'], facts: value =>
         record(value) && value.provenance === 'client_reported' ? compact({ name: text(value.name), version: text(value.version), provenance: 'client_reported',
-            hostRuntimeVersion: text(value.hostRuntimeVersion) }) : undefined },
+            hostRuntimeVersion: text(value.hostRuntimeVersion), hostLastFailure: HOST_LAST_FAILURES.includes(value.hostLastFailure) ? value.hostLastFailure : undefined,
+            hostRestarts: Number.isSafeInteger(value.hostRestarts) && value.hostRestarts >= 0 ? value.hostRestarts : undefined }) : undefined },
     routeFreshness: { check: 'route_freshness', sources: ['extension_heartbeat'], planes: ['device'], causes: ['unknown'], facts: value => {
         const lastObservedAt = record(value) ? iso(value.lastObservedAt) : undefined;
         return lastObservedAt ? { lastObservedAt } : undefined;
@@ -96,15 +96,9 @@ const specs = {
         causes: ['permission_denied', 'io_error', 'directory_absent', 'unknown'], facts: exactFacts(extensionInstallFactsSchema), strict: true },
     hookPermissions: { check: 'hook_permissions', sources: ['codex_hooks_list', 'device_process'], planes: ['device'],
         causes: ['permission_denied', 'missing', 'unavailable', 'unsupported', 'unknown'], facts: exactFacts(hookPermissionsFactsSchema), strict: true },
+    extensionLog: { check: 'extension_log', sources: ['browser_profile_storage'], planes: ['device'],
+        causes: ['permission_denied', 'io_error', 'directory_absent', 'corrupt', 'unavailable', 'unknown'], facts: exactFacts(extensionLogFactsSchema), strict: true },
 };
-
-export const feedbackDeviceDiagnosticsFailure = (error, now = Date.now) => ({
-    bridgeStatusCollection: {
-        check: 'bridge_status_collection', state: 'failed', observedAt: new Date(now()).toISOString(),
-        source: 'feedback_preparation', executionPlane: 'device',
-        cause: ['EACCES', 'EPERM'].includes(error?.code) ? 'permission_denied' : 'unknown',
-    },
-});
 
 const selectCheck = (slot, value) => {
     const spec = specs[slot];
@@ -142,17 +136,28 @@ const selectStorage = storage => {
 };
 
 // The cause code and the registration and broker facts behind it, as closed values only. Error names and codes come
-// from the file system and from a broker's record, so only a short identifier is kept: anything longer or looser can
-// carry a path, a message or a user name. The broker nonce, endpoint, process ids and times are never copied.
-const BRIDGE_IDENTIFIER = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+// from the file system and from a broker's record, so only a short identifier (BRIDGE_IDENTIFIER) is kept. The broker
+// nonce, endpoint, process ids and times are never copied.
 const MAX_BRIDGE_BROWSERS = 8;
 // RegExp.test stringifies its argument, so a null or missing name would pass as "null" and sink the whole block at the
 // schema; only a string can be an identifier, and a record that is not one is dropped alone.
 const bridgeIdentifier = value => typeof value === 'string' && BRIDGE_IDENTIFIER.test(value);
+const version = value => (typeof value === 'string' && EXTENSION_INSTALL_VOCABULARY.version.test(value) ? value : undefined);
+// The transport event ring sits beside the diagnostics, outside their 12 KiB cap, within its own 4 KiB: the newest
+// events are kept, and selectFeedbackDeviceSnapshot drops the oldest until the whole snapshot fits.
+const MAX_TRANSPORT_EVENTS = 32;
+const MAX_TRANSPORT_EVENTS_BYTES = 4 * 1024;
+const selectTransportEvents = value => {
+    const events = (Array.isArray(value) ? value : [])
+        .filter(event => record(event) && iso(event.at) && TRANSPORT_EVENT_KINDS.includes(event.kind) && bridgeIdentifier(event.code))
+        .map(({ at, kind, code }) => ({ at, kind, code })).slice(-MAX_TRANSPORT_EVENTS);
+    while (events.length > 0 && Buffer.byteLength(JSON.stringify(events), 'utf8') > MAX_TRANSPORT_EVENTS_BYTES) events.shift();
+    return events.length > 0 ? events : undefined;
+};
 const selectBridgeFailure = value => (record(value) && bridgeIdentifier(value.name) && (value.code === null || value.code === undefined || bridgeIdentifier(value.code))
     ? { name: value.name, code: value.code ?? null } : undefined);
 const selectBridge = value => {
-    // The already projected form is re-validated as it is, so the cloud half can accept what the device sent.
+    // The already projected form is re-validated as it is, so projecting a projection changes nothing.
     if (record(value.bridge)) return validateSchemaValue(value.bridge, bridgeBlockSchema) ? value.bridge : undefined;
     if (!BRIDGE_STATUS_CODES.includes(value.code)) return undefined;
     const registration = record(value.registration) ? value.registration : {};
@@ -160,6 +165,13 @@ const selectBridge = value => {
     const hosts = Array.isArray(value.userLevelHosts) ? value.userLevelHosts : [];
     // The browsers, from the closed list only, whose policy matches.
     const policyBrowsers = matches => [...new Set(hosts.filter(host => record(host) && matches(host) && EXTENSION_INSTALL_VOCABULARY.browsers.includes(host.browser)).map(host => host.browser))];
+    // The browsers whose policy read observed nothing: their null policy is unknown, not unset.
+    const unreadPolicies = [...new Set((Array.isArray(value.policyReadFailed) ? value.policyReadFailed : [])
+        .filter(browser => EXTENSION_INSTALL_VOCABULARY.browsers.includes(browser)))];
+    // Every running broker's version, and the extension behind the serving broker, or the newest one without a session.
+    const brokerVersions = [...new Set(brokers.map(broker => (record(broker) ? version(broker.brokerVersion) : undefined)).filter(Boolean))].slice(0, MAX_BRIDGE_BROWSERS);
+    const serving = brokers.find(broker => record(broker) && broker.current === true) ?? brokers[0];
+    const lastFailureRecord = selectBridgeFailure(value.lastFailureRecord) ?? null;
     const candidate = compact({
         code: value.code,
         registrationState: BRIDGE_REGISTRATION_STATES.includes(registration.state) ? registration.state : undefined,
@@ -169,7 +181,18 @@ const selectBridge = value => {
         browsers: [...new Set(brokers.map(broker => (record(broker) ? text(broker.browser) : undefined)).filter(browser => browser !== undefined))].slice(0, MAX_BRIDGE_BROWSERS),
         userLevelHostsDisabled: policyBrowsers(host => host.allowed === false),
         nativeHostBlocked: policyBrowsers(host => host.hostBlocked === true),
-        lastFailureRecord: selectBridgeFailure(value.lastFailureRecord) ?? null,
+        // Omitted when every read worked.
+        policyReadFailed: unreadPolicies.length > 0 ? unreadPolicies : undefined,
+        lastFailureRecord,
+        // Who can act on the cause, and the facts that named it: the ComSpec state and what the repair re-checked.
+        owner: BRIDGE_OWNERS.includes(value.owner) ? value.owner : undefined,
+        comspec: BRIDGE_COMSPEC_STATES.includes(value.comspec) ? value.comspec : undefined,
+        runtimeRecheck: BRIDGE_RUNTIME_RECHECKS.includes(registration.runtimeRecheck) ? registration.runtimeRecheck : undefined,
+        // A version mismatch between the plugin, its brokers and the extension is the first fact support checks.
+        brokerVersions: brokerVersions.length > 0 ? brokerVersions : undefined,
+        servingBrokerVersion: version(value.brokerVersion),
+        extensionVersion: record(serving) ? version(serving.extensionVersion) : undefined,
+        lastFailureRecordAt: lastFailureRecord ? iso(value.lastFailureRecord.at) : undefined,
     });
     return validateSchemaValue(candidate, bridgeBlockSchema) ? candidate : undefined;
 };
@@ -189,80 +212,35 @@ export const selectFeedbackDeviceSnapshot = status => {
         state: status.browserContext.state, wbTabConnected: bool(status.browserContext.wbTabConnected),
         sellerTabConnected: bool(status.browserContext.sellerTabConnected), changedAt: iso(status.browserContext.changedAt),
     }) : undefined;
-    return compact({
+    const snapshot = compact({
         bridgeStatusCollection: status.bridgeStatusCollection?.check === 'bridge_status_collection'
             ? selectCheck('bridgeStatusCollection', status.bridgeStatusCollection) : undefined,
         bridgeVersion: text(status.bridgeVersion), extensionProtocolVersion: positiveInteger(status.extensionProtocolVersion),
         state: bridgeStates.has(status.state) ? status.state : undefined,
         bridge: selectBridge(status),
+        transportEvents: selectTransportEvents(status.transportEvents),
         extension: extension && Object.keys(extension).length ? extension : undefined,
         browserContext, storage: selectStorage(status.storage), diagnostics: selectFeedbackDeviceDiagnostics(status.diagnostics),
     });
-};
-
-export const isValidFeedbackDeviceSnapshot = value => {
-    if (!record(value)) return false;
-    const selected = selectFeedbackDeviceSnapshot(value);
-    if (!isValidFeedbackDeviceDiagnostics(value.diagnostics)) return false;
-    if (value.extension !== undefined && (!record(value.extension) || value.extension.state === undefined || value.extension.route === undefined)) return false;
-    if (value.storage !== undefined && (!record(value.storage) || !['results', 'marketplaceArtifacts', 'feedbackArtifacts'].every(key => Object.hasOwn(value.storage, key)))) return false;
-    return Object.keys(selected).length > 0 && exact(value, selected) && Buffer.byteLength(JSON.stringify(value), 'utf8') <= FEEDBACK_DEVICE_SNAPSHOT_MAX_BYTES;
-};
-
-const exact = (left, right) => {
-    if (left === right) return true;
-    if (Array.isArray(left) || Array.isArray(right)) {
-        return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((item, index) => exact(item, right[index]));
+    // The ring yields to the rest: its oldest events leave until the whole snapshot fits its 16 KiB.
+    while (snapshot.transportEvents && Buffer.byteLength(JSON.stringify(snapshot), 'utf8') > FEEDBACK_DEVICE_SNAPSHOT_MAX_BYTES) {
+        snapshot.transportEvents = snapshot.transportEvents.slice(1);
+        if (snapshot.transportEvents.length === 0) delete snapshot.transportEvents;
     }
-    if (!record(left) || !record(right)) return false;
-    const leftKeys = Object.keys(left); const rightKeys = Object.keys(right);
-    return leftKeys.length === rightKeys.length && leftKeys.every(key => Object.hasOwn(right, key) && exact(left[key], right[key]));
+    return snapshot;
 };
 
-export const isValidFeedbackDeviceDiagnostics = value => {
-    const selected = selectFeedbackDeviceDiagnostics(value);
-    return selected !== undefined && exact(value, selected) && Buffer.byteLength(JSON.stringify(value), 'utf8') <= FEEDBACK_DEVICE_DIAGNOSTICS_MAX_BYTES;
-};
-
-const diagnosticString = { type: 'string', minLength: 1, maxLength: MAX_TEXT_LENGTH };
 const diagnosticTimestamp = { type: 'string', minLength: 24, maxLength: 24, pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$' };
 const nonNegativeIntegerSchema = { type: 'integer', minimum: 0 };
 const diagnosticObject = (properties, required) => ({ type: 'object', properties, required, additionalProperties: false });
-const checkSchema = (check, sources, planes, facts, causes) => diagnosticObject({
-    check: { const: check }, state: { type: 'string', enum: [...STATES] }, observedAt: diagnosticTimestamp,
-    source: { type: 'string', enum: sources }, executionPlane: { type: 'string', enum: planes },
-    ...(facts ? { facts } : {}), cause: { type: 'string', enum: causes },
-}, ['check', 'state', 'observedAt', 'source', 'executionPlane']);
-const storageTargetSchema = { type: 'object', oneOf: [
-    diagnosticObject({ state: { const: 'ready' }, backend: { type: 'string', enum: ['plugin_data', 'application_data', 'override'] } }, ['state', 'backend']),
-    diagnosticObject({ state: { const: 'unavailable' }, reason: { type: 'string', enum: ['plugin_data_missing', 'plugin_data_invalid', 'plugin_data_conflict', 'application_data_invalid', 'override_invalid'] } }, ['state', 'reason']),
-] };
-const packageMetadataSchema = name => diagnosticObject({ name: { const: name }, version: diagnosticString }, ['name', 'version']);
-export const feedbackDeviceDiagnosticsSchema = diagnosticObject({
-    bridgeStatusCollection: checkSchema('bridge_status_collection', ['feedback_preparation'], ['device'], undefined, ['permission_denied', 'unknown']),
-    snapshot: checkSchema('snapshot', ['local_bridge_status'], ['device'], undefined, ['unknown']),
-    runtime: checkSchema('runtime', ['node_process'], ['device'], diagnosticObject({ nodeVersion: diagnosticString, platform: diagnosticString,
-        arch: diagnosticString, bridgeVersion: diagnosticString, mcpProtocolVersion: diagnosticString }, ['nodeVersion', 'platform', 'arch', 'bridgeVersion']), ['unknown']),
-    client: checkSchema('client', ['mcp_initialize'], ['client'], diagnosticObject({ name: diagnosticString, version: diagnosticString, provenance: { const: 'client_reported' },
-        hostRuntimeVersion: diagnosticString }, ['provenance']), ['unknown']),
-    routeFreshness: checkSchema('route_freshness', ['extension_heartbeat'], ['device'], diagnosticObject({ lastObservedAt: diagnosticTimestamp }, ['lastObservedAt']), ['unknown']),
-    storage: checkSchema('storage', ['resolved_configuration'], ['device'], diagnosticObject({ scope: { const: 'configuration' },
-        targets: diagnosticObject({ results: storageTargetSchema, marketplaceArtifacts: storageTargetSchema, feedbackArtifacts: storageTargetSchema }, []) }, ['scope', 'targets']), ['unknown']),
-    extensionSnapshot: checkSchema('extension_snapshot', ['extension', 'capability_negotiation', 'device_process'], ['device'], extensionSnapshotFactsSchema, ['unsupported', 'unavailable', 'corrupt', 'unknown']),
-    packageLayout: checkSchema('package_layout', ['module_location'], ['device'], diagnosticObject({ layout: { type: 'string', enum: LAYOUTS } }, ['layout']), ['unknown']),
-    packageMetadata: checkSchema('package_metadata', ['package_metadata'], ['device'], packageMetadataSchema('@e-comet/local-mcp'), ['missing', 'corrupt', 'io_error']),
-    codexManifest: checkSchema('codex_manifest', ['package_metadata'], ['device'], packageMetadataSchema('e-comet-skills'), ['missing', 'corrupt', 'io_error']),
-    mcpConfiguration: checkSchema('mcp_configuration', ['package_metadata'], ['device'],
-        diagnosticObject(Object.fromEntries(Object.entries(MCP_CONFIGURATION).map(([key, value]) => [key, { const: value }])), Object.keys(MCP_CONFIGURATION)), ['missing', 'corrupt', 'io_error']),
-    entrypoint: checkSchema('entrypoint', ['filesystem_metadata'], ['device'], undefined, ['missing', 'io_error']),
-    extensionInstall: checkSchema('extension_install', ['browser_profile_metadata'], ['device'], extensionInstallFactsSchema, ['permission_denied', 'io_error', 'directory_absent', 'unknown']),
-    hookPermissions: checkSchema('hook_permissions', ['codex_hooks_list', 'device_process'], ['device'], hookPermissionsFactsSchema, ['permission_denied', 'missing', 'unavailable', 'unsupported', 'unknown']),
-}, []);
-
+const versionSchema = { type: 'string', pattern: EXTENSION_INSTALL_VOCABULARY.version.source };
 const bridgeFailureSchema = diagnosticObject({ name: { type: 'string', pattern: BRIDGE_IDENTIFIER.source }, code: { oneOf: [{ type: 'string', pattern: BRIDGE_IDENTIFIER.source }, { type: 'null' }] } }, ['name', 'code']);
 const policyBrowsersSchema = { type: 'array', items: { type: 'string', enum: [...EXTENSION_INSTALL_VOCABULARY.browsers] }, uniqueItems: true, maxItems: EXTENSION_INSTALL_VOCABULARY.browsers.length };
 const bridgeBlockSchema = diagnosticObject({
     code: { type: 'string', enum: [...BRIDGE_STATUS_CODES] },
+    owner: { type: 'string', enum: [...BRIDGE_OWNERS] },
+    comspec: { type: 'string', enum: [...BRIDGE_COMSPEC_STATES] },
+    runtimeRecheck: { type: 'string', enum: [...BRIDGE_RUNTIME_RECHECKS] },
     registrationState: { type: 'string', enum: [...BRIDGE_REGISTRATION_STATES] },
     registrationError: bridgeFailureSchema,
     runtime: { type: 'string', enum: [...BRIDGE_RUNTIMES] },
@@ -270,20 +248,10 @@ const bridgeBlockSchema = diagnosticObject({
     browsers: { type: 'array', items: { type: 'string', pattern: '^[^\\u0000-\\u001f\\u007f]{1,128}$' }, uniqueItems: true, maxItems: MAX_BRIDGE_BROWSERS },
     userLevelHostsDisabled: policyBrowsersSchema,
     nativeHostBlocked: policyBrowsersSchema,
+    policyReadFailed: { ...policyBrowsersSchema, minItems: 1 },
     lastFailureRecord: { oneOf: [bridgeFailureSchema, { type: 'null' }] },
+    brokerVersions: { type: 'array', items: versionSchema, uniqueItems: true, minItems: 1, maxItems: MAX_BRIDGE_BROWSERS },
+    servingBrokerVersion: versionSchema,
+    extensionVersion: versionSchema,
+    lastFailureRecordAt: diagnosticTimestamp,
 }, ['code', 'brokerCount', 'browsers', 'userLevelHostsDisabled', 'nativeHostBlocked', 'lastFailureRecord']);
-
-export const feedbackDeviceSnapshotSchema = diagnosticObject({
-    bridgeStatusCollection: feedbackDeviceDiagnosticsSchema.properties.bridgeStatusCollection,
-    bridgeVersion: diagnosticString,
-    extensionProtocolVersion: { type: 'integer', minimum: 1 },
-    state: { type: 'string', enum: [...bridgeStates] },
-    bridge: bridgeBlockSchema,
-    extension: diagnosticObject({ state: { type: 'string', enum: ['never_connected', 'connected', 'disconnected'] }, route: { type: 'string', enum: ['direct', 'none'] },
-        version: diagnosticString, lastConnectedAt: diagnosticTimestamp, lastDisconnectedAt: diagnosticTimestamp,
-        ozonSellerPromotionReportSupported: { type: 'boolean' }, ozonSellerPromotionReportsSupported: { type: 'boolean' }, ozonSellerAnalyticsReportSupported: { type: 'boolean' },
-        ozonSearchPositionsSupported: { type: 'boolean' } }, ['state', 'route']),
-    browserContext: diagnosticObject({ state: { type: 'string', enum: ['unknown', 'known'] }, wbTabConnected: { type: 'boolean' }, sellerTabConnected: { type: 'boolean' }, changedAt: diagnosticTimestamp }, ['state']),
-    storage: diagnosticObject({ results: storageTargetSchema, marketplaceArtifacts: storageTargetSchema, feedbackArtifacts: storageTargetSchema }, []),
-    diagnostics: feedbackDeviceDiagnosticsSchema,
-}, []);

@@ -11,6 +11,7 @@ import {
     ARTIFACT_STORAGE,
 } from './config.mjs';
 import { sweepExpired } from './file-retention.mjs';
+import { LOCAL_STORAGE_MESSAGES } from './tool-errors.mjs';
 import { requireStorageTarget } from './storage-layout.mjs';
 import { assertXlsxPackage } from './xlsx-package.mjs';
 
@@ -31,6 +32,16 @@ export class ArtifactStoreError extends Error {
         if (options.retryable !== undefined) this.retryable = options.retryable === true;
     }
 }
+// A rejected workbook write keeps a closed class (spec 7.4): `disk` with the filesystem code, a `limit`, an `integrity`
+// mismatch, or a stream in the wrong `format`. The text stays local; only the class and code leave this process.
+const rejected = (artifactClass, message) => Object.assign(new Error(message), { artifactClass });
+const ARTIFACT_CLASSES = ['disk', 'limit', 'integrity', 'format'];
+export const artifactFailureDetails = (error) => {
+    if (!(error instanceof Error)) return undefined;
+    const { code, artifactClass } = /** @type {{ code?: unknown, artifactClass?: unknown }} */ (error);
+    if (typeof code === 'string' && Object.hasOwn(LOCAL_STORAGE_MESSAGES, code)) return { class: 'disk', systemCode: code };
+    return typeof artifactClass === 'string' && ARTIFACT_CLASSES.includes(artifactClass) ? { class: artifactClass } : undefined;
+};
 const isPositiveSafeInteger = (value) => Number.isSafeInteger(value) && value > 0;
 const isSweptArtifactName = (name, entry) => !entry.isDirectory() && (ARTIFACT_PARTIAL_PATTERN.test(name) || ARTIFACT_FILE_PATTERN.test(name));
 const sweepArtifacts = (directory, { retentionMs, now }) =>
@@ -50,14 +61,14 @@ const safeArtifactName = (fileName) => {
     return baseName.toLowerCase().endsWith('.xlsx') ? baseName : `${baseName}.xlsx`;
 };
 const decodeCanonicalBase64 = (base64Data, maxChunkBytes) => {
-    if (typeof base64Data !== 'string' || base64Data.length === 0) throw new Error('Artifact chunk must use canonical base64');
+    if (typeof base64Data !== 'string' || base64Data.length === 0) throw rejected('format', 'Artifact chunk must use canonical base64');
     const maximumEncodedLength = Math.ceil(maxChunkBytes / 3) * 4;
-    if (base64Data.length > maximumEncodedLength) throw new Error(`Artifact encoded chunk exceeds the ${maximumEncodedLength}-byte chunk limit`);
+    if (base64Data.length > maximumEncodedLength) throw rejected('format', `Artifact encoded chunk exceeds the ${maximumEncodedLength}-byte chunk limit`);
     if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(base64Data)) {
-        throw new Error('Artifact chunk must use canonical base64');
+        throw rejected('format', 'Artifact chunk must use canonical base64');
     }
     const bytes = Buffer.from(base64Data, 'base64');
-    if (bytes.toString('base64') !== base64Data) throw new Error('Artifact chunk must use canonical base64');
+    if (bytes.toString('base64') !== base64Data) throw rejected('format', 'Artifact chunk must use canonical base64');
     return bytes;
 };
 const validateLimits = ({ maxChunkBytes, maxFileBytes, maxJobBytes, retentionMs }) => {
@@ -183,14 +194,16 @@ export const createArtifactWriter = async (options = {}) => {
             writeChain = writeChain.then(async () => {
                 try {
                     assertWritable();
-                    if (!Number.isSafeInteger(index) || index !== nextIndex) throw new Error(`Unexpected artifact chunk index: expected ${nextIndex}`);
+                    if (!Number.isSafeInteger(index) || index !== nextIndex) throw rejected('format', `Unexpected artifact chunk index: expected ${nextIndex}`);
                     const bytes = decodeCanonicalBase64(base64Data, maxChunkBytes);
-                    if (bytes.length > maxChunkBytes) throw new Error(`Artifact chunk exceeds the ${maxChunkBytes}-byte chunk limit`);
-                    if (byteCount + bytes.length > maxFileBytes) throw new Error(`Artifact exceeds the ${maxFileBytes}-byte per-file limit`);
+                    if (bytes.length > maxChunkBytes) throw rejected('format', `Artifact chunk exceeds the ${maxChunkBytes}-byte chunk limit`);
+                    if (byteCount + bytes.length > maxFileBytes) throw rejected('limit', `Artifact exceeds the ${maxFileBytes}-byte per-file limit`);
                     // Cross-writer callbacks sharing this budget are serialized by the package broker
                     // or WB export loop. Parallelizing them must revisit reservation before append.
                     if (jobBudget.bytes + bytes.length > maxJobBytes) {
-                        throw new ArtifactStoreError('JOB_ARTIFACT_QUOTA_EXCEEDED', `Artifact job quota exceeds the ${maxJobBytes}-byte limit`);
+                        // The same call cannot shrink its own workbooks, so a retry of it cannot succeed.
+                        throw Object.assign(new ArtifactStoreError('JOB_ARTIFACT_QUOTA_EXCEEDED', `Artifact job quota exceeds the ${maxJobBytes}-byte limit`,
+                            { retryable: false }), { artifactClass: 'limit' });
                     }
                     assertNotAborted();
                     await appendFile(partialPath, bytes);
@@ -212,14 +225,14 @@ export const createArtifactWriter = async (options = {}) => {
             const publication = writeChain.then(async () => {
                 try {
                     assertWritable();
-                    if (!Number.isSafeInteger(size) || size < 0 || size !== byteCount) throw new Error('Artifact declared size does not match written bytes');
-                    if (typeof sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(sha256)) throw new Error('Artifact SHA-256 must be a lowercase hexadecimal digest');
-                    if (hash.digest('hex') !== sha256) throw new Error('Artifact SHA-256 does not match written bytes');
+                    if (!Number.isSafeInteger(size) || size < 0 || size !== byteCount) throw rejected('integrity', 'Artifact declared size does not match written bytes');
+                    if (typeof sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(sha256)) throw rejected('integrity', 'Artifact SHA-256 must be a lowercase hexadecimal digest');
+                    if (hash.digest('hex') !== sha256) throw rejected('integrity', 'Artifact SHA-256 does not match written bytes');
                     assertNotAborted();
                     if (validateXlsx) {
                         const workbook = await readFile(partialPath);
                         assertNotAborted();
-                        assertXlsxPackage(workbook, { maxFileBytes });
+                        try { assertXlsxPackage(workbook, { maxFileBytes }); } catch (error) { throw Object.assign(asError(error), { artifactClass: 'format' }); }
                     }
                     assertNotAborted();
                     await rename(partialPath, artifactPath);

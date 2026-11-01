@@ -1,13 +1,36 @@
+import { readFileSync } from 'node:fs';
+
 const EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PostToolUseFailure']);
 const TOOL_FAMILIES = new Set(['browser_job', 'feedback_prepare', 'feedback_authorization', 'feedback_submit']);
-const HANDLERS = new Set(['browser_job_handoff', 'feedback_handoff', 'feedback_cloud']);
-const STAGES = new Set(['handoff_staged', 'input_rewritten', 'call_denied', 'result_observed', 'result_replaced']);
+const HANDLERS = new Set(['browser_job_handoff', 'feedback_handoff']);
+const STAGES = new Set(['handoff_staged', 'input_rewritten', 'call_denied', 'result_observed']);
 const OUTCOMES = new Set(['succeeded', 'denied', 'failed', 'uncertain']);
 const EXECUTION_PLANES = new Set(['native', 'cloud', 'unknown']);
 const CAUSES = new Set(['invalid_event', 'invalid_input', 'invalid_state', 'state_missing', 'storage_unavailable',
     'permission_denied', 'expired', 'missing', 'ambiguous', 'unsupported', 'io_error', 'internal_error', 'unknown']);
 const SYSTEM_CODES = new Set(['EACCES', 'EPERM', 'EROFS', 'ENOENT', 'ENOSPC', 'EDQUOT', 'EEXIST', 'EBUSY']);
 const VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/;
+
+// The installed plugin version from the manifest beside these hooks, read once and only for a denial.
+let installedVersion;
+const handlerVersion = () => {
+    if (installedVersion === undefined) {
+        try {
+            const version = JSON.parse(readFileSync(new URL('../.codex-plugin/plugin.json', import.meta.url), 'utf8')).version;
+            installedVersion = typeof version === 'string' && version.length <= 64 && VERSION.test(version) ? version : null;
+        } catch {
+            installedVersion = null;
+        }
+    }
+    return installedVersion ?? undefined;
+};
+
+// What a denial adds to its record: its closed cause, the filesystem code behind it, and the installed handler version.
+export const denialEvidence = (cause, systemCode) => ({
+    ...(CAUSES.has(cause) ? { cause } : {}),
+    ...(SYSTEM_CODES.has(systemCode) ? { systemCode } : {}),
+    ...(handlerVersion() ? { handlerVersion: handlerVersion() } : {}),
+});
 
 const requiredEnum = (value, allowed) => {
     if (typeof value !== 'string' || !allowed.has(value)) throw new TypeError('Unsupported hook diagnostic value.');

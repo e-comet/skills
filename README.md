@@ -275,9 +275,10 @@ claude plugin update e-comet-skills@e-comet-skills
 <a id="update-codex"></a>
 
 <details>
-<summary>ChatGPT Desktop (Codex или ChatGPT Work)</summary>
+<summary>ChatGPT Desktop (Codex)</summary>
 
 1. В левом нижнем углу нажмите на `Имя` → `Settings` → `Plugins` → `Marketplace` → `e-Comet MCP Tools` → `Upgrade`.
+2. В карточке `e-Comet MCP Tools` в разделе `Hooks` нажмите `Trust all`.
 
 </details>
 
@@ -348,7 +349,7 @@ codex plugin add e-comet-skills@e-comet-skills
 
 1. Коннектор e-Comet подключён, и вход в него завершён (в DeepSeek Harness — аккаунт привязан в карточке `e-Comet Skills`). Без него не работает ничего: ни аналитика кабинета, ни живые данные. Шаг с подключением есть в разделах [Базовая](#базовая) и [Полная](#полная).
 2. Для живых данных с WB и из ЛК селлера используется Полная установка: при Базовой их нет. Если они нужны, сделайте [Полную установку](#полная).
-3. При Полной установке в Claude и ChatGPT (Codex) добавлен marketplace `https://github.com/e-comet/skills`, а плагин `e-Comet MCP Tools` установлен и включён: в приложении Claude он в списке `Yours` того режима, где вы работаете (`Cowork` или `Code`), в ChatGPT — профиль → `Settings` → `Plugins` → `Browse directory` → `Personal` → `e-Comet MCP Tools`. Для Claude Code CLI и Codex CLI выполнены шаги [Полной установки](#полная). В DeepSeek Harness плагин `e-Comet Skills` установлен и включён в `Plugins`.
+3. При Полной установке в Claude и ChatGPT (Codex) добавлен marketplace `https://github.com/e-comet/skills`, а плагин `e-Comet MCP Tools` установлен и включён: в приложении Claude он в списке `Yours` того режима, где вы работаете (`Cowork` или `Code`), в ChatGPT — профиль → `Settings` → `Plugins` → `Browse directory` → `Personal` → `e-Comet MCP Tools`, и в разделе `Hooks` его карточки нажата кнопка `Trust all` (после каждого обновления плагина — заново). Для Claude Code CLI и Codex CLI выполнены шаги [Полной установки](#полная). В DeepSeek Harness плагин `e-Comet Skills` установлен и включён в `Plugins`.
 4. Установлен Node.js 22 или новее, Chrome запущен, расширение e-Comet установлено и активировано API-ключом, открыта вкладка Wildberries, где вы вошли в свой аккаунт.
 5. Все шаги инструкции [Базовая](#базовая) либо [Полная](#полная) выполнены (в зависимости от варианта установки).
 6. После любого изменения начата новая задача: в уже открытой оно не подхватится. В DeepSeek Harness после установки или обновления плагина приложение перезагружено (`Application` → `Exit`).

@@ -10,10 +10,9 @@ import {
     MAX_PRODUCT_ARTICLES,
     MAX_RETURNED_PRODUCTS,
 } from './config.mjs';
-import { BRIDGE_CODES, BRIDGE_REGISTRATION_STATES, BRIDGE_RUNTIMES, BRIDGE_STATUS_CODES } from './bridge-codes.mjs';
+import { BRIDGE_CODES, BRIDGE_COMSPEC_STATES, BRIDGE_OWNERS, BRIDGE_REGISTRATION_STATES, BRIDGE_RUNTIME_RECHECKS, BRIDGE_RUNTIMES, BRIDGE_STATUS_CODES } from './bridge-codes.mjs';
 import { FEEDBACK_DIAGNOSTIC_OPERATIONS, FEEDBACK_DIAGNOSTIC_ERROR_TYPES, FEEDBACK_DIAGNOSTIC_SYSTEM_CODES, FEEDBACK_DIAGNOSTIC_MODULES, FEEDBACK_DIAGNOSTIC_REASONS } from './feedback-diagnostics.mjs';
 import { CONTRACT_TOOL_NAMES } from './tool-contracts.mjs';
-import { feedbackCloudTransportSchema, feedbackHostAdapterMarkerSchema } from './feedback-host-adapter.mjs';
 import {
     EXTENSION_UPDATE_URL,
     FETCH_ERROR_CODES,
@@ -22,7 +21,7 @@ import {
     OZON_PROMOTION_MIN_EXTENSION_VERSION,
     OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES,
 } from './extension-vocabulary.mjs';
-import { OZON_EXTENSION_OUTDATED_REASON, OZON_PROMOTION_TERMINAL_CODE_STAGES } from './tool-errors.mjs';
+import { ARTIFACT_FAILURE_CLASSES, DESCRIPTOR_RULES, FAILURE_DETAIL_VALUES, OZON_EXTENSION_OUTDATED_REASON, OZON_PROMOTION_TERMINAL_CODE_STAGES } from './tool-errors.mjs';
 import { MAX_OZON_REPORT_PACKAGE_ITEMS } from './ozon-report-package-domain.mjs';
 import { OZON_PACKAGE_STOP_REASONS, OZON_SEARCH_POSITIONS_STOP_REASONS } from './ozon-report-package-result.mjs';
 import {
@@ -31,10 +30,10 @@ import {
     OZON_SEARCH_POSITIONS_DEFAULT_REGION,
     OZON_SEARCH_POSITIONS_PLATFORMS,
 } from './ozon-search-positions-domain.mjs';
-import { DIAGNOSTIC_STATES, EXTENSION_INSTALL_VOCABULARY, extensionInstallFactsSchema, hookPermissionsFactsSchema } from './diagnostic-facts.mjs';
+import { DIAGNOSTIC_STATES, EXTENSION_INSTALL_VOCABULARY, extensionInstallFactsSchema, extensionLogFactsSchema, HOST_LAST_FAILURES, hookPermissionsFactsSchema } from './diagnostic-facts.mjs';
+import { TRANSPORT_EVENT_KINDS } from './transport-events.mjs';
 // The producers validate their facts against these; the feedback projection reads the same objects.
 export { extensionInstallFactsSchema, hookPermissionsFactsSchema };
-import { feedbackDeviceSnapshotSchema } from './feedback-device-diagnostics.mjs';
 
 const string = { type: 'string' };
 const boolean = { type: 'boolean' };
@@ -108,12 +107,24 @@ const listingProductSchema = object({
     globalPosition: positiveInteger,
 }, ['nmId', 'position']);
 
+const closedValue = (key) => ({ type: 'string', enum: [...FAILURE_DETAIL_VALUES[key]] });
+// The closed `details` of a local failure: a reason, timeout phase, failure class, WBAAS outcome, filesystem code,
+// descriptor rule, Seller refusal and HTTP status, or the request counts of a stopped job.
+const failureDetailsSchema = object({
+    ...Object.fromEntries(Object.keys(FAILURE_DETAIL_VALUES).map((key) => [key, closedValue(key)])),
+    wbRefused: boolean,
+    httpStatus: { type: 'integer', minimum: 100, maximum: 599 },
+    completed: nonNegativeInteger,
+    pending: nonNegativeInteger,
+});
 const buyerErrorProperties = {
     skipped: boolean,
     errorDetails: object({
         code: { type: 'string', enum: [...Object.values(FETCH_ERROR_CODES), 'WB_FETCH_FAILED', 'WB_RATE_LIMITED', 'WB_REQUEST_FAILED'] },
         stage: { const: 'execution' },
         retryable: boolean,
+        phase: closedValue('phase'),
+        recovery: closedValue('recovery'),
     }, ['code', 'stage', 'retryable']),
 };
 
@@ -196,13 +207,17 @@ const liveBaseProperties = {
 
 const browserJobRejectionSchema = objectUnion(
     object({ schemaVersion: { const: 1 }, reason: { const: 'invalid_job' }, diagnostic: { type: 'string', enum: ['job_type', 'jobs_count', 'descriptor_type', 'descriptor_shape', 'date_from', 'date_to_or_range', 'claims_iat_or_jti'] } }, ['schemaVersion', 'reason']),
-    ...['public_key_not_configured', 'user_not_available', 'invalid_format', 'invalid_algorithm', 'invalid_signature', 'issuer_mismatch', 'audience_mismatch', 'subject_mismatch', 'expired', 'token_reuse', 'ecomet_not_authenticated', 'activation_storage_unavailable', 'unknown']
-        .map((reason) => object({ schemaVersion: { const: 1 }, reason: { const: reason } }, ['schemaVersion', 'reason']))
+    ...['public_key_not_configured', 'user_not_available', 'invalid_format', 'invalid_algorithm', 'invalid_signature', 'issuer_mismatch', 'audience_mismatch', 'subject_mismatch', 'expired', 'token_reuse', 'ecomet_not_authenticated', 'activation_storage_unavailable', 'storage_unavailable', 'unknown']
+        .map((reason) => object({ schemaVersion: { const: 1 }, reason: { const: reason } }, ['schemaVersion', 'reason'])),
+    object({ schemaVersion: { const: 1 }, reason: { type: 'string', enum: ['device_clock_ahead', 'device_clock_behind'] }, skewMinutes: nonNegativeInteger }, ['schemaVersion', 'reason'])
 );
 const browserJobRejectionDetailsSchema = object({ browserJobRejection: browserJobRejectionSchema }, ['browserJobRejection']);
-// An Ozon authorization failure carries either the extension's rejection or, when no broker answered, the bridge cause.
+// An Ozon authorization failure carries either the extension's rejection or, when no broker answered, the bridge cause,
+// or the local descriptor rule the signed job broke.
 const ozonAuthorizationRejectedDetailsSchema = objectUnion(browserJobRejectionDetailsSchema,
-    object({ bridgeCode: { type: 'string', enum: [...BRIDGE_CODES] } }, ['bridgeCode']));
+    object({ bridgeCode: { type: 'string', enum: [...BRIDGE_CODES] } }, ['bridgeCode']),
+    object({ rule: { type: 'string', enum: [...DESCRIPTOR_RULES] } }, ['rule']));
+const artifactRejectedDetailsSchema = object({ class: { type: 'string', enum: [...ARTIFACT_FAILURE_CLASSES] }, systemCode: closedValue('systemCode') }, ['class']);
 
 export const toolErrorSchema = object({
     ok: { const: false },
@@ -216,7 +231,7 @@ export const toolErrorSchema = object({
     details: objectUnion(object({
         operation: { const: 'create_result' },
         systemCode: { type: 'string', enum: ['EEXIST', 'EACCES', 'EPERM', 'ENOSPC', 'EDQUOT', 'EROFS', 'ENOTDIR', 'EBUSY'] },
-    }, ['operation', 'systemCode']), browserJobRejectionDetailsSchema),
+    }, ['operation', 'systemCode']), browserJobRejectionDetailsSchema, failureDetailsSchema),
     resultPath: string,
     storageWarnings,
 }, ['ok', 'code', 'message', 'stage', 'retryable']);
@@ -263,6 +278,7 @@ const checkQueryProperties = {
     ...buyerErrorProperties,
     query: string,
     pagesChecked: nonNegativeInteger,
+    httpStatus: integer,
     error: string,
 };
 const checkQueryRequired = ['query', 'found', 'pagesChecked', 'completionReason'];
@@ -309,9 +325,12 @@ const filtersQuerySchema = object({
         },
         stage: { const: 'execution' },
         retryable: boolean,
+        phase: closedValue('phase'),
+        recovery: closedValue('recovery'),
     }, ['code', 'stage', 'retryable']),
     query: string,
     status: { type: 'string', enum: ['ok', 'partial', 'empty', 'request_failed', 'rate_limited'] },
+    httpStatus: integer,
     filterKeys: array(string),
     error: string,
 }, ['query', 'status']);
@@ -397,6 +416,7 @@ const sellerExportErrorSchema = object({
     message: string,
     stage: string,
     retryable: boolean,
+    details: failureDetailsSchema,
 }, ['code', 'message', 'stage', 'retryable']);
 
 const sellerExportSchema = object({
@@ -431,6 +451,8 @@ const sellerReviewsSuccessSchema = object({
     jobId: string,
     org: object({ id: string, name: string }, [], false),
     exports: array(sellerExportSchema, { minItems: 1 }),
+    // Present when Wildberries answered a status poll in an unrecognized shape and the export stopped.
+    stopReason: { const: 'unrecognized_response' },
     // Present when the exports themselves are described accurately but restoring the seller cabinet failed.
     releaseError: toolErrorSchema,
 }, ['ok', 'status', 'jobType', 'jobId', 'exports']);
@@ -480,15 +502,18 @@ const diagnosticBase = (check, facts, causes = ['unknown']) => object({
 
 const bridgeDiagnosticsSchema = object({
     snapshot: described(diagnosticBase('snapshot'), 'Timestamped production of the status snapshot; it is not a product-health verdict.'),
-    runtime: described(diagnosticBase('runtime', object({ nodeVersion: described(string, 'Version of the Node.js process executing this MCP server.'), platform: described(string, 'Node.js platform identifier for the process executing this MCP server.'), arch: described(string, 'Node.js architecture identifier for the process executing this MCP server.'), bridgeVersion: described(string, 'Version of the local bridge build executing this check.'), mcpProtocolVersion: described(string, 'MCP protocol version negotiated with the current client; omitted when unavailable.') }, ['nodeVersion', 'platform', 'arch', 'bridgeVersion'])), 'Facts about the Node.js process running this MCP server.'),
-    client: described(diagnosticBase('client', object({ name: described(string, 'Bounded client name supplied in MCP initialize metadata.'), version: described(string, 'Bounded client version supplied in MCP initialize metadata.'), provenance: described({ const: 'client_reported' }, 'Marks these values as client-reported rather than trusted host identity.'), hostRuntimeVersion: described(string, 'DeepSeek Harness runtime version the native adapter resolved its peers against; present only under that adapter.') }, ['name', 'version', 'provenance'])), 'Sanitized MCP initialize metadata; it does not prove host identity or hook support.'),
+    runtime: described(diagnosticBase('runtime', object({ nodeVersion: described(string, 'Version of the Node.js process executing this MCP server.'), platform: described(string, 'Node.js platform identifier for the process executing this MCP server.'), arch: described(string, 'Node.js architecture identifier for the process executing this MCP server.'), bridgeVersion: described(string, 'Version of the local bridge build executing this check.'), mcpProtocolVersion: described(string, 'MCP protocol version negotiated with the current client; omitted when unavailable.'), osRelease: described(string, 'Release of the operating system kernel, as os.release() reports it.') }, ['nodeVersion', 'platform', 'arch', 'bridgeVersion'])), 'Facts about the Node.js process running this MCP server.'),
+    client: described(diagnosticBase('client', object({ name: described(string, 'Bounded client name supplied in MCP initialize metadata.'), version: described(string, 'Bounded client version supplied in MCP initialize metadata.'), provenance: described({ const: 'client_reported' }, 'Marks these values as client-reported rather than trusted host identity.'), hostRuntimeVersion: described(string, 'DeepSeek Harness runtime version the native adapter resolved its peers against; present only under that adapter.'), hostLastFailure: described({ type: 'string', enum: [...HOST_LAST_FAILURES] }, 'Closed class of the last failure of the local module the native DeepSeek adapter started again; present only under that adapter after a failure.'), hostRestarts: described(nonNegativeInteger, 'How many times the native DeepSeek adapter started the local module again; present only under that adapter after a restart.') }, ['name', 'version', 'provenance'])), 'Sanitized MCP initialize metadata; it does not prove host identity or hook support.'),
     routeFreshness: described(diagnosticBase('route_freshness', object({ lastObservedAt: described(string, 'Timestamp of an actually observed route response; omitted when no producer supplies one.') }, ['lastObservedAt'])), 'Freshness of a real extension-route observation, never inferred from browser-context changes.'),
+    extensionLog: described(diagnosticBase('extension_log', extensionLogFactsSchema, ['permission_denied', 'io_error', 'directory_absent', 'corrupt', 'unavailable', 'unknown']), 'The e-Comet extension\'s own record of its native connection, read from the browser profile on disk by the last tool call that found no broker or the last runtime extension_log diagnosis; present only after one, and dropped when a broker connects.'),
     storage: described(diagnosticBase('storage', object({ scope: described({ const: 'configuration' }, 'Declares that these storage facts cover configuration resolution only.'), targets: described(storageStatusSchema, 'Sanitized configured storage targets without paths or write claims.') }, ['scope', 'targets'])), 'Read-only storage configuration observation; it does not test writability.'),
 }, ['snapshot', 'runtime', 'client', 'routeFreshness', 'storage']);
 
 const bridgeStatusSchema = described(object({
     ok: described({ const: true }, 'Confirms that the status response was constructed; it is not a product-health result.'),
     code: described({ type: 'string', enum: [...BRIDGE_STATUS_CODES] }, 'Closed cause of the current bridge state, read first. connected and connecting are healthy states. A BRIDGE_* value names the one observed reason no extension route exists; BRIDGE_NO_BROWSER is the one used when nothing more specific was observed. A route lost mid-job is EXTENSION_DISCONNECTED on the failing tool call; status never returns it and names the cause found since. The other fields are the evidence behind it.'),
+    owner: described({ type: 'string', enum: [...BRIDGE_OWNERS] }, 'Who can act on the cause in code: user, administrator (whoever manages the computer), e_comet, or unknown. Absent while connected or connecting.'),
+    comspec: described({ type: 'string', enum: [...BRIDGE_COMSPEC_STATES] }, 'Whether the Windows ComSpec variable names an existing cmd.exe, read by the last tool call that found no broker or runtime extension_log diagnosis; unknown when this process has no ComSpec, since it sees its host environment, not the browser one; present only on Windows with code BRIDGE_HOST_START_FAILED.'),
     extensionConnected: described(boolean, 'Whether this process currently holds an extension session through a broker.'),
     browserJobSupported: described(boolean, 'Whether the effective route advertised browser-job support; it does not prove a particular operation will succeed.'),
     state: described({ type: 'string', enum: ['initializing', 'waiting_for_extension', 'extension_connected_no_wb_tab', 'extension_context_unknown', 'ready', 'extension_update_required'] }, 'Ordered compatibility summary of observed bridge state, not a complete fault list or retry instruction.'),
@@ -523,6 +548,8 @@ const bridgeStatusSchema = described(object({
         version: described(string, 'Plugin version the registration was made for.'),
         runtime: described(nullable(described({ type: 'string', enum: [...BRIDGE_RUNTIMES] }, 'Runtime the launcher starts: path_node is Node found on PATH, host_executable is the host application own executable.'), 'No runtime was resolved.'), 'Runtime the launcher starts; null when none was resolved.'),
         manifestWrittenAt: described(nullable(described(string, 'ISO timestamp of the newest host manifest.'), 'The manifest time is unknown.'), 'ISO timestamp of the newest host manifest; null when it is unknown.'),
+        verifiedSinceAt: described(nullable(described(string, 'ISO timestamp since which the registration has stayed unchanged.'), 'The time is unknown.'), 'ISO timestamp since which the registration the browser reads (manifest, launcher and, on Windows, the registry key) has stayed unchanged; null when it is unknown.'),
+        runtimeRecheck: described({ type: 'string', enum: [...BRIDGE_RUNTIME_RECHECKS] }, 'Whether the last check also ran the launcher runtime with -v: not_run outside a repair or when the launcher was just written, passed when it still runs, repaired when it was missing or too old and the launcher was re-pointed to another runtime, failed when no other runtime was found, inconclusive when the answer proved nothing; the launcher is left as it is unless repaired.'),
         error: described(nullable(described(object({
             name: described(string, 'Name of the registration step that failed.'),
             code: described(nullable(described(string, 'System or exit code of the failure.'), 'The failure carried no code.'), 'System or exit code of the failure; null when there was none. Never a message or a path.'),
@@ -533,6 +560,7 @@ const bridgeStatusSchema = described(object({
         allowed: described(nullable(described(boolean, 'The policy allows or forbids hosts registered per user.'), 'No policy is set for this browser.'), 'Whether the NativeMessagingUserLevelHosts policy allows hosts registered per user; null when no policy is set.'),
         hostBlocked: described(nullable(described(boolean, 'true: the block list holds * or the e-Comet host and the allow list does not name it; false: the lists do not block it.'), 'No block list was read for this browser.'), 'Whether the NativeMessagingBlocklist and NativeMessagingAllowlist policies block the e-Comet host; null when no block list is set.'),
     }, ['browser', 'allowed', 'hostBlocked']), 'The native messaging policies of one browser.')), 'Per browser, the native messaging policies that decide whether it may start the e-Comet host; empty when none was read.'),
+    policyReadFailed: described(array(described({ type: 'string', enum: [...EXTENSION_INSTALL_VOCABULARY.browsers] }, 'Browser whose policy read observed nothing.'), { uniqueItems: true }), 'Browsers whose native messaging policy could not be read (a timeout, or the reader did not start): their null userLevelHosts values are unknown, not unset; empty when every read worked.'),
     extensionInstall: described(nullable(described({ type: 'object', additionalProperties: true }, 'Facts of the extension_install probe, defined in DIAGNOSTICS.md.'), 'No extension_install probe has run.'), 'Chromium profile facts from the extension_install probe, in the shape e_comet_diagnose reports them; null until a probe has run.'),
     brokers: described(array(described(object({
         pid: described(positiveInteger, 'Process id of the broker, as its entry names it.'),
@@ -550,13 +578,21 @@ const bridgeStatusSchema = described(object({
     clientProtocolVersion: described(positiveInteger, 'Client protocol version this plugin speaks to a broker.'),
     brokerProtocolVersion: described(nullable(described(positiveInteger, 'Client protocol version the broker reported.'), 'No broker session is open.'), 'Client protocol version the connected broker reported; null without a broker session.'),
     brokerVersion: described(nullable(described(string, 'Plugin version of the connected broker.'), 'No broker session is open.'), 'Plugin version of the connected broker; null without a broker session.'),
+    transportEvents: described(array(described(object({
+        at: described(string, 'ISO timestamp at which this process first saw the event.'),
+        kind: described({ type: 'string', enum: [...TRANSPORT_EVENT_KINDS] }, 'late_answer, connect_failed, session_end, registration_step_failed or failure_record_seen.'),
+        code: described(string, 'Short identifier that names the event: a typed code, a system code or a step; never a request id or a message.'),
+    }, ['at', 'kind', 'code']), 'One transport event this process saw.'), { maxItems: 32 }), 'The last transport events this process saw, oldest first; a repeat of the newest is not listed again.'),
     instanceId: described(string, 'Ephemeral identifier of this local bridge process; it is not a host or user identity.'),
     storage: described(storageStatusSchema, 'Read-only resolution status for the three configured storage targets.'),
     diagnostics: described(bridgeDiagnosticsSchema, 'Typed passive observations collected with this status response.'),
 }, ['ok', 'extensionConnected', 'code', 'storage']), 'Passive local bridge status response; successful construction is distinct from product health.');
 
 const operationDiagnosticSchema = described(object({
-    schemaVersion: described({ const: 1 }, 'Version of the operation-diagnostic receipt contract.'), handle: described(string, 'Opaque handle for the latest real completion in this MCP process.'), stage: described(string, 'Last operation stage established by the producer.'), outcome: described({ type: 'string', enum: ['succeeded', 'partial', 'failed', 'uncertain'] }, 'Observed terminal outcome without converting uncertainty into failure.'),
+    schemaVersion: described({ const: 1 }, 'Version of the operation-diagnostic receipt contract.'), handle: described(string, 'Opaque handle for one of the last eight real completions in this MCP process.'),
+    at: described(string, 'ISO timestamp of the completion; present in a last_operation diagnosis.'), tool: described(string, 'Local tool that completed; present in a last_operation diagnosis.'),
+    code: described(string, 'Closed error code of the completion, or of its first failed item; omitted when none.'), reason: described(string, 'Closed reason or stop reason the completion carried; omitted when none.'),
+    stage: described(string, 'Last operation stage established by the producer.'), outcome: described({ type: 'string', enum: ['succeeded', 'partial', 'failed', 'uncertain'] }, 'Observed terminal outcome without converting uncertainty into failure.'),
     retryDisposition: described({ type: 'string', enum: ['allowed', 'forbidden', 'requires_new_authorization', 'unknown'] }, 'Whether repeating the original operation is safe under its existing authorization contract.'),
 }, ['schemaVersion', 'handle', 'stage', 'outcome', 'retryDisposition']), 'Terminal receipt for one exact real operation completion in this MCP process.');
 export const codexMcpAuthFactsSchema = object({
@@ -583,13 +619,27 @@ const withOperationDiagnostic = (schema) => schema.oneOf
     ? { ...schema, oneOf: schema.oneOf.map(withOperationDiagnostic) }
     : { ...schema, properties: { ...schema.properties, operationDiagnostic: operationDiagnosticSchema } };
 
+// A bridge tool's answer while its job still runs: not a failure; e_comet_run_result returns the final answer.
+const runningAnswerSchema = object({
+    ok: { const: true },
+    status: { const: 'running' },
+    runId: string,
+    tool: string,
+    elapsedSeconds: nonNegativeInteger,
+    progress: object({ completed: nonNegativeInteger, total: positiveInteger }, ['completed', 'total']),
+    nextStep: string,
+}, ['ok', 'status', 'runId', 'tool', 'elapsedSeconds', 'nextStep']);
+const withRunningAnswer = (schema) => schema.oneOf
+    ? { ...schema, oneOf: [...schema.oneOf, runningAnswerSchema] }
+    : objectUnion(schema, runningAnswerSchema);
+
 const triggerUrlProperty = {
     type: 'string',
     minLength: 1,
     maxLength: MAX_BROWSER_JOB_TOKEN_BYTES,
     description:
         'Opaque browser authorization injected by the trusted Claude or Codex host hook immediately before this local tool call. ' +
-        'It is transport-only; model-authored arguments must omit both triggerUrl and trigger_url. The conservative schema maxLength is a character count; ' +
+        'It is transport-only; model-authored arguments must omit both triggerUrl and trigger_url, except for an mcp__remote-devices__ tool, which gets the browser_job trigger_url unchanged. The conservative schema maxLength is a character count; ' +
         'runtime authoritatively enforces the 128 KiB UTF-8 byte limit.',
 };
 
@@ -598,7 +648,7 @@ const ozonTriggerUrlProperty = {
     minLength: 1,
     maxLength: MAX_BROWSER_JOB_TOKEN_BYTES,
     description:
-        'Opaque browser authorization injected by the trusted Claude or Codex host hook immediately before this Ozon tool call. It is transport-only; model-authored arguments must omit both triggerUrl and trigger_url.',
+        'Opaque browser authorization injected by the trusted Claude or Codex host hook immediately before this Ozon tool call. It is transport-only; model-authored arguments must omit both triggerUrl and trigger_url, except for an mcp__remote-devices__ tool, which gets the browser_job trigger_url unchanged.',
 };
 
 const canonicalDateProperty = {
@@ -651,6 +701,7 @@ const ozonPromotionErrorSchema = objectUnion(
                 retryable: { const: false },
                 ...(code === 'OZON_ROUTE_NOT_READY' ? { details: ozonExtensionOutdatedDetailsSchema } : {}),
                 ...(code === 'OZON_AUTHORIZATION_REJECTED' ? { details: ozonAuthorizationRejectedDetailsSchema } : {}),
+                ...(code === 'ARTIFACT_REJECTED' ? { details: artifactRejectedDetailsSchema } : {}),
             },
             ['code', 'message', 'stage', 'retryable']
         )
@@ -731,6 +782,7 @@ const ozonPackageError = (codeStages, analytics = false) =>
                     }, ['marketplaceErrorCode']) } : {}),
                     ...(code === 'OZON_EXECUTION_INTERRUPTED' ? { details: ozonExecutionInterruptionDetailsSchema } : {}),
                     ...(code === 'OZON_AUTHORIZATION_REJECTED' ? { details: ozonAuthorizationRejectedDetailsSchema } : {}),
+                    ...(code === 'ARTIFACT_REJECTED' ? { details: artifactRejectedDetailsSchema } : {}),
                 },
                 ['code', 'message', 'stage', 'retryable']
             )
@@ -914,6 +966,13 @@ const hookOnlyFeedbackField = (description) => ({
         `${description.description} Injected by the trusted Claude or Codex host hook immediately before this local tool call; ` +
         'model-authored arguments must omit it and every snake_case alias.',
 });
+// The upload grant: in Cowork no hook can change the device call, so the model copies it from report_issue there.
+const grantFeedbackField = (description) => ({
+    ...description,
+    description:
+        `${description.description} Injected by the trusted Claude Code or Codex host hook immediately before this local tool call, and ` +
+        'model-authored arguments omit it, except for an mcp__remote-devices__ tool, which copies it from report_issue and the prepared result.',
+});
 // Preserve authored report text: the STDIO message limit and trusted prepare hook enforce
 // MAX_MCP_MESSAGE_BYTES before rendering. The archive budget also includes the transcript;
 // it is not a replacement per-field allowance for model-authored summary/details.
@@ -926,22 +985,21 @@ const feedbackPrepareSchema = object(
         transcriptPath: hookOnlyFeedbackField({ type: 'string', minLength: 1, maxLength: 4096, description: 'Trusted local transcript path.' }),
         feedbackClaim: hookOnlyFeedbackField({ ...feedbackClaim, description: 'Local feedback handoff signature injected by the trusted host hook.' }),
         feedbackSession: hookOnlyFeedbackField({ ...feedbackSession, description: 'Bound host-session digest for the feedback claim.' }),
-        feedbackAdapter: hookOnlyFeedbackField({ ...feedbackHostAdapterMarkerSchema, description: 'Host feedback result adapter marker.' }),
     },
     ['kind', 'summary', 'details', 'includeTranscript']
 );
 const feedbackSubmitSchema = object(
     {
         artifactId: feedbackArtifactIdSchema,
-        uploadUrl: hookOnlyFeedbackField({ type: 'string', minLength: 1, maxLength: 8192, description: 'Signed HTTPS upload URL.' }),
-        requiredHeaders: hookOnlyFeedbackField({ type: 'object', properties: {}, additionalProperties: { type: 'string', maxLength: 8192 }, description: 'Signed required request headers.' }),
-        objectKey: hookOnlyFeedbackField({ type: 'string', minLength: 1, maxLength: 1024, description: 'Storage object key.' }),
-        expiresAt: hookOnlyFeedbackField({ type: 'integer', minimum: 1, description: 'Upload grant expiry timestamp.' }),
-        expectedSize: hookOnlyFeedbackField({ type: 'integer', minimum: 1, maximum: FEEDBACK_MAX_BYTES, description: 'Expected archive size in bytes.' }),
-        expectedSha256: hookOnlyFeedbackField({ ...feedbackSha256, description: 'Expected archive SHA-256.' }),
+        uploadUrl: grantFeedbackField({ type: 'string', minLength: 1, maxLength: 8192, description: 'Signed HTTPS upload URL.' }),
+        requiredHeaders: grantFeedbackField({ type: 'object', properties: {}, additionalProperties: { type: 'string', maxLength: 8192 }, description: 'Signed required request headers.' }),
+        objectKey: grantFeedbackField({ type: 'string', minLength: 1, maxLength: 1024, description: 'Storage object key.' }),
+        // Untyped: the hook injects Unix seconds, a Cowork model copies report_issue's ISO time; submit checks either.
+        expiresAt: grantFeedbackField({ description: 'Upload grant expiry: Unix seconds, or report_issue expires_at as it came.' }),
+        expectedSize: grantFeedbackField({ type: 'integer', minimum: 1, maximum: FEEDBACK_MAX_BYTES, description: 'Expected archive size in bytes.' }),
+        expectedSha256: grantFeedbackField({ ...feedbackSha256, description: 'Expected archive SHA-256.' }),
         feedbackClaim: hookOnlyFeedbackField({ ...feedbackClaim, description: 'Local feedback handoff signature injected by the trusted host hook.' }),
         feedbackSession: hookOnlyFeedbackField({ ...feedbackSession, description: 'Bound host-session digest for the feedback claim.' }),
-        feedbackCloud: hookOnlyFeedbackField({ ...feedbackCloudTransportSchema, description: 'Cloud transport injected by the trusted cloud hook: grant-bound archive bytes for device-side upload.' }),
     },
     ['artifactId']
 );
@@ -963,10 +1021,9 @@ const feedbackErrorSchema = objectUnion(
     feedbackErrorObject({ code: { const: 'FEEDBACK_HOOK_HANDOFF_UNAVAILABLE' }, message: feedbackMessage, stage: { const: 'handoff' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
     feedbackErrorObject({ code: { const: 'ARTIFACT_UNAVAILABLE' }, message: feedbackMessage, stage: { const: 'artifact' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
     feedbackErrorObject({ code: { const: 'UPLOAD_GRANT_INVALID' }, message: feedbackMessage, stage: { const: 'grant' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'UPLOAD_REJECTED' }, message: feedbackMessage, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'UPLOAD_UNCERTAIN' }, message: feedbackMessage, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
     feedbackErrorObject({ code: { const: 'UPLOAD_DESTINATION_REFUSED' }, message: feedbackMessage, stage: { const: 'grant' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-    feedbackErrorObject({ code: { const: 'FEEDBACK_ARCHIVE_MISMATCH' }, message: feedbackMessage, stage: { const: 'artifact' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable'])
+    feedbackErrorObject({ code: { const: 'UPLOAD_REJECTED' }, message: feedbackMessage, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
+    feedbackErrorObject({ code: { const: 'UPLOAD_UNCERTAIN' }, message: feedbackMessage, stage: { const: 'upload' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable'])
 );
 const feedbackPreparationErrorSchema = objectUnion(
     feedbackErrorObject({ code: { const: 'FEEDBACK_INPUT_INVALID' }, message: feedbackMessage, stage: { const: 'prepare' }, retryable: { const: false }, recommendedAction: { const: 'RETRY_WITH_VALID_REPORT' } }, ['code', 'message', 'stage', 'retryable', 'recommendedAction']),
@@ -1004,33 +1061,6 @@ const feedbackSubmitFailureSchema = object(
     { ok: { const: false }, status: { type: 'string', enum: ['failed', 'rejected', 'uncertain'] }, artifactId: feedbackArtifactIdSchema, error: feedbackErrorSchema },
     ['ok', 'status', 'error']
 );
-const feedbackCloudNotStartedSchema = object({
-    ok: { const: false }, status: { const: 'not_started' }, artifactId: feedbackArtifactIdSchema,
-    // insufficient_execution_budget is no longer produced: no hook uploads, so neither runs a budget
-    // check. It stays accepted so attempt and operation records the previous build wrote remain
-    // readable for the rest of their 24-hour retention.
-    reason: { type: 'string', enum: ['insufficient_execution_budget', 'FEEDBACK_GRANT_REFRESH_REQUIRED'] },
-    error: feedbackErrorObject({ code: { type: 'string', enum: ['insufficient_execution_budget', 'FEEDBACK_GRANT_REFRESH_REQUIRED', 'FEEDBACK_GRANT_MISSING', 'FEEDBACK_SUBMISSION_FAILED'] },
-        message: feedbackMessage, stage: { const: 'handoff' }, retryable: { const: false } }, ['code', 'message', 'stage', 'retryable']),
-}, ['ok', 'status', 'artifactId', 'error']);
-const feedbackPrepareHostUnavailableSchema = object(
-    {
-        ok: { const: false },
-        status: { const: 'host_result_unavailable' },
-        adapter: object({
-            ...feedbackHostAdapterMarkerSchema.properties,
-            targetTool: { const: 'prepare_e_comet_feedback' },
-        }, ['version', 'operationId', 'nonce', 'targetTool']),
-        bridgeStatus: feedbackDeviceSnapshotSchema,
-        error: object({
-            code: { const: 'FEEDBACK_HOST_RESULT_UNAVAILABLE' },
-            message: feedbackMessage,
-            stage: { const: 'handoff' },
-            retryable: { const: false },
-        }, ['code', 'message', 'stage', 'retryable']),
-    },
-    ['ok', 'status', 'adapter', 'bridgeStatus', 'error']
-);
 
 const describedToolName = described(
     { type: 'string', enum: [...CONTRACT_TOOL_NAMES] },
@@ -1054,7 +1084,7 @@ export const toolInputSchemas = {
         scope: described({ type: 'string', enum: ['installation', 'runtime', 'last_operation'] }, 'Evidence domain to inspect: packaged installation, current bridge runtime, or one exact operation receipt.'),
         mode: described({ type: 'string', enum: ['passive', 'safe_probes'] }, 'Passive reads existing facts; safe_probes additionally runs only the explicitly selected allowlisted probes.'),
         operationHandle: described(string, 'Opaque handle returned by the exact terminal operation; required only for last_operation and never substitutes the latest result.'),
-        probes: described(array(described({ type: 'string', enum: ['storage_write', 'extension_snapshot', 'hook_permissions', 'codex_mcp_auth', 'extension_install'] }, 'storage_write, hook_permissions, codex_mcp_auth and extension_install apply only to installation; extension_snapshot applies only to runtime.'), { uniqueItems: true }), 'Allowlisted probes requested for safe_probes mode; an inapplicable requested probe is not executed and is omitted from checks.'),
+        probes: described(array(described({ type: 'string', enum: ['storage_write', 'extension_snapshot', 'hook_permissions', 'codex_mcp_auth', 'extension_install', 'extension_log'] }, 'storage_write, hook_permissions, codex_mcp_auth and extension_install apply only to installation; extension_snapshot and extension_log apply only to runtime.'), { uniqueItems: true }), 'Allowlisted probes requested for safe_probes mode; an inapplicable requested probe is not executed and is omitted from checks.'),
     }, ['scope', 'mode']), 'Selects one diagnostic scope and observation mode without authorizing a business operation.'),
     describe_e_comet_tool: described(
         object({ name: describedToolName }, ['name']),
@@ -1139,33 +1169,49 @@ export const toolInputSchemas = {
         },
         ['nmIds']
     ),
+    e_comet_run_result: object(
+        { runId: described({ type: 'string', minLength: 1, maxLength: 64 }, 'The runId from a "running" answer of a long e-Comet tool.') },
+        ['runId']
+    ),
 };
 
 export const toolOutputSchemas = {
     local_bridge_status: bridgeStatusSchema,
     e_comet_diagnose: diagnosisSchema,
     describe_e_comet_tool: describedToolContractSchema,
-    wb_product_card: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(productCardSuccessSchema), toolErrorSchema)),
-    wb_search_by_query: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(searchSuccessSchema), toolErrorSchema)),
-    wb_check_by_query: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(checkSuccessSchema), toolErrorSchema)),
-    wb_filters_by_query: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(filtersSuccessSchema), toolErrorSchema)),
-    wb_recommendations_by_product: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(recommendationsSuccessSchema), toolErrorSchema)),
-    wb_seller_reviews: withOperationDiagnostic(objectUnion(sellerReviewsSuccessSchema, toolErrorSchema)),
-    prepare_e_comet_feedback: withOperationDiagnostic(objectUnion(feedbackPrepareSuccessSchema, feedbackPrepareFailureSchema, feedbackPrepareHostUnavailableSchema)),
-    submit_e_comet_feedback: withOperationDiagnostic(objectUnion(feedbackSubmitSuccessSchema, feedbackSubmitFailureSchema, feedbackCloudNotStartedSchema)),
+    wb_product_card: withRunningAnswer(withOperationDiagnostic(objectUnion(...liveAggregateSchemas(productCardSuccessSchema), toolErrorSchema))),
+    wb_search_by_query: withRunningAnswer(withOperationDiagnostic(objectUnion(...liveAggregateSchemas(searchSuccessSchema), toolErrorSchema))),
+    wb_check_by_query: withRunningAnswer(withOperationDiagnostic(objectUnion(...liveAggregateSchemas(checkSuccessSchema), toolErrorSchema))),
+    wb_filters_by_query: withRunningAnswer(withOperationDiagnostic(objectUnion(...liveAggregateSchemas(filtersSuccessSchema), toolErrorSchema))),
+    wb_recommendations_by_product: withRunningAnswer(withOperationDiagnostic(objectUnion(...liveAggregateSchemas(recommendationsSuccessSchema), toolErrorSchema))),
+    wb_seller_reviews: withRunningAnswer(withOperationDiagnostic(objectUnion(sellerReviewsSuccessSchema, toolErrorSchema))),
+    prepare_e_comet_feedback: withOperationDiagnostic(objectUnion(feedbackPrepareSuccessSchema, feedbackPrepareFailureSchema)),
+    submit_e_comet_feedback: withOperationDiagnostic(objectUnion(feedbackSubmitSuccessSchema, feedbackSubmitFailureSchema)),
     wb_product_images: withOperationDiagnostic(objectUnion(...liveAggregateSchemas(imagesSuccessSchema), toolErrorSchema)),
-    ozon_seller_promotion_report: withOperationDiagnostic(objectUnion(ozonPromotionSuccessSchema, ozonPromotionFailureSchema, ozonPromotionPreflightFailureSchema)),
-    ozon_seller_promotion_reports: withOperationDiagnostic(packageResultSchema(
+    ozon_seller_promotion_report: withRunningAnswer(withOperationDiagnostic(objectUnion(ozonPromotionSuccessSchema, ozonPromotionFailureSchema, ozonPromotionPreflightFailureSchema))),
+    ozon_seller_promotion_reports: withRunningAnswer(withOperationDiagnostic(packageResultSchema(
         'ozon_seller_promotion_reports',
         'periods',
         promotionPackageItems
-    )),
-    ozon_seller_analytics_report: withOperationDiagnostic(packageResultSchema(
+    ))),
+    ozon_seller_analytics_report: withRunningAnswer(withOperationDiagnostic(packageResultSchema(
         'ozon_seller_analytics_report',
         'reports',
         analyticsPackageItems
-    )),
-    ozon_search_positions: withOperationDiagnostic(searchPositionsResultSchema),
+    ))),
+    ozon_search_positions: withRunningAnswer(withOperationDiagnostic(searchPositionsResultSchema)),
+    // Returns any of the ten finished answers unchanged, so only their shared envelope is typed: a union of their schemas
+    // would add about 395 KB to tools/list, and the original tools' schemas keep the finished answers typed.
+    e_comet_run_result: object({
+        ok: boolean,
+        status: string,
+        runId: string,
+        tool: string,
+        code: string,
+        message: string,
+        stage: string,
+        retryable: boolean,
+    }, ['ok'], true),
 };
 
 export const schemaContractTerms = (schema = bridgeStatusSchema) => {

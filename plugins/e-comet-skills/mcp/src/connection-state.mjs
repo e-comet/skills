@@ -10,6 +10,7 @@ export class ConnectionState {
     extensionOzonAnalyticsReady = false;
     extensionOzonSearchPositionsReady = false;
     extensionDiagnosticSnapshotReady = false;
+    extensionDiagnosticSnapshotV2Ready = false;
     extensionLastConnectedAtMs = null;
     extensionLastDisconnectedAtMs = null;
     extensionVersion = undefined;
@@ -31,6 +32,7 @@ export class ConnectionState {
         this.extensionOzonAnalyticsReady = options.ozonSellerAnalyticsReportSupported === true;
         this.extensionOzonSearchPositionsReady = options.ozonSearchPositionsSupported === true;
         this.extensionDiagnosticSnapshotReady = options.diagnosticSnapshotSupported === true;
+        this.extensionDiagnosticSnapshotV2Ready = options.diagnosticSnapshotV2Supported === true;
         this.extensionVersion = options.version;
         this.extensionLastConnectedAtMs = this.#now();
         return previous && previous !== session ? previous : null;
@@ -46,6 +48,7 @@ export class ConnectionState {
         this.extensionOzonAnalyticsReady = false;
         this.extensionOzonSearchPositionsReady = false;
         this.extensionDiagnosticSnapshotReady = false;
+        this.extensionDiagnosticSnapshotV2Ready = false;
         this.extensionLastDisconnectedAtMs = this.#now();
         this.browserContext = { state: 'unknown' };
         return true;

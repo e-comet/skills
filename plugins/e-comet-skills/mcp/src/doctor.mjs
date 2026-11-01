@@ -1,5 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
+import { release } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -53,7 +54,7 @@ export const collectDoctorReport = async ({ env = process.env, platform = proces
     nodeVersion = process.version, observedAt = new Date().toISOString() } = {}) => {
     const packageObservation = await readJson(join(packageRoot, 'package.json'));
     const checks = collectStaticFacts({ platform, arch,
-        versions: { node: nodeVersion, bridge: safeVersion(packageObservation.value?.version) },
+        versions: { node: nodeVersion, bridge: safeVersion(packageObservation.value?.version), os: release() },
         storageLayout: resolveStorageLayout({ env, platform }), observedAt });
     checks.push(diagnosticCheck({ check: 'package_layout', state: 'passed', observedAt, source: 'module_location',
         executionPlane: 'device', facts: { layout: installedLayout ? 'installed_plugin' : 'canonical_source' } }));

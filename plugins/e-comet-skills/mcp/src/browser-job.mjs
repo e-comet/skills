@@ -30,12 +30,14 @@ import {
     REQUEST_TIMEOUT_MS,
     SEARCH_CONCURRENCY,
 } from './config.mjs';
-import { FETCH_ERROR_CODES, SELLER_OPERATION_STAGES } from './extension-vocabulary.mjs';
+import { FETCH_ERROR_CODES, SELLER_OPERATION_STAGES, wbaasRecoveryOutcome } from './extension-vocabulary.mjs';
 import { parseAnalyticsReports } from './ozon-analytics-domain.mjs';
 import { parseOzonPromotionPeriod } from './ozon-promotion-domain.mjs';
 import { parsePromotionPeriods } from './ozon-report-package-domain.mjs';
 import { canonicalSearchPositionsRequest, sameSearchPositionsRequest } from './ozon-search-positions-domain.mjs';
-import { ToolExecutionError } from './tool-errors.mjs';
+import { artifactFailureDetails } from './artifact-store.mjs';
+import { countRunProgress } from './run-registry.mjs';
+import { LOCAL_STORAGE_MESSAGES, ToolExecutionError, artifactFailureMessage, closedFailureDetails } from './tool-errors.mjs';
 import {
     isSuccessfulWbResponse,
     isAllowedWbUrl,
@@ -65,14 +67,20 @@ const CHECK_SEARCH_DEFAULT_PARAMS = Object.freeze({
 });
 
 const validJobTimeout = (job) => job.timeout === undefined || validTimeout(job.timeout);
-const invalidDescriptor = (cause) =>
-    new ToolExecutionError(
+// Each broken limit names its closed rule (tool-errors DESCRIPTOR_RULES); the message stays in the log only.
+const brokenRule = (rule, message) => Object.assign(new Error(message), { rule });
+const invalidDescriptor = (cause) => {
+    const error = new ToolExecutionError(
         'BROWSER_JOB_DESCRIPTOR_INVALID',
-        'The signed browser job descriptor is invalid.',
+        // The same job is signed the same way, so another authorization fails the same way.
+        'The signed browser job descriptor is invalid; this is an e-Comet defect. Offer to report it; do not request another authorization for the same job.',
         'authorization',
         false,
         { cause: cause instanceof Error ? cause : new Error(String(cause)) }
     );
+    if (typeof cause?.rule === 'string') error.details = Object.freeze({ rule: cause.rule });
+    return error;
+};
 const boundedText = (value) =>
     typeof value === 'string' && value.length >= 1 && value.length <= MAX_BROWSER_JOB_TEXT_LENGTH;
 const validEndpoint = (value) => {
@@ -138,18 +146,43 @@ const WB_ITEM_ERROR_CODES = Object.freeze([
     'WB_UNRELIABLE_RESPONSE', 'WB_FULL_LISTS_INCOMPLETE',
 ]);
 const skippedBuyerErrors = new WeakSet();
+// A buyer item's errorDetails keep only the closed timeout phase and WBAAS recovery outcome (spec 7.2, 7.4).
+const buyerEvidence = (details) => {
+    const { phase, recovery } = /** @type {any} */ (closedFailureDetails(details) ?? {});
+    return { ...(phase ? { phase } : {}), ...(recovery ? { recovery } : {}) };
+};
 const buyerErrorFields = (error) => ({
     error: error.message,
     errorDetails: {
         code: error instanceof ToolExecutionError && WB_ITEM_ERROR_CODES.includes(error.code) ? error.code : 'WB_REQUEST_FAILED',
         stage: 'execution',
         retryable: error instanceof ToolExecutionError ? error.retryable : false,
+        ...(error instanceof ToolExecutionError ? buyerEvidence(error.details) : {}),
     },
     ...(skippedBuyerErrors.has(error) ? { skipped: true } : {}),
 });
-const buyerResponseErrorFields = (response) => response?.data?.status === 429
-    ? buyerErrorFields(new ToolExecutionError('WB_RATE_LIMITED', 'Wildberries rate limited this job. No additional work was scheduled after this response.', 'execution', false))
-    : {};
+const buyerResponseErrorFields = (response) => {
+    const recovery = wbaasRecoveryOutcome(response?.wbaasRecovery);
+    if (response?.data?.status === 429) {
+        const error = new ToolExecutionError('WB_RATE_LIMITED', 'Wildberries rate limited this job. No additional work was scheduled after this response.', 'execution', false);
+        if (recovery) error.details = { recovery };
+        return buyerErrorFields(error);
+    }
+    return recovery && !isSuccessfulWbResponse(response)
+        ? { errorDetails: { code: 'WB_REQUEST_FAILED', stage: 'execution', retryable: false, recovery } }
+        : {};
+};
+// The HTTP status of a failed WB answer, for check_by_query rows that otherwise keep only the text.
+const failedHttpStatus = (response) =>
+    !isSuccessfulWbResponse(response) && Number.isSafeInteger(response?.data?.status) ? { httpStatus: response.data.status } : {};
+// WB's catalog search answers no results with HTTP 200 metadata without `products`. The plain search answers
+// `products: []` instead (live WB, 2026-10-27), so only wb_check_by_query uses this.
+const isMetadataOnlyNoResult = (response) => {
+    const body = response?.data?.body;
+    return isSuccessfulWbResponse(response) && body !== null && typeof body === 'object' && typeof body.name === 'string' &&
+        typeof body.query === 'string' && body.shardKey === 'merger' && body.search_result !== null &&
+        typeof body.search_result === 'object' && !Object.hasOwn(body, 'products');
+};
 const rethrowAuthorizationError = (error) => {
     if (error instanceof ToolExecutionError && ABORTING_STAGES.has(error.stage)) {
         throw error;
@@ -160,14 +193,14 @@ export const validateAuthorizedJobLimits = (authorization) => {
     try {
         const job = authorization?.job;
         if (!job || typeof job !== 'object' || Array.isArray(job) || !boundedText(job.jobId))
-            throw new Error('Browser job descriptor is invalid');
-        if (!validJobTimeout(job)) throw new Error('Browser job timeout is invalid');
+            throw brokenRule('descriptor', 'Browser job descriptor is invalid');
+        if (!validJobTimeout(job)) throw brokenRule('timeout', 'Browser job timeout is invalid');
 
         if (authorization.jobType === 'search_by_query') {
             const queries = job.queries;
-            if (job.type !== 'wb-search-by-query') throw new Error('Invalid search descriptor type');
-            if (!validEndpoint(job.endpoint)) throw new Error('Invalid browser job endpoint');
-            if (!validParams(job.params)) throw new Error('Invalid browser job params');
+            if (job.type !== 'wb-search-by-query') throw brokenRule('type', 'Invalid search descriptor type');
+            if (!validEndpoint(job.endpoint)) throw brokenRule('endpoint', 'Invalid browser job endpoint');
+            if (!validParams(job.params)) throw brokenRule('params', 'Invalid browser job params');
             if (
                 !Array.isArray(queries) ||
                 queries.length < 1 ||
@@ -181,26 +214,26 @@ export const validateAuthorizedJobLimits = (authorization) => {
                         item[1] >= 1
                 )
             )
-                throw new Error('Invalid browser job queries');
+                throw brokenRule('queries', 'Invalid browser job queries');
             if (queries.some(([, pages]) => pages > MAX_SEARCH_PAGES_PER_QUERY))
-                throw new Error(`Browser search job requires at most ${MAX_SEARCH_PAGES_PER_QUERY} pages per query`);
+                throw brokenRule('pages', `Browser search job requires at most ${MAX_SEARCH_PAGES_PER_QUERY} pages per query`);
             if (queries.reduce((total, [, pages]) => total + pages, 0) > MAX_SEARCH_REQUEST_UNITS)
-                throw new Error(`Browser search job requires at most ${MAX_SEARCH_REQUEST_UNITS} total pages`);
+                throw brokenRule('requests', `Browser search job requires at most ${MAX_SEARCH_REQUEST_UNITS} total pages`);
             if (!descriptorPagesAllowed(job.endpoint, job.params, queries))
-                throw new Error('Invalid browser job assembled endpoint URL');
+                throw brokenRule('assembled_url', 'Invalid browser job assembled endpoint URL');
             return;
         }
 
         if (authorization.jobType === 'check_by_query') {
             const queries = job.queries;
-            if (job.type !== 'wb-check-by-query') throw new Error('Invalid check-by-query descriptor type');
+            if (job.type !== 'wb-check-by-query') throw brokenRule('type', 'Invalid check-by-query descriptor type');
             if (!Number.isSafeInteger(job.article) || job.article <= 0)
-                throw new Error('Invalid check-by-query product');
+                throw brokenRule('product', 'Invalid check-by-query product');
             if (!validEndpoint(job.cardUrl) || !cardUrlMatchesArticle(job.cardUrl, job.article))
-                throw new Error('Invalid check-by-query card URL');
-            if (!validEndpoint(job.endpoint)) throw new Error('Invalid browser job endpoint');
+                throw brokenRule('card_url', 'Invalid check-by-query card URL');
+            if (!validEndpoint(job.endpoint)) throw brokenRule('endpoint', 'Invalid browser job endpoint');
             if (!validParams(job.params) || job.params.fbrand !== undefined || job.params.resultset !== undefined)
-                throw new Error('Invalid browser job params');
+                throw brokenRule('params', 'Invalid browser job params');
             if (
                 !Array.isArray(queries) ||
                 queries.length < 1 ||
@@ -208,22 +241,22 @@ export const validateAuthorizedJobLimits = (authorization) => {
                 !queries.every((query) => boundedText(query) && query.trim().length > 0) ||
                 new Set(queries).size !== queries.length
             )
-                throw new Error(`Browser check-by-query job requires 1-${MAX_CHECK_QUERIES} unique queries`);
+                throw brokenRule('queries', `Browser check-by-query job requires 1-${MAX_CHECK_QUERIES} unique queries`);
             if (job.maxPages !== MAX_CHECK_PAGES_PER_QUERY)
-                throw new Error(`Browser check-by-query job requires exactly ${MAX_CHECK_PAGES_PER_QUERY} pages per query`);
+                throw brokenRule('pages', `Browser check-by-query job requires exactly ${MAX_CHECK_PAGES_PER_QUERY} pages per query`);
             if (queries.length * job.maxPages > MAX_CHECK_SEARCH_REQUESTS)
-                throw new Error(`Browser check-by-query job requires at most ${MAX_CHECK_SEARCH_REQUESTS} search requests`);
+                throw brokenRule('requests', `Browser check-by-query job requires at most ${MAX_CHECK_SEARCH_REQUESTS} search requests`);
             if (!descriptorCheckPagesAllowed(job, queries))
-                throw new Error('Invalid browser job assembled endpoint URL');
+                throw brokenRule('assembled_url', 'Invalid browser job assembled endpoint URL');
             return;
         }
 
         if (authorization.jobType === 'filters_by_query') {
             const queries = job.queries;
-            if (job.type !== 'wb-filters-by-query') throw new Error('Invalid filters-by-query descriptor type');
-            if (!validEndpoint(job.endpoint)) throw new Error('Invalid browser job endpoint');
+            if (job.type !== 'wb-filters-by-query') throw brokenRule('type', 'Invalid filters-by-query descriptor type');
+            if (!validEndpoint(job.endpoint)) throw brokenRule('endpoint', 'Invalid browser job endpoint');
             if (!validParams(job.params) || job.params.resultset !== undefined || job.params.filters !== undefined)
-                throw new Error('Invalid browser job params');
+                throw brokenRule('params', 'Invalid browser job params');
             if (
                 !Array.isArray(queries) ||
                 queries.length < 1 ||
@@ -231,20 +264,20 @@ export const validateAuthorizedJobLimits = (authorization) => {
                 !queries.every((query) => boundedText(query) && query.trim().length > 0) ||
                 new Set(queries).size !== queries.length
             )
-                throw new Error(`Browser filters-by-query job requires 1-${MAX_FILTER_QUERIES} unique queries`);
+                throw brokenRule('queries', `Browser filters-by-query job requires 1-${MAX_FILTER_QUERIES} unique queries`);
             if (!queries.every((query) => isAllowedWbUrl(buildFiltersDescriptorUrl(job, query))))
-                throw new Error('Invalid browser job assembled endpoint URL');
+                throw brokenRule('assembled_url', 'Invalid browser job assembled endpoint URL');
             return;
         }
 
         if (authorization.jobType === 'product_card') {
             const articles = job.articles;
             const endpoints = job.endpoints;
-            if (job.type !== 'wb-product-card') throw new Error('Invalid product-card descriptor type');
+            if (job.type !== 'wb-product-card') throw brokenRule('type', 'Invalid product-card descriptor type');
             if (!Array.isArray(articles) || articles.length < 1 || !articles.every(validProductArticle))
-                throw new Error('Invalid browser job articles');
+                throw brokenRule('articles', 'Invalid browser job articles');
             if (articles.length > MAX_PRODUCT_CARD_PRODUCTS)
-                throw new Error(`Browser product-card job requires at most ${MAX_PRODUCT_CARD_PRODUCTS} products`);
+                throw brokenRule('requests', `Browser product-card job requires at most ${MAX_PRODUCT_CARD_PRODUCTS} products`);
             if (
                 !Array.isArray(endpoints) ||
                 endpoints.length < 1 ||
@@ -256,19 +289,19 @@ export const validateAuthorizedJobLimits = (authorization) => {
                         endpoint.url.length <= MAX_BROWSER_JOB_URL_LENGTH
                 )
             )
-                throw new Error('Invalid browser job endpoints');
+                throw brokenRule('endpoints', 'Invalid browser job endpoints');
             if (articles.length * endpoints.length > MAX_PRODUCT_CARD_REQUEST_UNITS)
-                throw new Error(`Browser product-card job requires at most ${MAX_PRODUCT_CARD_REQUEST_UNITS} requests`);
+                throw brokenRule('requests', `Browser product-card job requires at most ${MAX_PRODUCT_CARD_REQUEST_UNITS} requests`);
             if (!articles.every((article) => endpoints.every((endpoint) => isAllowedWbUrl(fillTemplate(endpoint.url, article)))))
-                throw new Error('Invalid browser job expanded endpoint URL');
+                throw brokenRule('assembled_url', 'Invalid browser job expanded endpoint URL');
             return;
         }
 
         if (authorization.jobType === 'recommendations_by_product') {
             const articles = job.articles;
-            if (job.type !== 'wb-recommendations-by-product') throw new Error('Invalid recommendations descriptor type');
-            if (!validEndpoint(job.endpoint)) throw new Error('Invalid browser job endpoint');
-            if (!validParams(job.params)) throw new Error('Invalid browser job params');
+            if (job.type !== 'wb-recommendations-by-product') throw brokenRule('type', 'Invalid recommendations descriptor type');
+            if (!validEndpoint(job.endpoint)) throw brokenRule('endpoint', 'Invalid browser job endpoint');
+            if (!validParams(job.params)) throw brokenRule('params', 'Invalid browser job params');
             if (
                 !Array.isArray(articles) ||
                 articles.length < 1 ||
@@ -281,16 +314,16 @@ export const validateAuthorizedJobLimits = (authorization) => {
                         (item.length === 1 || (Number.isInteger(item[1]) && item[1] >= 1))
                 )
             )
-                throw new Error('Invalid browser job recommendation articles');
+                throw brokenRule('articles', 'Invalid browser job recommendation articles');
             if (new Set(articles.map(([nm]) => nm)).size !== articles.length)
-                throw new Error('Browser recommendations job requires unique products');
+                throw brokenRule('unique_products', 'Browser recommendations job requires unique products');
             if (articles.some((item) => item[1] !== undefined && item[1] > MAX_RECOMMENDATION_PAGES_PER_PRODUCT))
-                throw new Error(`Browser recommendations job requires at most ${MAX_RECOMMENDATION_PAGES_PER_PRODUCT} pages per product`);
+                throw brokenRule('pages', `Browser recommendations job requires at most ${MAX_RECOMMENDATION_PAGES_PER_PRODUCT} pages per product`);
             if (
                 articles.reduce((total, item) => total + (item[1] ?? MAX_RECOMMENDATION_PAGES_PER_PRODUCT), 0) >
                 MAX_RECOMMENDATION_REQUEST_UNITS
             )
-                throw new Error(`Browser recommendations job requires at most ${MAX_RECOMMENDATION_REQUEST_UNITS} total pages`);
+                throw brokenRule('requests', `Browser recommendations job requires at most ${MAX_RECOMMENDATION_REQUEST_UNITS} total pages`);
             if (
                 !descriptorPagesAllowed(
                     job.endpoint,
@@ -298,7 +331,7 @@ export const validateAuthorizedJobLimits = (authorization) => {
                     articles.map(([nm, pages]) => [String(nm), pages ?? MAX_RECOMMENDATION_PAGES_PER_PRODUCT])
                 )
             )
-                throw new Error('Invalid browser job assembled endpoint URL');
+                throw brokenRule('assembled_url', 'Invalid browser job assembled endpoint URL');
             return;
         }
 
@@ -329,7 +362,7 @@ export const validateAuthorizedJobLimits = (authorization) => {
                 exports.reduce((total, item) => total + (item.isAnswered === undefined ? 2 : 1), 0) <=
                     MAX_SELLER_REVIEW_PHYSICAL_REPORTS;
             if (!validSellerReviews) {
-                throw new Error(
+                throw brokenRule('seller_exports', 
                     `Browser seller-review job requires at most ${MAX_SELLER_REVIEW_EXPORTS} exports and ${MAX_SELLER_REVIEW_PHYSICAL_REPORTS} physical reports`
                 );
             }
@@ -343,9 +376,9 @@ export const validateAuthorizedJobLimits = (authorization) => {
                 !keys.every((key) => ['jobId', 'type', 'dateFrom', 'dateTo'].includes(key)) ||
                 job.type !== 'ozon-seller-promotion-report'
             ) {
-                throw new Error('Invalid Ozon promotion descriptor');
+                throw brokenRule('ozon_descriptor', 'Invalid Ozon promotion descriptor');
             }
-            parseOzonPromotionPeriod(job.dateFrom, job.dateTo);
+            try { parseOzonPromotionPeriod(job.dateFrom, job.dateTo); } catch (error) { throw brokenRule('ozon_items', error.message); }
             return;
         }
 
@@ -356,9 +389,9 @@ export const validateAuthorizedJobLimits = (authorization) => {
                 !keys.every((key) => ['jobId', 'type', 'periods'].includes(key)) ||
                 job.type !== 'ozon-seller-promotion-reports'
             ) {
-                throw new Error('Invalid Ozon promotion package descriptor');
+                throw brokenRule('ozon_descriptor', 'Invalid Ozon promotion package descriptor');
             }
-            parsePromotionPeriods(job.periods);
+            try { parsePromotionPeriods(job.periods); } catch (error) { throw brokenRule('ozon_items', error.message); }
             return;
         }
 
@@ -369,9 +402,9 @@ export const validateAuthorizedJobLimits = (authorization) => {
                 !keys.every((key) => ['jobId', 'type', 'reports'].includes(key)) ||
                 job.type !== 'ozon-seller-analytics-report'
             ) {
-                throw new Error('Invalid Ozon analytics descriptor');
+                throw brokenRule('ozon_descriptor', 'Invalid Ozon analytics descriptor');
             }
-            parseAnalyticsReports(job.reports, authorization.issuedAt);
+            try { parseAnalyticsReports(job.reports, authorization.issuedAt); } catch (error) { throw brokenRule('ozon_items', error.message); }
             return;
         }
 
@@ -382,44 +415,42 @@ export const validateAuthorizedJobLimits = (authorization) => {
                 !keys.every((key) => ['jobId', 'type', 'queries', 'skus', 'region', 'platform'].includes(key)) ||
                 job.type !== 'ozon-search-positions'
             ) {
-                throw new Error('Invalid Ozon search positions descriptor');
+                throw brokenRule('ozon_descriptor', 'Invalid Ozon search positions descriptor');
             }
             // The signer materializes defaults and trims, so a signed descriptor is already canonical. A signer trimming
             // other whitespace than ECMAScript fails closed here: accepted residual, see
             // docs/local-agent-architecture.md#accepted-residuals.
             const { queries, skus, region, platform } = job;
             if (!sameSearchPositionsRequest(canonicalSearchPositionsRequest({ queries, skus, region, platform }), job)) {
-                throw new Error('Ozon search positions descriptor is not canonical');
+                throw brokenRule('ozon_canonical', 'Ozon search positions descriptor is not canonical');
             }
             return;
         }
 
-        throw new Error(`Unsupported browser_job type: ${authorization.jobType}`);
+        throw brokenRule('job_type', `Unsupported browser_job type: ${authorization.jobType}`);
     } catch (error) {
         if (error instanceof ToolExecutionError) throw error;
         throw invalidDescriptor(error);
     }
 };
 
+// A trigger URL that is not a browser job is the same failed handoff as a missing one (spec 7.2).
+const unusableTriggerUrl = (what = 'not a usable browser job') => new ToolExecutionError('BROWSER_JOB_HANDOFF_REQUIRED',
+    `Browser authorization handoff is required: the trigger URL the tool received is ${what}. Do not repeat browser_job; ` +
+        'check the host hook handoff (e-comet-doctor), then let the user decide.', 'handoff', false);
 export const extractBrowserJobToken = (value) => {
-    if (typeof value !== 'string') {
-        throw new Error('triggerUrl must be a browser_job trigger URL or JWT string');
-    }
+    if (typeof value !== 'string') throw unusableTriggerUrl();
     const input = value.trim();
-    if (!input) {
-        throw new Error('triggerUrl must be a browser_job trigger URL or JWT string');
-    }
-    if (Buffer.byteLength(input, 'utf8') > MAX_BROWSER_JOB_TOKEN_BYTES) throw new Error('triggerUrl is too large');
+    if (!input) throw unusableTriggerUrl();
+    if (Buffer.byteLength(input, 'utf8') > MAX_BROWSER_JOB_TOKEN_BYTES) throw unusableTriggerUrl('too large to be a browser job');
     if (!input.includes('__agent_job')) {
-        if (input.split('.').length !== 3) throw new Error('Invalid browser_job JWT');
+        if (input.split('.').length !== 3) throw unusableTriggerUrl();
         return input;
     }
     const hashIndex = input.indexOf('#');
     const hash = hashIndex >= 0 ? input.slice(hashIndex + 1) : input.replace(/^#/, '');
     const token = new URLSearchParams(hash).get('__agent_job');
-    if (!token || token.split('.').length !== 3) {
-        throw new Error('Invalid browser_job trigger URL');
-    }
+    if (!token || token.split('.').length !== 3) throw unusableTriggerUrl();
     return token;
 };
 
@@ -513,7 +544,7 @@ const executeSearchJob = async ({ authorizationId, job, requestWbFetch, writer, 
             url: buildDescriptorUrl(job.endpoint, job.params, query, index + 1),
         }))
     );
-    const fetched = await runWithConcurrency(units, SEARCH_CONCURRENCY, async (unit) => {
+    const fetched = await runWithConcurrency(units, SEARCH_CONCURRENCY, countRunProgress(units.length, async (unit) => {
         try {
             const response = await requestWbFetch(unit.url, job.timeout ?? REQUEST_TIMEOUT_MS, authorizationId);
             await writer.append({ jobId: job.jobId, ...unit, response, ...buyerResponseErrorFields(response) });
@@ -532,7 +563,7 @@ const executeSearchJob = async ({ authorizationId, job, requestWbFetch, writer, 
             });
             return { ...unit, ok: false, ...buyerErrorFields(error) };
         }
-    });
+    }));
 
     const queries = job.queries.map(([query, pagesRequested], queryIndex) => {
         let globalOffset = 0;
@@ -646,13 +677,14 @@ const executeCheckByQueryJob = async ({ authorizationId, job, requestWbFetch, wr
                 pagesChecked: 0,
                 completionReason: 'card_failed',
                 error,
+                ...failedHttpStatus(cardResponse),
                 ...buyerResponseErrorFields(cardResponse),
             })),
         };
     }
 
     let searchRequestsMade = 0;
-    const queries = await runWithConcurrency(job.queries, CHECK_QUERY_CONCURRENCY, async (query) => {
+    const queries = await runWithConcurrency(job.queries, CHECK_QUERY_CONCURRENCY, countRunProgress(job.queries.length, async (query) => {
         let previousFingerprint;
         for (let page = 1; page <= job.maxPages; page += 1) {
             const url = buildCheckDescriptorUrl(job, query, page, brandId);
@@ -673,26 +705,15 @@ const executeCheckByQueryJob = async ({ authorizationId, job, requestWbFetch, wr
                     ...buyerErrorFields(error),
                 };
             }
-            const body = response?.data?.body;
-            const hasProductArray = Array.isArray(body?.products);
-            // WB's current valid no-results response is metadata-only and omits products entirely.
-            const isMetadataOnlyNoResult =
-                isSuccessfulWbResponse(response) &&
-                body !== null &&
-                typeof body === 'object' &&
-                typeof body.name === 'string' &&
-                typeof body.query === 'string' &&
-                body.shardKey === 'merger' &&
-                body.search_result !== null &&
-                typeof body.search_result === 'object' &&
-                !Object.hasOwn(body, 'products');
+            const hasProductArray = Array.isArray(response?.data?.body?.products);
             const products = hasProductArray ? responseProducts(response) : [];
-            if (!isSuccessfulWbResponse(response) || (!hasProductArray && !isMetadataOnlyNoResult)) {
+            if (!isSuccessfulWbResponse(response) || (!hasProductArray && !isMetadataOnlyNoResult(response))) {
                 return {
                     query,
                     found: false,
                     pagesChecked: page - 1,
                     completionReason: 'request_failed',
+                    ...failedHttpStatus(response),
                     ...buyerResponseErrorFields(response),
                     error: response?.error || response?.data?.statusText || 'WB search request failed',
                 };
@@ -722,7 +743,7 @@ const executeCheckByQueryJob = async ({ authorizationId, job, requestWbFetch, wr
             pagesChecked: job.maxPages,
             completionReason: 'page_limit',
         };
-    });
+    }));
 
     const successfulQueries = queries.filter((query) => query.completionReason !== 'request_failed').length;
     return {
@@ -747,9 +768,11 @@ const filtersResponseFailure = (response) => {
         response?.error ||
         (response?.data?.ok ? 'Wildberries returned an unreadable filters response' : response?.data?.statusText) ||
         'WB filters request failed';
+    // A failed answer keeps the anti-bot recovery outcome and its HTTP status, as the other WB rows do: over HTTP/2 the
+    // browser gives no status text, so the message alone cannot tell a 498 from a 403 or a 500.
     return response?.data?.status === 429
-        ? { ...buyerResponseErrorFields(response), error: message }
-        : filtersItemError('WB_REQUEST_FAILED', message);
+        ? { ...buyerResponseErrorFields(response), ...failedHttpStatus(response), error: message }
+        : { ...filtersItemError('WB_REQUEST_FAILED', message), ...buyerResponseErrorFields(response), ...failedHttpStatus(response), error: message };
 };
 
 // Per phrase: the filters WB shows, then one request for every truncated characteristic and category list. A decoy body or a
@@ -773,7 +796,7 @@ const executeFiltersByQueryJob = async ({ authorizationId, job, requestWbFetch, 
     };
     const decoy = () => filtersItemError('WB_UNRELIABLE_RESPONSE', 'Wildberries returned a decoy filters response for this phrase.');
 
-    const phrases = await runWithConcurrency(job.queries, FILTER_QUERY_CONCURRENCY, async (query) => {
+    const phrases = await runWithConcurrency(job.queries, FILTER_QUERY_CONCURRENCY, countRunProgress(job.queries.length, async (query) => {
         const first = await fetchFilters(query);
         if (first.error) {
             return { query, status: skippedBuyerErrors.has(first.error) ? 'rate_limited' : 'request_failed', ...buyerErrorFields(first.error) };
@@ -804,7 +827,7 @@ const executeFiltersByQueryJob = async ({ authorizationId, job, requestWbFetch, 
             ...(fullFailure ?? filtersItemError('WB_FULL_LISTS_INCOMPLETE', 'Wildberries did not return every full value list for this phrase.')),
             filters,
         };
-    });
+    }));
 
     // A partial phrase has data, so the job is ok, but only fully answered phrases make it done.
     const answered = phrases.filter(({ status }) => status === 'ok' || status === 'partial' || status === 'empty').length;
@@ -828,7 +851,7 @@ const executeProductCardJob = async ({ authorizationId, job, requestWbFetch, wri
             url: fillTemplate(endpoint.url, article),
         }))
     );
-    const fetched = await runWithConcurrency(units, PRODUCT_CARD_CONCURRENCY, async (unit) => {
+    const fetched = await runWithConcurrency(units, PRODUCT_CARD_CONCURRENCY, countRunProgress(units.length, async (unit) => {
         try {
             const response = await requestWbFetch(unit.url, job.timeout ?? REQUEST_TIMEOUT_MS, authorizationId);
             await writer.append({ jobId: job.jobId, ...unit, response, ...buyerResponseErrorFields(response) });
@@ -842,7 +865,7 @@ const executeProductCardJob = async ({ authorizationId, job, requestWbFetch, wri
             });
             return { ...unit, ok: false, ...buyerErrorFields(error) };
         }
-    });
+    }));
 
     const products = articles.map((article) => {
         const articleUnits = fetched.filter((unit) => unit.nmId === article.nm);
@@ -1061,10 +1084,18 @@ const sellerArtifactName = (sellerExport) => {
 
 const sellerError = (error, fallbackCode, fallbackMessage, stage = 'execution', retryable = false) => {
     if (error instanceof ToolExecutionError) {
-        return { code: error.code, message: error.message, stage: error.stage, retryable: error.retryable };
+        const details = closedFailureDetails(error.details);
+        return { code: error.code, message: error.message, stage: error.stage, retryable: error.retryable, ...(details ? { details } : {}) };
+    }
+    // A local workbook write: a filesystem refusal is LOCAL_STORAGE_FAILED with its code, any other its closed class.
+    const artifact = artifactFailureDetails(error);
+    if (artifact?.systemCode) {
+        return { code: 'LOCAL_STORAGE_FAILED', message: LOCAL_STORAGE_MESSAGES[artifact.systemCode], stage: 'storage', retryable: true, details: artifact };
     }
     const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/.test(error.code) ? error.code : fallbackCode;
-    return { code, message: fallbackMessage, stage: error?.stage || stage, retryable: typeof error?.retryable === 'boolean' ? error.retryable : retryable };
+    return { code, message: artifactFailureMessage(artifact) ?? fallbackMessage, stage: error?.stage || stage,
+        retryable: typeof error?.retryable === 'boolean' ? error.retryable : retryable,
+        ...(artifact ? { details: artifact } : {}) };
 };
 
 // A per-operation timeout is retryable by construction: the poll and download loops already own their
@@ -1084,6 +1115,12 @@ const abortsSellerPackage = (error) =>
           : error?.stage === 'authorization' || error?.stage === 'extension' || SELLER_ABORT_CODES.has(error?.code);
 
 const reportIdFromCreate = (response) => response?.data?.reportId ?? response?.reportId;
+// A poll answer is recognized when it names this report's status or lists reports; anything else is not "still running".
+const isRecognizedPoll = (response) => [response?.data, response].some((body) =>
+    (typeof body?.reportId === 'string' && typeof body.status === 'string') || Array.isArray(body?.reportsInfo));
+const unrecognizedPoll = () => new ToolExecutionError('SELLER_RESPONSE_INVALID',
+    'Wildberries answered the review report status in a shape e-Comet does not recognize, so the export stopped instead of polling until it ' +
+        'times out. This is an e-Comet defect: offer to report it; do not repeat the export automatically.', 'execution', false);
 const reportStatusFromPoll = (response, reportId) => {
     if (response?.data?.reportId === reportId && typeof response.data.status === 'string') return response.data.status;
     if (response?.reportId === reportId && typeof response.status === 'string') return response.status;
@@ -1160,6 +1197,7 @@ export const executeSellerReviewsJob = async ({
     const physicalExports = normalizeSellerExports(authorization.job.exports);
     const exports = [];
     let packageAborted = false;
+    let stopReason;
     let consecutiveExportFailures = 0;
     // Every export result goes through here so the package can notice that it is failing the same
     // way over and over: a create that keeps failing costs one request per export, and without a
@@ -1243,6 +1281,12 @@ export const executeSellerReviewsJob = async ({
                 // Reset on the response itself, not on a usable status: the request succeeded, so
                 // whatever the line below makes of it is a fresh failure rather than a repeat.
                 consecutivePollFailures = 0;
+                if (!isRecognizedPoll(pollResponse)) {
+                    pollFailure = unrecognizedPoll();
+                    stopReason = 'unrecognized_response';
+                    packageAborted = true;
+                    break;
+                }
                 const status = reportStatusFromPoll(pollResponse, reportId);
                 if (status === 'complete') {
                     reportReady = true;
@@ -1292,7 +1336,7 @@ export const executeSellerReviewsJob = async ({
             // agent to wait longer for a report that was never being refused for time reasons. An
             // opaque failure has no cause to carry, so it must at least not claim to be a
             // retryable timeout while the package it just stopped stays stopped.
-            const error = pollBreakerTripped
+            const error = stopReason === 'unrecognized_response' ? pollFailure : pollBreakerTripped
                 ? pollFailure instanceof ToolExecutionError
                     ? pollFailure
                     : new ToolExecutionError(
@@ -1433,6 +1477,7 @@ export const executeSellerReviewsJob = async ({
         jobType: 'seller_reviews',
         jobId,
         ...(authorization.job.org ? { org: authorization.job.org } : {}),
+        ...(stopReason ? { stopReason } : {}),
         exports,
     };
 
@@ -1448,6 +1493,7 @@ export const executeAuthorizedBrowserJob = async ({
     validateAuthorizedJobLimits(authorization);
     const originalFetch = requestWbFetch;
     let rateLimited = false;
+    let answered = 0;
     requestWbFetch = async (...args) => {
         if (rateLimited) {
             const error = new ToolExecutionError('WB_RATE_LIMITED', 'Not requested because Wildberries rate limited this job.', 'execution', false);
@@ -1455,11 +1501,49 @@ export const executeAuthorizedBrowserJob = async ({
             throw error;
         }
         const response = await originalFetch(...args);
+        answered += 1;
         // Observe before writer I/O; in-flight requests may finish, but no new request is sent.
         if (response?.data?.status === 429) rateLimited = true;
         return response;
     };
     const projection = { productLimitPerScope, productNmIds };
+    let result;
+    try {
+        result = await executeWbJob(authorization, requestWbFetch, writer, projection);
+    } catch (error) {
+        if (!(error instanceof ToolExecutionError)) throw error;
+        throw stoppedWbJobError(error, authorization, answered);
+    }
+    return {
+        ...result,
+        ...(rateLimited ? { stopReason: 'rate_limited' } : {}),
+        jobType: authorization.jobType,
+        jobId: authorization.job.jobId,
+        expiresAt: authorization.expiresAt,
+    };
+};
+
+// The job stopped mid-run: say how many WB requests were answered (their rows are in the result file) and, when the
+// signed budget is known, how many were not. Each job gets its own copy; one cause can end several jobs at once.
+export const stoppedWbJobError = (error, authorization, answered) => {
+    const stopped = new ToolExecutionError(error.code, error.message, error.stage, error.retryable, { cause: error });
+    const budget = signedRequests(authorization);
+    stopped.details = { ...error.details, completed: answered, ...(budget === undefined ? {} : { pending: Math.max(0, budget - answered) }) };
+    return stopped;
+};
+
+// The signed request budget, undefined for a job type not listed here; check_by_query and recommendations may stop
+// early, and filters_by_query asks for a full list only when a phrase has lists to expand, so for them it is an upper bound.
+const signedRequests = ({ jobType, job }) =>
+    jobType === 'search_by_query' ? job.queries.reduce((total, [, pages]) => total + pages, 0)
+        : jobType === 'check_by_query' ? 1 + job.queries.length * job.maxPages
+            : jobType === 'filters_by_query' ? job.queries.length * 2
+                : jobType === 'product_card' ? normalizeProductArticles(job.articles).length * job.endpoints.length
+                    : jobType === 'recommendations_by_product'
+                        ? job.articles.reduce((total, [, pages]) => total + (pages ?? MAX_RECOMMENDATION_PAGES_PER_PRODUCT), 0)
+                        : undefined;
+
+const executeWbJob = async (authorization, requestWbFetch, writer, projection) => {
     let result;
     if (authorization.jobType === 'search_by_query') {
         result = await executeSearchJob({
@@ -1501,11 +1585,5 @@ export const executeAuthorizedBrowserJob = async ({
     } else {
         throw new Error(`Unsupported browser_job type: ${authorization.jobType}`);
     }
-    return {
-        ...result,
-        ...(rateLimited ? { stopReason: 'rate_limited' } : {}),
-        jobType: authorization.jobType,
-        jobId: authorization.job.jobId,
-        expiresAt: authorization.expiresAt,
-    };
+    return result;
 };
