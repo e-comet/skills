@@ -72,7 +72,7 @@ export const REMOTE_E_COMET_TOOL_NAMES = Object.freeze([
     'update_product_settings', 'update_stock_rebalancer_settings',
     'campaign_comments', 'product_comments', 'update_campaign_comments', 'update_product_comments',
     'campaign_journal', 'product_journal', 'account_journal', 'search_positions', 'recom_positions',
-    'org_balance_history', 'campaign_budget', 'campaign_budget_history',
+    'org_balance_history', 'campaign_budget', 'campaign_budget_history', 'order_feed',
 ]);
 const REMOTE_TOOL_NAME = new RegExp(`^mcp__(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|e-comet|plugin_e-comet-skills_e-comet|(?:claude_ai_)?https_mcp_e-comet_io_mcp)__(?:${REMOTE_E_COMET_TOOL_NAMES.join('|')})$`);
 
