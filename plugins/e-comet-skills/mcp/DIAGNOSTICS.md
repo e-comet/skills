@@ -190,7 +190,7 @@ including an absent name, each answers `state:"unsupported"` with `source:"devic
 and `cause:"unsupported"` without starting an inspector: they would otherwise report another host's configuration as this
 session's. The installation `hook_permissions` probe asks native Codex `hooks/list` for the e-Comet plugin hooks resolved in the
 MCP process working-directory context. It starts one bounded read-only `app-server --stdio` configuration inspector;
-the default five-second diagnostic wait accommodates cold startup beyond two seconds and does not retry. The inspector performs only protocol initialization
+the default 20-second diagnostic wait covers a cold start, measured at 5.5–9.7 s, and does not retry. The inspector performs only protocol initialization
 and `hooks/list`; it does not create a task, invoke a model or tool, start MCP lifecycle work, or write hook trust and
 enablement. On success, `facts.context` is `configuration_snapshot`: this proves persisted configuration for that directory,
 not that a hook ran in the current task. Successful `facts.hooks[]` contains only canonical e-Comet hook family, event, enabled
@@ -421,8 +421,8 @@ the `comspec` state of a start failure on Windows, the registration's `runtimeRe
 failed (`policyReadFailed`), every live broker's version (`brokerVersions`), the serving broker's version
 (`servingBrokerVersion`), the extension version behind the serving broker or the newest one (`extensionVersion`) and
 when the failure record was written (`lastFailureRecordAt`); each field only in its closed list or version grammar, and
-omitted when unknown. The report also carries the `transportEvents` ring beside the diagnostics, outside their 12 KiB
-cap, within its own 4 KiB: the newest events are kept, and the oldest leave until the whole projection fits 16 KiB.
+omitted when unknown. The report also carries the `transportEvents` ring beside the diagnostics, within its own 4 KiB:
+the newest events are kept, and the oldest leave until the whole projection fits 16 KiB.
 
 Every archive may hold `extension-log.json` after `report.md`, `metadata.json` and `transcript.jsonl`: the e-Comet
 extension's own log, read from the same profile the `extension_log` check reads, whether or not the extension is

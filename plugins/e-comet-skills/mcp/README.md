@@ -40,8 +40,8 @@ plugin-data root or explicit store override exists. The browser bridge files and
 remain in shared profile state, outside host-specific plugin-data output, so concurrently running
 supported hosts find the same bridge and verify the same signatures.
 
-The canonical source and tests live under `e-comet-local-mcp/` in the private skills repository. This plugin contains a
-release snapshot of its `src/` directory.
+The canonical source and tests live in the private skills repository. This directory is the build of its
+`src/plugins/e-comet-skills/mcp/src/` TypeScript and JavaScript sources.
 
 The MCP never listens on a network port. After it starts, it registers a small native messaging host for the
 browsers; the e-Comet extension starts that host through the browser, and every MCP process connects to it through a
