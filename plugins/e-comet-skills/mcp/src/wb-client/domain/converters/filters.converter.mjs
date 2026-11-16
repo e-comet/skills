@@ -24,12 +24,17 @@ export const readFiltersResponse = (response) => {
     return { state: 'genuine', filters: data.filters.filter(isRecord), total: numberOrUndefined(data.total) };
 };
 const filterKind = (key) => (CHARACTERISTIC_KEY.test(key) ? 'characteristic' : key === 'xsubject' ? 'category' : undefined);
-const valueNames = (filter) => isUnknownArray(filter.items)
+const filterValues = (filter) => isUnknownArray(filter.items)
     ? filter.items.flatMap((item) => {
+        const id = fieldOf(item, 'id');
         const name = fieldOf(item, 'name');
-        return typeof name === 'string' && name ? [name] : [];
+        if (typeof name !== 'string' || !name)
+            return [];
+        return [typeof id === 'number' && Number.isSafeInteger(id) ? { id, name } : { name }];
     })
     : [];
+// A value is the same across phrases by its id, or by its spelling when WB gave none.
+const valueIdentity = ({ id, name }) => id ?? name;
 export const keptFilters = (filters) => filters.flatMap((filter) => {
     const key = filter.key;
     if (typeof key !== 'string')
@@ -44,7 +49,7 @@ export const keptFilters = (filters) => filters.flatMap((filter) => {
             key,
             isTop: filter.isTop === true,
             fullKey: typeof filter.fullKey === 'string' ? filter.fullKey : undefined,
-            values: valueNames(filter),
+            values: filterValues(filter),
         },
     ];
 });
@@ -66,8 +71,8 @@ export const completeFilters = (kept, fullFilters) => {
         if (!isTop)
             return { kind, name, key, complete: true, values };
         const full = fullFilters?.find((candidate) => candidate.key === key && candidate.isTop !== true);
-        const fullValues = full ? valueNames(full) : [];
-        // A full list without names would replace real values with nothing; keep the first values instead.
+        const fullValues = full ? filterValues(full) : [];
+        // A full list without readable values would replace real values with nothing; keep the first values instead.
         if (fullValues.length === 0) {
             missing += 1;
             return { kind, name, key, complete: false, values };
@@ -86,8 +91,8 @@ export const mergeFilters = (phraseFilters) => {
                 merged.set(filter.key, { ...filter, values: [...filter.values], queryCount: 1 });
                 continue;
             }
-            const known = new Set(current.values);
-            current.values.push(...filter.values.filter((value) => !known.has(value) && known.add(value)));
+            const known = new Set(current.values.map(valueIdentity));
+            current.values.push(...filter.values.filter((value) => !known.has(valueIdentity(value)) && known.add(valueIdentity(value))));
             current.complete = current.complete && filter.complete;
             current.queryCount += 1;
         }

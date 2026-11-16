@@ -2,7 +2,7 @@ import { ToolExecutionError } from '../../shared/coded-error.mjs';
 import { validTimeout } from '../../shared/timeouts.mjs';
 import { fieldOf, isBoundedText, isPositiveSafeInteger, isRecord, isUnknownArray } from '../../shared/values.mjs';
 import { MAX_BROWSER_JOB_TEXT_LENGTH, MAX_BROWSER_JOB_URL_LENGTH } from '../../transport/mcp/limits.mjs';
-import { MAX_FILTER_QUERIES, MAX_CHECK_PAGES_PER_QUERY, MAX_CHECK_QUERIES, MAX_CHECK_SEARCH_REQUESTS, MAX_PRODUCT_CARD_PRODUCTS, MAX_PRODUCT_CARD_REQUEST_UNITS, MAX_RECOMMENDATION_PAGES_PER_PRODUCT, MAX_RECOMMENDATION_REQUEST_UNITS, MAX_SEARCH_PAGES_PER_QUERY, MAX_SEARCH_REQUEST_UNITS, } from '../domain/constants/limits.const.mjs';
+import { CHECK_FILTER_KEY, MAX_FILTER_QUERIES, MAX_CHECK_FILTERS, MAX_CHECK_FILTER_VALUES, MAX_CHECK_PAGES_PER_QUERY, MAX_CHECK_QUERIES, MAX_CHECK_SEARCH_REQUESTS, MAX_PRODUCT_CARD_PRODUCTS, MAX_PRODUCT_CARD_REQUEST_UNITS, MAX_RECOMMENDATION_PAGES_PER_PRODUCT, MAX_RECOMMENDATION_REQUEST_UNITS, MAX_SEARCH_PAGES_PER_QUERY, MAX_SEARCH_REQUEST_UNITS, } from '../domain/constants/limits.const.mjs';
 import { buildCheckDescriptorUrl, buildDescriptorUrl, buildFiltersDescriptorUrl, fillTemplate, normalizeProductArticles, } from '../domain/converters/descriptor-urls.converter.mjs';
 import { isAllowedWbUrl } from '../domain/policies/wb-url.policy.mjs';
 // Parse boundary: a signed descriptor as the extension attested it; the checks below read it field by field.
@@ -53,6 +53,21 @@ const validUniqueQueries = (queries, maxQueries) => isUnknownArray(queries) &&
     queries.length <= maxQueries &&
     queries.every(queryText) &&
     new Set(queries).size === queries.length;
+const validCheckFilter = (filter) => isRecord(filter) &&
+    typeof filter.key === 'string' &&
+    CHECK_FILTER_KEY.test(filter.key) &&
+    isUnknownArray(filter.values) &&
+    filter.values.length >= 1 &&
+    filter.values.length <= MAX_CHECK_FILTER_VALUES &&
+    filter.values.every((value) => typeof value === 'number' && Number.isSafeInteger(value)) &&
+    new Set(filter.values).size === filter.values.length;
+// Absent for an unfiltered check; otherwise 1-MAX_CHECK_FILTERS filters with distinct keys.
+const validCheckFilters = (filters) => filters === undefined ||
+    (isUnknownArray(filters) &&
+        filters.length >= 1 &&
+        filters.length <= MAX_CHECK_FILTERS &&
+        filters.every(validCheckFilter) &&
+        new Set(filters.map(({ key }) => key)).size === filters.length);
 const cardUrlMatchesArticle = (cardUrl, article) => {
     try {
         return Number(new URL(cardUrl).searchParams.get('nm')) === article;
@@ -92,7 +107,7 @@ export const validateAuthorizedJobLimits = (authorization) => {
             return { jobType, job: { jobId, timeout, endpoint, params, queries } };
         }
         if (jobType === 'check_by_query') {
-            const { queries, article, cardUrl, endpoint, params, maxPages } = job;
+            const { queries, article, cardUrl, endpoint, params, maxPages, filters } = job;
             if (job.type !== 'wb-check-by-query')
                 throw brokenRule('type', 'Invalid check-by-query descriptor type');
             if (!isPositiveSafeInteger(article))
@@ -109,7 +124,9 @@ export const validateAuthorizedJobLimits = (authorization) => {
                 throw brokenRule('pages', `Browser check-by-query job requires exactly ${MAX_CHECK_PAGES_PER_QUERY} pages per query`);
             if (queries.length * maxPages > MAX_CHECK_SEARCH_REQUESTS)
                 throw brokenRule('requests', `Browser check-by-query job requires at most ${MAX_CHECK_SEARCH_REQUESTS} search requests`);
-            const checkJob = { jobId, timeout, article, cardUrl, endpoint, params, queries, maxPages };
+            if (!validCheckFilters(filters))
+                throw brokenRule('filters', `Browser check-by-query job requires 1-${MAX_CHECK_FILTERS} filters with distinct keys and 1-${MAX_CHECK_FILTER_VALUES} distinct value ids each`);
+            const checkJob = { jobId, timeout, article, cardUrl, endpoint, params, queries, maxPages, filters };
             if (!descriptorCheckPagesAllowed(checkJob, queries))
                 throw brokenRule('assembled_url', 'Invalid browser job assembled endpoint URL');
             return { jobType, job: checkJob };

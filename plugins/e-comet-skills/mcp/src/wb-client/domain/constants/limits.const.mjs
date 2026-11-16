@@ -8,6 +8,11 @@ export const SEARCH_CONCURRENCY = 4;
 export const MAX_CHECK_QUERIES = 100;
 export const MAX_CHECK_PAGES_PER_QUERY = 10;
 export const MAX_CHECK_SEARCH_REQUESTS = 1000;
+// A filtered check: at most this many filters, each with at most this many value ids. A key is a card characteristic
+// (`f` + digits) or the category filter; brand, seller, price and flag filters are not accepted.
+export const MAX_CHECK_FILTERS = 5;
+export const MAX_CHECK_FILTER_VALUES = 10;
+export const CHECK_FILTER_KEY = /^(?:f[0-9]{1,18}|xsubject)$/;
 // wb_filters_by_query: one filters request and at most one full-list request per phrase. A full-list request names at most
 // this many WB fullKey values (`ff` + at most 32 lower-case letters or digits), joined by ";".
 export const MAX_FILTER_QUERIES = 50;

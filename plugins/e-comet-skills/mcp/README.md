@@ -70,7 +70,8 @@ Local tools:
 
 - `wb_product_card` — discovers and executes signed live product-card requests;
 - `wb_search_by_query` — discovers and executes signed live WB search requests;
-- `wb_check_by_query` — checks whether one article appears in search for up to 100 phrases, without reporting a position;
+- `wb_check_by_query` — checks whether one article appears in search for up to 100 phrases, optionally under WB search
+  filters, without reporting a position;
 - `wb_filters_by_query` — returns the search-filter characteristics and categories, with complete value lists, for up
   to 50 phrases, merged by filter; the connected extension must support the job type;
 - `wb_recommendations_by_product` — discovers and executes signed recommendation-shelf requests;

@@ -193,6 +193,8 @@ const executeSearchJob = async ({ authorizationId, job, requestWbFetch, writer, 
 const executeCheckByQueryJob = async ({ authorizationId, job, requestWbFetch, writer }) => {
     // product_id is the public tool terminology; article is retained only in the signed wire descriptor.
     const productId = job.article;
+    // The signed search filters, echoed so the answer names the search it checked.
+    const appliedFilters = job.filters ? { filters: job.filters } : {};
     let cardResponse;
     try {
         cardResponse = await requestWbFetch(job.cardUrl, job.timeout ?? REQUEST_TIMEOUT_MS, authorizationId);
@@ -206,6 +208,7 @@ const executeCheckByQueryJob = async ({ authorizationId, job, requestWbFetch, wr
             status: 'failed',
             complete: false,
             product_id: productId,
+            ...appliedFilters,
             requestsMade: 1,
             queries: job.queries.map((query) => ({
                 query,
@@ -229,6 +232,7 @@ const executeCheckByQueryJob = async ({ authorizationId, job, requestWbFetch, wr
             complete: false,
             product_id: productId,
             product: cardProductIdentity(cardProduct, productId),
+            ...appliedFilters,
             requestsMade: 1,
             queries: job.queries.map((query) => ({
                 query,
@@ -310,6 +314,7 @@ const executeCheckByQueryJob = async ({ authorizationId, job, requestWbFetch, wr
         complete: successfulQueries === queries.length,
         product_id: productId,
         product: cardProductIdentity(cardProduct, productId),
+        ...appliedFilters,
         requestsMade: 1 + searchRequestsMade,
         queries,
     };

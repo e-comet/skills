@@ -16,6 +16,10 @@ export const buildCheckDescriptorUrl = (job, query, page, brandId) => {
     // Match front's checkAvailabilityForArticle flow: catalog search narrowed by the card-derived brand.
     url.searchParams.set('resultset', 'catalog');
     url.searchParams.set('fbrand', String(brandId));
+    // Signed search filters in the signer's order; the values of one filter widen it, as on WB (";" is written %3B). The
+    // extension rebuilds the same string; the contract's wbCheckByQueryFilters.urlFixtures pin it.
+    for (const { key, values } of job.filters ?? [])
+        url.searchParams.set(key, values.join(';'));
     return url.toString();
 };
 // The extension rebuilds the same string and admits it only on exact equality; the contract's wbFiltersByQuery.urlFixtures

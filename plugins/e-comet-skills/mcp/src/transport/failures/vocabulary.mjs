@@ -16,6 +16,7 @@ export const DESCRIPTOR_RULES = [
     'assembled_url',
     'product',
     'card_url',
+    'filters',
     'articles',
     'endpoints',
     'unique_products',

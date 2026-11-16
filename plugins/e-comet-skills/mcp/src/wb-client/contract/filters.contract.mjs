@@ -33,7 +33,7 @@ const filterSchema = object({
     name: string,
     key: string,
     complete: boolean,
-    values: array(string),
+    values: array(object({ id: integer, name: string }, ['name'])),
     queryCount: positiveInteger,
 }, ['kind', 'name', 'key', 'complete', 'values', 'queryCount']);
 const filtersSuccessSchema = object({
@@ -51,8 +51,8 @@ const filtersContract = 'Get the Wildberries search filters for 1-50 phrases: ev
     buyerOutcomeGuidance +
     rejectionAndHandoffGuidance +
     'Authorize with job {type:"filters_by_query",queries:[string,...]}; send 1-50 unique non-empty phrases as a shopper types them. ' +
-    "Read filters[]: one entry per filter across all phrases; values are WB's exact spellings in WB's order, the union over the phrases; queryCount counts the phrases that show the filter, and queries[].filterKeys lists the filters of each phrase. " +
-    'Quote values verbatim when advising what to fill in a card. complete:false means WB returned only the first values of that list: say the list may be longer. ' +
+    "Read filters[]: one entry per filter across all phrases; values[] are in WB's order, the union over the phrases, each with name, WB's exact spelling, and id, which wb_check_by_query takes with the filter key to check an article under that filter; queryCount counts the phrases that show the filter, and queries[].filterKeys lists the filters of each phrase. " +
+    'Quote names verbatim when advising what to fill in a card. complete:false means WB returned only the first values of that list: say the list may be longer. ' +
     'Per phrase, empty means WB found nothing for it; request_failed with WB_UNRELIABLE_RESPONSE means WB answered with decoy data, which was discarded; partial means some lists stayed truncated. Never present a failed phrase as one without filters. ' +
     'Brand, seller, price, delivery and yes/no filters are not returned. Which phrase showed which value is in the result file. Results are a current WB-session snapshot. ' +
     resultPathGuidance;
@@ -60,7 +60,7 @@ export const contract = {
     name: 'wb_filters_by_query',
     description: 'Get the WB search filters for phrases: every card characteristic with all its values, and the categories, as on the search page under «Все фильтры». ' +
         signedDiscovery('wb_filters_by_query', 'filters_by_query') +
-        "Never automatically repeat rate-limited work; retain partial results. Values are WB's exact spellings; complete:false means only the first values were returned. empty means WB found nothing for the phrase; a failed phrase is not a phrase without filters. " +
+        "Never automatically repeat rate-limited work; retain partial results. Value names are WB's exact spellings; complete:false means only the first values were returned. empty means WB found nothing for the phrase; a failed phrase is not a phrase without filters. " +
         completeContractGuidance,
     inputSchema: liveInputSchema(),
     outputSchema: withRunningAnswer(withOperationDiagnostic(objectUnion(...liveAggregateSchemas(filtersSuccessSchema), toolErrorSchema))),

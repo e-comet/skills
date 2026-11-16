@@ -25,14 +25,23 @@ export const BUYER_TOOLS = [
 ];
 // The authorization lease is built by this process; a wrong shape is an e-Comet defect, not the seller's.
 const leaseInvalid = () => new ToolExecutionError('BROWSER_JOB_LEASE_INVALID', 'The local MCP received an invalid browser job authorization lease; this is an e-Comet defect. Offer to report it; do not repeat browser_job.', 'local', false);
-// The e-Comet signer issues filters_by_query, so an extension refusing that job type (invalid_job/job_type) predates it. Without
-// this an outdated extension reads as our defect. Older WB jobs are known to every supported extension. The refusal details are
-// not passed on: DIAGNOSTICS.md reads invalid_job as our defect, which would contradict the update advice.
+// The e-Comet signer issues filters_by_query and filtered check_by_query jobs, so an extension refusing that job type
+// (invalid_job/job_type) or a check descriptor (invalid_job/descriptor_shape: its schema is strict, so `filters` is unknown to
+// it) predates them. Without this an outdated extension reads as our defect. Older WB jobs are known to every supported
+// extension. The refusal details are not passed on: DIAGNOSTICS.md reads invalid_job as our defect, which would contradict
+// the update advice.
+// ponytail: any descriptor_shape refusal of a check reads as outdated, so a broken signed check would also ask for an update
+// (accepted residual); gate on an extension capability if that ever happens.
+const OUTDATED_EXTENSION_REFUSALS = {
+    wb_filters_by_query: { diagnostic: 'job_type', feature: 'wb_filters_by_query' },
+    wb_check_by_query: { diagnostic: 'descriptor_shape', feature: 'search filters in wb_check_by_query' },
+};
 const outdatedExtensionForJobType = (toolName, error) => {
     const rejection = browserJobRejectionDetails(error)?.browserJobRejection;
-    if (toolName !== 'wb_filters_by_query' || rejection?.reason !== 'invalid_job' || rejection.diagnostic !== 'job_type')
+    const outdated = Object.hasOwn(OUTDATED_EXTENSION_REFUSALS, toolName) ? OUTDATED_EXTENSION_REFUSALS[toolName] : undefined;
+    if (!outdated || rejection?.reason !== 'invalid_job' || rejection.diagnostic !== outdated.diagnostic)
         return error;
-    return new ToolExecutionError('EXTENSION_UPDATE_REQUIRED', `The connected e-Comet extension does not support ${toolName}. Update the e-Comet extension at ${EXTENSION_UPDATE_URL}, then request a new authorization and retry.`, 'extension', false, { cause: error });
+    return new ToolExecutionError('EXTENSION_UPDATE_REQUIRED', `The connected e-Comet extension does not support ${outdated.feature}. Update the e-Comet extension at ${EXTENSION_UPDATE_URL}, then request a new authorization and retry.`, 'extension', false, { cause: error });
 };
 // Scope revocation occurs before the release route's acknowledgement can suspend, so the tool can safely deliver a
 // terminal result without letting an extension round trip delay it.
