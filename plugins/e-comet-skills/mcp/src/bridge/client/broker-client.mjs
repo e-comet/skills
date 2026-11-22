@@ -3,6 +3,7 @@
 // session closes. The nonce never leaves this module: not in entries it lists, log lines or session facts.
 import { join } from 'node:path';
 import { CLIENT_PROTOCOL_VERSION, MAX_FRAME_BYTES, MAX_HOST_TO_BROWSER_BYTES, createFrameReader, encodeFrame } from '../../native-framing.mjs';
+import { markRequestNotSent, ToolExecutionError } from '../../shared/coded-error.mjs';
 import { isRecord } from '../../shared/values.mjs';
 const ENTRY_NAME = /^(\d+)\.json$/;
 const RECORD_NAME = /^(\d+)\.failed$/;
@@ -176,12 +177,13 @@ export function createBrokerClient({ rendezvousDir, platform, pluginVersion, ins
                     send: (message) => {
                         const encoded = encodeFrame(message);
                         if (encoded.readUInt32LE(0) + PREFIX_ALLOWANCE_BYTES > MAX_HOST_TO_BROWSER_BYTES) {
-                            throw Object.assign(new Error(`The frame is over the ${MAX_HOST_TO_BROWSER_BYTES}-byte browser limit.`), {
+                            throw markRequestNotSent(Object.assign(new Error(`The frame is over the ${MAX_HOST_TO_BROWSER_BYTES}-byte browser limit.`), {
                                 code: 'FRAME_TOO_LARGE',
-                            });
+                            }));
                         }
-                        if (!socket.destroyed)
-                            socket.write(encoded);
+                        if (socket.destroyed)
+                            throw markRequestNotSent(new ToolExecutionError('EXTENSION_DISCONNECTED', 'The broker connection closed before sending the request.', 'extension', true));
+                        socket.write(encoded);
                     },
                     close: () => socket.destroy(),
                     facts: {

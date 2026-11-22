@@ -35,7 +35,8 @@ export const createOperationDiagnostics = ({ now = Date.now, randomUUID, } = {})
 const fieldsOf = (value) => (isRecord(value) ? value : {});
 const listOf = (value) => (Array.isArray(value) ? value : []);
 export const operationFactsFromResult = (toolName, result) => {
-    const value = fieldsOf(fieldsOf(result).structuredContent);
+    const envelope = fieldsOf(result);
+    const value = fieldsOf(envelope.structuredContent);
     const error = fieldsOf(value.error ?? value);
     const code = error.code;
     // Every result of ours names its stage in text.
@@ -112,11 +113,13 @@ export const decorateOperationResult = (result, receipt) => {
     return { ...result, content, structuredContent };
 };
 // Records a tool's receipt and puts its disposition on the result. A diagnostic must never replace the business result.
-export const withReceipt = (diagnostics, toolName, result) => {
+export const withReceipt = (diagnostics, toolName, result, projectFacts) => {
     if (RECEIPT_EXEMPT_TOOLS.includes(toolName))
         return result;
     try {
-        return decorateOperationResult(result, diagnostics.record(operationFactsFromResult(toolName, result)));
+        const defaults = operationFactsFromResult(toolName, result);
+        const facts = projectFacts === undefined ? defaults : projectFacts(result, defaults);
+        return decorateOperationResult(result, diagnostics.record(facts));
     }
     catch {
         return result;

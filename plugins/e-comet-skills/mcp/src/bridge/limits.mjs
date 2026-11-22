@@ -4,10 +4,7 @@ import { EXTENSION_ORIGIN } from '../native-framing.mjs';
 // Cabinet restoration can include a portal ping, activation/reload and a retry. Keep its acknowledgement
 // budget independent from the shorter per-request default so a successful export is not reported failed early.
 export const AUTHORIZATION_RELEASE_TIMEOUT_MS = 75_000;
-// Расширение отсчитывает свой таймаут от момента получения wb_fetch, то есть позже
-// нас. Без запаса наш таймер всегда срабатывал первым, и типизированный
-// WB_FETCH_TIMEOUT не доезжал до агента никогда.
-export const REQUEST_TIMEOUT_GRACE_MS = 2000;
+export { REQUEST_TIMEOUT_GRACE_MS } from '../shared/timeouts.mjs';
 export const AUTHORIZATION_SCOPE_MAX_MS = 10 * 60 * 1000;
 export const MAX_ACTIVE_AUTHORIZATION_SCOPES = 32;
 // Bounds for reading the extension's own connection log from a browser profile on disk (profile/leveldb.mts), on the

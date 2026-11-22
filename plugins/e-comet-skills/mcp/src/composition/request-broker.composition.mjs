@@ -7,13 +7,19 @@ import { ToolExecutionError } from '../shared/coded-error.mjs';
 import { REQUEST_TIMEOUT_MS } from '../shared/timeouts.mjs';
 import { MESSAGE_TYPES, SELLER_SCOPE_DURATION_MS } from '../transport/extension/wire.mjs';
 import { safeFeedbackProperty } from '../transport/failures/evidence.mjs';
-import { SELLER_OPERATION } from '../wb-seller/out/extension/operations.mjs';
+import { pendingComparisonStage, SELLER_OPERATION } from '../wb-seller/out/extension/operations.mjs';
 // The family half of the request broker: the WB fetch, the seller operations and the Ozon operations are wb-client's,
 // wb-seller's and ozon-seller's adapters (out/extension), each a caller of the correlation broker's `open` with a frame
 // handler (bridge/broker/correlation.mjs). The WB fetch and seller frames are routed here, the Ozon ones through the Ozon
 // adapters' own route, and every family frame is delivered here by its id. A seller export and an Ozon package drive many
 // reports through one scope, so they get the longer scope ceiling.
-const LONG_SCOPE_JOB_TYPES = ['seller_reviews', 'ozon_seller_promotion_reports', 'ozon_seller_analytics_report', 'ozon_search_positions'];
+const LONG_SCOPE_JOB_TYPES = [
+    'seller_reviews',
+    'seller_card_comparison',
+    'ozon_seller_promotion_reports',
+    'ozon_seller_analytics_report',
+    'ozon_search_positions',
+];
 // The request types of the families; the session requests use the wire's message types.
 const WB_FETCH = MESSAGE_TYPES.wbFetch;
 // What each family's route receives besides the request id.
@@ -112,6 +118,9 @@ export class RequestBroker {
     hasPendingAuthorizationRelease(requestId) {
         return this.correlation.has(requestId, MESSAGE_TYPES.browserJobAuthorizationRelease);
     }
+    hasPendingComparisonOperation(requestId) {
+        return pendingComparisonStage(this.correlation, requestId) !== undefined;
+    }
     hasPendingSellerOperation(requestId) {
         return this.correlation.has(requestId, SELLER_OPERATION);
     }
@@ -184,7 +193,7 @@ export class RequestBroker {
         return this.#deliver(MESSAGE_TYPES.browserJobAuthorizationRelease, 'authorization-release-error', requestId, safeFeedbackProperty(error, 'code'), { type: 'error', payload: error });
     }
     // The job's lease: the correlation broker's binding (its id, scope, attested job type, signed job and expiry), the grant,
-    // whether the scope is still active, its release.
+    // whether the scope is still active, and its release methods.
     requestAuthorization(token, timeout = this.defaultTimeout) {
         return this.correlation.requestAuthorization(token, timeout).then((lease) => ({
             id: lease.id,
@@ -195,6 +204,7 @@ export class RequestBroker {
             authorization: lease.authorization,
             isActive: lease.isActive,
             release: lease.release,
+            releaseAndWait: lease.releaseAndWait,
         }));
     }
     requestAuthorizationRelease(authorizationId, route, timeout = this.authorizationReleaseTimeout) {

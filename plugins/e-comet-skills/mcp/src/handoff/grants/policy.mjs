@@ -19,6 +19,8 @@ export const LOCAL_TOOL_BY_BROWSER_JOB_TYPE = {
     filters_by_query: 'wb_filters_by_query',
     recommendations_by_product: 'wb_recommendations_by_product',
     seller_reviews: 'wb_seller_reviews',
+    seller_card_comparison: 'wb_seller_card_comparison',
+    seller_list_orgs: 'wb_seller_list_orgs',
     ozon_seller_promotion_report: 'ozon_seller_promotion_report',
     ozon_seller_promotion_reports: 'ozon_seller_promotion_reports',
     ozon_seller_analytics_report: 'ozon_seller_analytics_report',

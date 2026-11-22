@@ -455,13 +455,100 @@ errors, the extractor removes the exact `Error: ` wrapper and prefers the bridge
 before locating that delimiter and applies the same whole-object parsing and closed-field rules; malformed evidence
 contributes only the host error flag. Claude and Codex parsing is unchanged.
 
+## WB Seller company catalog
+
+`wb_seller_list_orgs` checks `wb_seller_list_orgs@1` on the connected extension. With `EXTENSION_UPDATE_REQUIRED`,
+follow the update step in the message. Use the canonical IDs for reviews or comparison when the seller explicitly
+chooses a company. `ENTITY_SELECTION_REQUIRED` with `details.reason:"multiple_seller_documents"` calls for leaving
+one Wildberries Seller tab in the connected profile and waiting until it loads. For `SELLER_CABINET_UNAUTHORIZED`
+open the cabinet in that browser and check sign-in.
+HTTP 429 stops the read with `reason:"rate_limited"` and `details.httpStatus:429`. A validation failure returns
+`reason:"response_invalid"` and can be reported to e-Comet. The passive operation diagnostic preserves either
+reason when read by its receipt handle.
+
+Both the catalog and comparison tools use the same cabinet recovery steps.
+
+- `SELLER_PORT_UNAVAILABLE` means the extension had no usable Seller tab for the operation. Open
+  `seller.wildberries.ru` in the connected browser profile, or refresh the tab if it is already open. Wait for
+  the cabinet and company menu to load.
+- `ENTITY_CATALOG_UNAVAILABLE` means the extension could not read the current company list. Use the same tab step
+  and keep the observed `details.httpStatus` when present.
+- `SELLER_CONTEXT_CHANGED` means the selected cabinet changed or its tab became unavailable during the operation.
+  If the tab was closed, reopen `seller.wildberries.ru` in the connected browser profile. Check the active company
+  in Wildberries Seller and confirm which cabinet the seller wants to use.
+
+Wait for the seller’s decision before requesting a fresh `browser_job` after the step. If a comparison or order
+may already have reached WB, use the recorded write outcomes to recover that work first.
+
+If `releaseError` accompanies a catalog, use the returned choices. `EXTENSION_DISCONNECTED` and
+`BROWSER_JOB_AUTHORIZATION_RELEASE_TIMEOUT` give the observed connection loss or deadline while waiting for
+confirmation that the read-only authorization was closed. Other release errors also mean closure was unconfirmed.
+
+## WB Seller card comparison
+
+The tool checks `wb_seller_card_comparison@1` from the connected extension's hello before sending the signed
+job. `EXTENSION_UPDATE_REQUIRED` on this tool means that hello omitted the capability. Update the extension or
+apply an already-downloaded update as the error message says. A `BRIDGE_*` result gives the observed connection
+problem. `LOCAL_STORAGE_UNAVAILABLE` on an export means its configured artifact target could not be resolved
+before any cabinet operation. Check `local_bridge_status.storage.marketplaceArtifacts` for the reason.
+
+- For `SELLER_PORT_UNAVAILABLE`, `ENTITY_CATALOG_UNAVAILABLE` or `SELLER_CONTEXT_CHANGED`, use the same
+  [cabinet recovery steps](#wb-seller-company-catalog) as the company catalog.
+- `ENTITY_SELECTION_REQUIRED` with `details.reason:"multiple_seller_documents"` means the extension could not
+  establish a current Seller document from the eligible tabs. Leave one Wildberries Seller tab in the connected
+  profile and wait until it loads. A duplicate company name within one catalog calls for its canonical ID from
+  `wb_seller_list_orgs`.
+- With `details.reason:"comparison_orphan"`, leave one ready Wildberries Seller tab. Ask the seller to choose
+  a company before authorizing with explicit `org`, or ask them to select a different company manually in the cabinet.
+- For `period_out_of_range`, show the inclusive dates in `periodWindow` and ask the seller to choose dates within
+  it. For `period_unavailable`, offer the today, week, month and quarter buttons or the exact dates of one button.
+  Both refusals occur before writes.
+- For `access_unknown`, follow the message. When only calendar access is unconfirmed, ask the seller to check
+  which periods their WB Seller cabinet offers before choosing dates. For `cards_unavailable`, report the full
+  article set. Keep the signed request intact until the seller chooses a change.
+- For `access_denied`, explain the confirmed refusal for the chosen company. If both write outcomes are `not_sent`,
+  offer another company from the current seller catalog. Wait for the seller’s explicit choice before requesting a fresh signed export.
+- With `compare/new_comparison_required`, read `comparisonLimits` when present, including zero. If the observed
+  balance permits a new comparison, ask permission to use it. `compare/comparison_limit` can include that balance.
+  For `create_xlsx/new_comparison_required`, the saved comparison is no longer reusable. For `comparison_limit`,
+  `export_limit` or `wb_refused`, report the refusal and preserve the article set.
+- With `compare/history_charge_required`, WB reported that the saved comparison is no longer free to reopen.
+  Relay the observed `comparisonLimits` and both unsent outcomes. With a history-only grant and an observed usable
+  balance, ask if the seller wants one charged comparison. If the grant already allowed creation, report the
+  terminal refusal and let the seller decide the next step.
+- For `SELLER_STATE_UNAVAILABLE`, follow `details.reason`. Ask the seller to restart the browser for `storage_failed`
+  and offer to report a recurring failure. For `probe_cooling_down`, ask them to wait a few seconds. For
+  `restore_unresolved`, ask them to check the active company. An absent reason leaves the state unverified.
+- `rate_limited` means WB returned HTTP 429 and the job stopped. `outcome_unknown` leaves the indicated write
+  uncertain. Compare and Excel order have separate `createOutcome` and `orderOutcome` fields. After expiry or a
+  transport loss, a possible order goes to Downloads (Загрузки) in the selected company using the pinned report
+  metadata if available. A possible comparison without an order goes to comparison history. When the detail
+  read fails after confirmed creation, show the known company, selected dates and the unsent order, then
+  check comparison history. Preserve the requested `sizeDetails` alongside the dates during recovery.
+- For `report_failed` or `download_refused`, report what WB confirmed about the pinned file and follow the same
+  Downloads step.
+- For `response_invalid`, e-Comet could not validate the response at the reported stage. The cause is unknown.
+  Preserve any known progress and offer to share the stage and code with e-Comet support.
+- `SELLER_STREAM_INVALID` means the workbook stream failed validation. Preserve the known file and offer to share
+  the stage and code with e-Comet support.
+- `SELLER_OPERATION_FAILED` with `details.reason` set to `stream_deadline_expired` means local workbook stream
+  delivery exceeded its deadline. Preserve the known file and follow the same Downloads step.
+- `ARTIFACT_REJECTED` after download preserves a known WB file. Size, integrity or format failures have no corrective
+  workbook-generation step. For `LOCAL_STORAGE_FAILED` use the closed `details.systemCode`. Recover an already
+  published workbook by its exact resource link even if cabinet restoration or the file copy failed.
+- A comparison `releaseError` means cabinet restoration could not be confirmed. Ask the seller to check the
+  active company and keep any completed workbook.
+- The comparison receipts preserve the terminal stage and report partial work or an uncertain write as applicable.
+  Reuse the same `runId` while running. After an interrupted run recover existing work before discussing another
+  order. A new comparison or Excel order needs the seller's specific decision.
+
 ## Failure details and the next step
 
 Each failure below gives its next step and owner in the message; the closed fields beside it are for receipts and
 reports. An extension or answer without the field keeps the earlier message. No field carries a token, header value,
 marketplace body or seller data.
 
-- `BROWSER_JOB_REAUTHORIZATION_REQUIRED` has `details.reason`: `expired` (one authorization lasts at most 10 minutes for
+- For buyer jobs and review packages, `BROWSER_JOB_REAUTHORIZATION_REQUIRED` has `details.reason`: `expired` (one authorization lasts at most 10 minutes for
   WB jobs, so split the remaining work into smaller jobs, one authorization each), `route_changed` (the bridge
   connection changed: one fresh authorization for the remaining work), or `released` (the job had already ended).
 - A WB job stopped mid-run by an authorization or extension failure adds `details.completed` (WB requests answered;
@@ -479,6 +566,9 @@ marketplace body or seller data.
   rate limit: the user keeps one Wildberries store tab, closes the other store tabs but not the seller portal, and
   switches to that tab so it is in front, then retry); such a page without another code reads
   `errorDetails.code:"WB_REQUEST_FAILED"`. A failed `wb_check_by_query` or `wb_filters_by_query` row keeps the answer's `httpStatus`.
+- For a reviews export with `ENTITY_SELECTION_REQUIRED` and `error.details.reason:"comparison_orphan"`, the original
+  comparison tab is unavailable. In one ready Wildberries Seller tab, ask the seller to select a different company
+  manually and leave it selected. Ask whether to continue before authorizing the requested reviews.
 - A Seller export `error.details.reason` is, for `SELLER_STATE_UNAVAILABLE`: `probe_cooling_down` (wait a few seconds,
   then one fresh authorization), `restore_unresolved` (the user checks which company is selected in the seller portal)
   or `storage_failed` (the user restarts the browser; report if it repeats, since a full extension storage quota
@@ -487,13 +577,13 @@ marketplace body or seller data.
 - A Seller failure the cabinet page classified has `error.details.class`: `network` (no answer from Wildberries),
   `status` (with `httpStatus`), `envelope` (with `wbRefused:true` when Wildberries answered `error:true`) or `script`,
   and `wbRefused`. A create Wildberries refused that way is a known failure, not `REPORT_CREATE_OUTCOME_UNKNOWN`.
-- A Seller workbook the local disk refused is `LOCAL_STORAGE_FAILED` (`stage:"storage"`) with `details.class:"disk"`
+- A Seller review workbook the local disk refused is `LOCAL_STORAGE_FAILED` (`stage:"storage"`) with `details.class:"disk"`
   and `systemCode`, and the message names the step. Only `ENOSPC` and `EDQUOT` (free space) are the user's own; for
   `EACCES`, `EPERM`, `EROFS`, `ENOTDIR` and `EEXIST` the user checks access only to a custom e-Comet output folder they
   set, and otherwise the agent offers a report: e-Comet chooses the folder, and a seller cannot see it. `JOB_ARTIFACT_QUOTA_EXCEEDED` is `retryable:false` with
   `details.class:"limit"` and stops the remaining exports: the same request cannot fit, so the agent splits it into
   smaller jobs.
-- A Seller status poll Wildberries answered in an unrecognized shape stops the export at once:
+- A Seller review status poll Wildberries answered in an unrecognized shape stops the export at once:
   `stopReason:"unrecognized_response"` and `SELLER_RESPONSE_INVALID` (`retryable:false`), an e-Comet defect to report.
 - Ozon `ARTIFACT_REJECTED` from a local workbook write has `details.class` and a message with its step: `disk` (with
   `systemCode` and the same steps as a Seller `LOCAL_STORAGE_FAILED`), `limit` (the job's workbooks exceed

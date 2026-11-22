@@ -53,7 +53,9 @@ const sellerReviewsContract = 'Original WB seller-review XLSX. ' +
     'Omitted dates mean all time; otherwise both inclusive YYYY-MM-DD dates. ' +
     'Omitted isAnswered produces separate answered and unanswered workbooks. ' +
     'Omit org for active seller company; another requires explicit user choice and one signed {id} or exact {name}. ' +
+    'To show available WB companies or resolve a canonical WB ID, call wb_seller_list_orgs with its own signed job first. ' +
     'For legacy-restoration ENTITY_SELECTION_REQUIRED, ask company, then reauthorize explicitly; never guess. ' +
+    'For ENTITY_SELECTION_REQUIRED with details.reason=comparison_orphan, use one ready Wildberries Seller tab and have the seller select a different company manually. Ask whether to continue before authorizing the requested reviews. ' +
     "SELLER_LOGIN_REQUIRED means no signed-in seller cabinet tab: the user opens seller.wildberries.ru in the browser where the extension is connected and signs in; then one fresh browser_job on the user's decision. " +
     "SELLER_AUTH_UNAVAILABLE with reason access_token_missing, seller_token_missing or both_missing: the user reloads the seller portal tab and signs in if it asks, then one fresh browser_job on the user's decision; the same reason again, header_too_long or reader_failed is an e-Comet defect to report, never repeated. " +
     'stopReason "unrecognized_response" with SELLER_RESPONSE_INVALID: WB answered the report status in a shape e-Comet does not recognize; no user step, an e-Comet defect to report, never repeated. ' +

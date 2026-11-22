@@ -4,9 +4,9 @@
 // and pong live in broker.mjs.
 import { safeExternalToolError } from './sanitize.mjs';
 import { bridgeCauseError } from '../cause.mjs';
-import { ToolExecutionError } from '../../shared/coded-error.mjs';
+import { markRequestNotSent, ToolExecutionError } from '../../shared/coded-error.mjs';
 import { hasOnlyOwnKeys, isNonNegativeSafeInteger, isOneOf, isRecord } from '../../shared/values.mjs';
-import { DIAGNOSTIC_SNAPSHOT_CAPABILITY, DIAGNOSTIC_SNAPSHOT_V2_CAPABILITY, EXTENSION_TO_CLIENT_MESSAGE_TYPES, localMessage, MESSAGE_TYPES, OZON_ANALYTICS_CAPABILITY, OZON_PROMOTION_CAPABILITY, OZON_PROMOTION_PACKAGE_CAPABILITY, OZON_SEARCH_POSITIONS_CAPABILITY, PENDING_UPDATE_VERSION_PATTERN, } from '../../transport/extension/wire.mjs';
+import { DIAGNOSTIC_SNAPSHOT_CAPABILITY, DIAGNOSTIC_SNAPSHOT_V2_CAPABILITY, EXTENSION_TO_CLIENT_MESSAGE_TYPES, localMessage, MESSAGE_TYPES, OZON_ANALYTICS_CAPABILITY, OZON_PROMOTION_CAPABILITY, OZON_PROMOTION_PACKAGE_CAPABILITY, OZON_SEARCH_POSITIONS_CAPABILITY, PENDING_UPDATE_VERSION_PATTERN, SELLER_CARD_COMPARISON_CAPABILITY, SELLER_LIST_ORGS_CAPABILITY, } from '../../transport/extension/wire.mjs';
 import { parseBrowserJobRejection } from '../../transport/failures/rejection.mjs';
 // The frame checks the family validators share.
 export const MAX_ID_LENGTH = 128;
@@ -101,11 +101,11 @@ export const bridgeFrameRefusal = (refusalCode) => {
     const refusal = typeof refusalCode === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(refusalCode) ? refusalCode : 'UNKNOWN';
     const error = bridgeCauseError({ code: 'BRIDGE_FRAME_TOO_LARGE', refusal });
     error.details = { refusalCode: refusal };
-    return error;
+    return markRequestNotSent(error);
 };
 // Nothing reached the extension, so one retry is safe.
 const DISCONNECTED_RETRY = 'Retry once; if it repeats, check local_bridge_status.';
-export const extensionDisconnectedError = (what = 'The e-Comet extension is not connected to this agent.') => new ToolExecutionError('EXTENSION_DISCONNECTED', `${what} ${DISCONNECTED_RETRY}`, 'extension', true);
+export const extensionDisconnectedError = (what = 'The e-Comet extension is not connected to this agent.') => markRequestNotSent(new ToolExecutionError('EXTENSION_DISCONNECTED', `${what} ${DISCONNECTED_RETRY}`, 'extension', true));
 // The extension may have applied the request already, so this text never invites repeating a create.
 const extensionDisconnectedInFlightError = () => new ToolExecutionError('EXTENSION_DISCONNECTED', 'The browser connection closed while the request was running; check local_bridge_status. A read can be repeated, ' +
     "but do not repeat a report create without the user's decision.", 'extension', true);
@@ -143,6 +143,8 @@ export const createSessionMessages = ({ connections, requestBroker, log, broadca
         const capabilities = Array.isArray(announced.capabilities) ? announced.capabilities : [];
         const previous = connections.connectExtension(session, {
             browserJobSupported: capabilities.includes('browser_job'),
+            sellerCardComparisonSupported: capabilities.includes(SELLER_CARD_COMPARISON_CAPABILITY),
+            sellerListOrgsSupported: capabilities.includes(SELLER_LIST_ORGS_CAPABILITY),
             ozonSellerPromotionReportSupported: capabilities.includes(OZON_PROMOTION_CAPABILITY),
             ozonSellerPromotionReportsSupported: capabilities.includes(OZON_PROMOTION_PACKAGE_CAPABILITY),
             ozonSellerAnalyticsReportSupported: capabilities.includes(OZON_ANALYTICS_CAPABILITY),

@@ -64,13 +64,13 @@ registerTools = (_registry) => [], }) => {
     const runs = createRunRegistry({ now, randomUUID: createUuid, waitMs: runWaitMs, retentionMs: runRetentionMs });
     // A bridge tool's handler answers to its run key; every other answer goes out as before.
     const sendResult = (id, result) => runs.settle(id, result) || sendMcpResult(id, result);
-    const sendOperationResult = async (id, toolName, result) => sendResult(id, withReceipt(operationDiagnostics, toolName, result));
+    const sendOperationResult = async (id, toolName, result, projectFacts) => sendResult(id, withReceipt(operationDiagnostics, toolName, result, projectFacts));
     // `needsBridge` declares which operational tools depend on the bridge, so the wake-up is applied once at
     // the dispatch point below instead of being remembered inside each handler. A tool added without the flag
     // never nudges; a tool added with it cannot forget to. `local_bridge_status` is deliberately false because
     // its read-only contract forbids a diagnostic call from starting a connect attempt.
     const registry = {
-        answer: (toolName) => (id, result) => sendOperationResult(id, toolName, result),
+        answer: (toolName, projectFacts) => (id, result) => sendOperationResult(id, toolName, result, projectFacts),
         bridgeStatus: currentBridgeStatus,
         clientName: () => router.session.clientInfo?.name,
         operationDiagnostics,

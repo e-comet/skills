@@ -76,6 +76,8 @@ Local tools:
   to 50 phrases, merged by filter; the connected extension must support the job type;
 - `wb_recommendations_by_product` — discovers and executes signed recommendation-shelf requests;
 - `wb_seller_reviews` — exports original WB seller-review XLSX reports through the authenticated seller portal;
+- `wb_seller_list_orgs` — lists WB Seller companies and their canonical IDs for reviews and card comparison.
+- `wb_seller_card_comparison` — exports the original card-comparison XLSX for a signed set of 2–5 articles in the active or explicitly selected company.
 - `prepare_e_comet_feedback` — prepares one local e-Comet issue-report archive after explicit user consent;
 - `submit_e_comet_feedback` — uploads one prepared feedback archive with a trusted one-use grant;
 - `ozon_seller_promotion_report` — exports one Ozon Seller promotion analytics XLSX report for one inclusive period;
@@ -93,10 +95,10 @@ Local tools:
 
 ## Workflow contract lookup
 
-The short `tools/list` catalog routes by intent; `describe_e_comet_tool({name})` returns the full current contract for exactly these ten signed local tools:
+The short `tools/list` catalog routes by intent; `describe_e_comet_tool({name})` returns the full current contract for exactly these eleven signed local tools:
 
 - `wb_product_card`, `wb_search_by_query`, `wb_check_by_query`, `wb_filters_by_query`, `wb_recommendations_by_product`,
-  `wb_seller_reviews`;
+  `wb_seller_list_orgs`, `wb_seller_reviews`, `wb_seller_card_comparison`;
 - `ozon_seller_promotion_report`, `ozon_seller_promotion_reports`, `ozon_seller_analytics_report`,
   `ozon_search_positions`.
 

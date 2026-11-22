@@ -8,6 +8,8 @@ export class ConnectionState {
     extensionOzonPromotionPackageReady = false;
     extensionOzonAnalyticsReady = false;
     extensionOzonSearchPositionsReady = false;
+    extensionSellerCardComparisonReady = false;
+    extensionSellerListOrgsReady = false;
     extensionDiagnosticSnapshotReady = false;
     extensionDiagnosticSnapshotV2Ready = false;
     extensionLastConnectedAtMs = null;
@@ -29,6 +31,8 @@ export class ConnectionState {
         this.extensionOzonPromotionPackageReady = options.ozonSellerPromotionReportsSupported === true;
         this.extensionOzonAnalyticsReady = options.ozonSellerAnalyticsReportSupported === true;
         this.extensionOzonSearchPositionsReady = options.ozonSearchPositionsSupported === true;
+        this.extensionSellerCardComparisonReady = options.sellerCardComparisonSupported === true;
+        this.extensionSellerListOrgsReady = options.sellerListOrgsSupported === true;
         this.extensionDiagnosticSnapshotReady = options.diagnosticSnapshotSupported === true;
         this.extensionDiagnosticSnapshotV2Ready = options.diagnosticSnapshotV2Supported === true;
         this.extensionVersion = options.version;
@@ -45,6 +49,8 @@ export class ConnectionState {
         this.extensionOzonPromotionPackageReady = false;
         this.extensionOzonAnalyticsReady = false;
         this.extensionOzonSearchPositionsReady = false;
+        this.extensionSellerCardComparisonReady = false;
+        this.extensionSellerListOrgsReady = false;
         this.extensionDiagnosticSnapshotReady = false;
         this.extensionDiagnosticSnapshotV2Ready = false;
         this.extensionLastDisconnectedAtMs = this.#now();

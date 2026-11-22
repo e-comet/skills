@@ -8,7 +8,7 @@ import { feedbackDiagnostics } from '../transport/failures/evidence.mjs';
 // grant store: files for the hooks, memory for DeepSeek's tool runtime.
 const MAX_HOOK_EVENT_BYTES = 1024 * 1024;
 const REMOTE_BROWSER_JOB_TOOL = /^mcp__.+__browser_job$/;
-const LOCAL_BROWSER_TOOL = /^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:wb_product_card|wb_search_by_query|wb_check_by_query|wb_filters_by_query|wb_recommendations_by_product|wb_seller_reviews|ozon_seller_promotion_report|ozon_seller_promotion_reports|ozon_seller_analytics_report|ozon_search_positions)$/;
+const LOCAL_BROWSER_TOOL = /^mcp__(?:(?:remote-devices__)?plugin_e-comet-skills_)?e[-_]comet[-_]local__(?:wb_product_card|wb_search_by_query|wb_check_by_query|wb_filters_by_query|wb_recommendations_by_product|wb_seller_list_orgs|wb_seller_reviews|wb_seller_card_comparison|ozon_seller_promotion_report|ozon_seller_promotion_reports|ozon_seller_analytics_report|ozon_search_positions)$/;
 const handoffRecovery = (code) => {
     // Refusals before claim consumption must not manufacture a second pending authorization.
     if (code === 'HANDOFF_COPY_REQUIRED')

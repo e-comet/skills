@@ -36,3 +36,19 @@ Adapter failures (`HANDOFF_*`, `ECOMET_*`, `MCP_CALL_FAILED`) arrive as a JSON o
 | `FEEDBACK_HOST_UNSUPPORTED` | Native approval or session history is unavailable in this deployment | State the limitation; no report can be prepared here. |
 
 The public upstream tool contracts define marketplace parameters and recovery rules. This skill changes host diagnostics, not those contracts.
+
+For `wb_seller_card_comparison`, use the [comparison diagnostics](../../../plugins/e-comet-skills/mcp/DIAGNOSTICS.md#wb-seller-card-comparison).
+For `wb_seller_list_orgs`, use the [company catalog diagnostics](../../../plugins/e-comet-skills/mcp/DIAGNOSTICS.md#wb-seller-company-catalog).
+For `SELLER_PORT_UNAVAILABLE` or `ENTITY_CATALOG_UNAVAILABLE` on either tool, ask the seller to open
+`seller.wildberries.ru` in the connected browser profile or refresh the open tab. Wait for the cabinet and company menu
+to load. For `SELLER_CONTEXT_CHANGED`, the selected cabinet changed or its tab became unavailable. If the tab was
+closed, ask the seller to reopen it in the connected profile. Check the active company with the seller and confirm
+which cabinet they want to use. Ask before requesting another `browser_job`.
+`multiple_seller_documents` means leave one Wildberries Seller tab in the connected profile and wait until it loads.
+For a comparison with `comparison_orphan`, use one ready Seller tab. Ask the seller to choose before authorizing with
+explicit `org`, or ask them to select a different company manually in the cabinet.
+For `period_out_of_range`, show `periodWindow`. For `period_unavailable`, offer the today, week, month and quarter
+buttons or their exact dates. If calendar access is unconfirmed, ask the seller to check the periods in their WB Seller cabinet.
+If a write may have happened, preserve the full article set, company, dates, requested `sizeDetails` and pinned file status. Use the existing workbook
+link or the same WB file in `Загрузки`. Use company history if only the comparison may have been created. A new order
+needs the seller's specific decision. Continue a running job with its existing `runId`.

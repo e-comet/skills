@@ -6,6 +6,7 @@ import { UUID_V4, isNonNegativeSafeInteger } from '../../shared/values.mjs';
 import { currentStorageLayout, requireStorageTarget } from '../files/layout.mjs';
 import { sweepExpired } from '../files/retention.mjs';
 import { ARTIFACT_MAX_CHUNK_BYTES, ARTIFACT_MAX_FILE_BYTES, ARTIFACT_MAX_JOB_BYTES, ARTIFACT_RETENTION_MS } from '../limits.mjs';
+import { extractComparisonWorkbook } from './comparison-archive.mjs';
 import { assertXlsxPackage } from './xlsx.mjs';
 // The one XLSX grammar of this root, today's and yesterday's: `<uuid>.xlsx` on Windows,
 // `<uuid>-<safe-name>` elsewhere (the safe name always ends in `.xlsx`), and that name plus `.part`
@@ -66,11 +67,12 @@ const decodeCanonicalBase64 = (base64Data, maxChunkBytes) => {
  * Sweeps exactly one root: the current artifacts root by default, or any directory the caller names.
  */
 export const pruneArtifacts = async ({ artifactDir = undefined, storageTarget = currentStorageLayout().marketplaceArtifacts, now = Date.now(), retentionMs = ARTIFACT_RETENTION_MS, } = {}) => sweepArtifacts(artifactDir ?? requireStorageTarget(storageTarget, 'marketplaceArtifacts'), { retentionMs, now });
-export const createArtifactWriter = async (options = {}) => {
+export const createArtifactWriter = async (options = {}, archiveSource) => {
     const { fileName, mimeType, artifactDir: configuredArtifactDir, maxChunkBytes = ARTIFACT_MAX_CHUNK_BYTES, maxFileBytes = ARTIFACT_MAX_FILE_BYTES, maxJobBytes = ARTIFACT_MAX_JOB_BYTES, 
     // One counter per call, created by the caller and shared by every writer of that call (spec
     // §4.2). A writer without one bounds only itself. Nothing outlives the call.
     jobBudget = { bytes: 0 }, retentionMs = ARTIFACT_RETENTION_MS, validateXlsx = false, signal, now = Date.now, } = options;
+    const maxStreamBytes = archiveSource?.maxArchiveBytes ?? maxFileBytes;
     const artifactDir = configuredArtifactDir ??
         requireStorageTarget(options.storageTarget ?? currentStorageLayout().marketplaceArtifacts, 'marketplaceArtifacts');
     if (typeof mimeType !== 'string' || mimeType.length === 0)
@@ -98,8 +100,15 @@ export const createArtifactWriter = async (options = {}) => {
     let writeChain = Promise.resolve();
     let nextIndex = 0;
     let byteCount = 0;
-    let jobByteCount = 0;
     const hash = createHash('sha256');
+    // Cross-writer callbacks sharing this budget are serialized by the package broker or WB export loop.
+    const assertJobBudget = (additionalBytes) => {
+        if (jobBudget.bytes + additionalBytes <= maxJobBytes)
+            return;
+        throw Object.assign(new ArtifactStoreError('JOB_ARTIFACT_QUOTA_EXCEEDED', `Artifact job quota exceeds the ${maxJobBytes}-byte limit`, {
+            retryable: false,
+        }), { artifactClass: 'limit' });
+    };
     let completed = false;
     let removal;
     // Own unfinished data only: a published workbook is immutable and survives any later abort.
@@ -107,8 +116,8 @@ export const createArtifactWriter = async (options = {}) => {
         removal ??= (async () => {
             if (completed)
                 return;
-            jobBudget.bytes -= jobByteCount;
-            jobByteCount = 0;
+            // The last accounted size belongs to this writer, including a successful archive replacement.
+            jobBudget.bytes -= byteCount;
             await rm(partialPath, { force: true });
             await rm(artifactPath, { force: true });
         })().catch(() => {
@@ -154,19 +163,13 @@ export const createArtifactWriter = async (options = {}) => {
                     const bytes = decodeCanonicalBase64(base64Data, maxChunkBytes);
                     if (bytes.length > maxChunkBytes)
                         throw rejected('format', `Artifact chunk exceeds the ${maxChunkBytes}-byte chunk limit`);
-                    if (byteCount + bytes.length > maxFileBytes)
-                        throw rejected('limit', `Artifact exceeds the ${maxFileBytes}-byte per-file limit`);
-                    // Cross-writer callbacks sharing this budget are serialized by the package broker
-                    // or WB export loop. Parallelizing them must revisit reservation before append.
-                    if (jobBudget.bytes + bytes.length > maxJobBytes) {
-                        // The same call cannot shrink its own workbooks, so a retry of it cannot succeed.
-                        throw Object.assign(new ArtifactStoreError('JOB_ARTIFACT_QUOTA_EXCEEDED', `Artifact job quota exceeds the ${maxJobBytes}-byte limit`, { retryable: false }), { artifactClass: 'limit' });
-                    }
+                    if (byteCount + bytes.length > maxStreamBytes)
+                        throw rejected('limit', `Artifact exceeds the ${maxStreamBytes}-byte per-file limit`);
+                    assertJobBudget(bytes.length);
                     assertNotAborted();
                     await appendFile(partialPath, bytes);
                     assertNotAborted();
                     jobBudget.bytes += bytes.length;
-                    jobByteCount += bytes.length;
                     byteCount += bytes.length;
                     hash.update(bytes);
                     nextIndex += 1;
@@ -189,14 +192,27 @@ export const createArtifactWriter = async (options = {}) => {
                     if (hash.digest('hex') !== sha256)
                         throw rejected('integrity', 'Artifact SHA-256 does not match written bytes');
                     assertNotAborted();
-                    if (validateXlsx) {
-                        const workbook = await readFile(partialPath);
+                    let publishedSha256 = sha256;
+                    if (archiveSource || validateXlsx) {
+                        const source = await readFile(partialPath);
                         assertNotAborted();
-                        try {
-                            assertXlsxPackage(workbook, { maxFileBytes });
+                        if (archiveSource) {
+                            const workbook = extractComparisonWorkbook(source, maxFileBytes);
+                            const sizeChange = workbook.length - byteCount;
+                            assertJobBudget(sizeChange);
+                            publishedSha256 = createHash('sha256').update(workbook).digest('hex');
+                            await writeFile(partialPath, workbook);
+                            assertNotAborted();
+                            byteCount = workbook.length;
+                            jobBudget.bytes += sizeChange;
                         }
-                        catch (error) {
-                            throw Object.assign(asError(error), { artifactClass: 'format' });
+                        else {
+                            try {
+                                assertXlsxPackage(source, { maxFileBytes });
+                            }
+                            catch (error) {
+                                throw Object.assign(asError(error), { artifactClass: 'format' });
+                            }
                         }
                     }
                     assertNotAborted();
@@ -216,7 +232,14 @@ export const createArtifactWriter = async (options = {}) => {
                     // Expired files can occupy space before this publication-driven sweep; that capacity
                     // boundary is accepted in docs/architecture/residuals/storage.md.
                     sweepArtifacts(artifactDir, { retentionMs, now: nowMs() });
-                    return { name, path: deliveredPath, uri: pathToFileURL(deliveredPath).href, mimeType, size: byteCount, sha256 };
+                    return {
+                        name,
+                        path: deliveredPath,
+                        uri: pathToFileURL(deliveredPath).href,
+                        mimeType,
+                        size: byteCount,
+                        sha256: publishedSha256,
+                    };
                 }
                 catch (error) {
                     await fail(error);

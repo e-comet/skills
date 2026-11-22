@@ -258,6 +258,9 @@ const handleMcpMessage = createMcpMessageHandler({
         }),
         ...wbSellerTools(registry, {
             ensureBroker: () => runtime.ensureBroker(),
+            sellerCardComparisonSupported: () => runtime.sellerCardComparisonSupported(),
+            sellerListOrgsSupported: () => runtime.sellerListOrgsSupported(),
+            shutdownSignal: shutdownController.signal,
             requestBrowserJobAuthorization,
             sellerOperations: createSellerOperations({ correlation: requestBroker.correlation }),
             reportOutputDirectory,

@@ -149,6 +149,11 @@ export const createExtensionProtocol = ({ connections, requestBroker, log, broad
         if (type !== MESSAGE_TYPES.wbFetchResult)
             return;
         const response = payload.response;
+        if (requestBroker.hasPendingComparisonOperation?.(id)) {
+            // The comparison adapter projects its stage-specific response, including both write outcomes.
+            requestBroker.resolveSellerOperation(id, response);
+            return;
+        }
         if (isRecord(response) && typeof response.error === 'string') {
             const code = typeof response.code === 'string' ? response.code : UNCLASSIFIED_FETCH_ERROR_CODE;
             const authorizationFailure = isOneOf(AUTHORIZATION_FETCH_ERROR_CODES, code);

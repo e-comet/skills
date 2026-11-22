@@ -22,3 +22,10 @@ export class ToolExecutionError extends Error {
         this.retryable = retryable;
     }
 }
+// Process-local evidence. This flag is never read from a wire error or serialized in an answer.
+const requestsRejectedBeforeSend = new WeakSet();
+export const markRequestNotSent = (error) => {
+    requestsRejectedBeforeSend.add(error);
+    return error;
+};
+export const isRequestNotSent = (error) => error instanceof Error && requestsRejectedBeforeSend.has(error);

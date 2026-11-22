@@ -1,7 +1,7 @@
 import { ToolExecutionError } from '../../shared/coded-error.mjs';
-import { isNonNegativeSafeInteger, isOneOf, isRecord } from '../../shared/values.mjs';
+import { isHttpStatus, isNonNegativeSafeInteger, isOneOf, isRecord } from '../../shared/values.mjs';
 import { BRIDGE_CODES } from '../diagnostics/bridge-codes.mjs';
-import { SELLER_FAILURE_CLASSES, SELLER_FAILURE_REASONS, WBAAS_RECOVERY_OUTCOMES, WB_FETCH_TIMEOUT_PHASES, } from '../extension/wire.mjs';
+import { COMPARISON_STREAM_DEADLINE, SELLER_FAILURE_CLASSES, SELLER_FAILURE_REASONS, WBAAS_RECOVERY_OUTCOMES, WB_FETCH_TIMEOUT_PHASES, } from '../extension/wire.mjs';
 // Closed rule names of a signed descriptor that broke a local limit (each context's validateAuthorizedJobLimits).
 export const DESCRIPTOR_RULES = [
     'descriptor',
@@ -59,10 +59,7 @@ export const closedFailureDetails = (value) => {
             details[key] = value[key];
     if (typeof value.wbRefused === 'boolean' && details.class !== undefined)
         details.wbRefused = value.wbRefused;
-    if (typeof value.httpStatus === 'number' &&
-        Number.isSafeInteger(value.httpStatus) &&
-        value.httpStatus >= 100 &&
-        value.httpStatus <= 599)
+    if (isHttpStatus(value.httpStatus))
         details.httpStatus = value.httpStatus;
     if (isNonNegativeSafeInteger(value.completed) && isNonNegativeSafeInteger(value.pending))
         Object.assign(details, { completed: value.completed, pending: value.pending });
@@ -168,6 +165,8 @@ const FETCH_GUIDANCE = {
     // A full extension storage quota survives the restart.
     'SELLER_STATE_UNAVAILABLE:storage_failed': 'The extension could not read or write its seller restoration state. No new seller operation was dispatched. ' +
         `Ask the user to restart the browser, ${AUTHORIZE_REMAINING} If it repeats, offer to report it.`,
+    'ENTITY_SELECTION_REQUIRED:comparison_orphan': 'The previous comparison tab is unavailable. In one ready Wildberries Seller tab, ask the seller to select a different company manually and leave it selected. ' +
+        'Ask whether they want to continue before requesting a fresh grant for the requested reviews.',
     // The extension reads the tokens from the page's storage, whose keys Wildberries has renamed before (2026-09-17): a
     // reason that survives a reload and a sign-in is ours. Accepted residual "A reasonless SELLER_AUTH_UNAVAILABLE gets no
     // step": docs/architecture/residuals/wildberries.md.
@@ -181,3 +180,97 @@ const FETCH_GUIDANCE = {
         'Offer to report it; do not repeat the export automatically.',
 };
 export const fetchFailureGuidance = (code, details) => FETCH_GUIDANCE[`${code}:${details?.phase ?? details?.reason}`];
+// Fixed messages for the comparison-only reasons and existing seller relay codes. Avoid forwarding page prose,
+// which may contain private data or package advice that cannot apply to one indivisible comparison.
+export const COMPARISON_FAILURE_MESSAGES = {
+    access_denied: 'Wildberries denied comparison or Excel access for the selected seller company.',
+    access_unknown: 'The extension could not establish the seller company’s access to comparison and Excel.',
+    period_out_of_range: 'The requested dates are outside the Wildberries comparison window for the seller browser’s local day.',
+    period_unavailable: 'This Wildberries company offers the today, week, month and quarter buttons. Choose one of those periods or its exact dates.',
+    cards_unavailable: 'Wildberries reported that one or more cards in the requested set are unavailable.',
+    new_comparison_required: 'The selected cards have no usable saved comparison for this request.',
+    history_charge_required: 'Wildberries reported that the saved comparison is no longer free to reopen. Reopening it would use the selected company’s comparison quota.',
+    comparison_limit: 'Wildberries reported that this seller company cannot create another comparison.',
+    export_limit: 'Wildberries reported that the seller company cannot order another Excel file.',
+    rate_limited: 'Wildberries rate limited this request (HTTP 429). The comparison job stopped.',
+    wb_refused: 'Wildberries refused this comparison operation.',
+    outcome_unknown: 'The result of the request sent to Wildberries could not be established.',
+    report_failed: 'Wildberries marked this Excel file as failed.',
+    response_invalid: 'The seller comparison response did not match the signed operation or the expected response format. Offer to report it to e-Comet.',
+    download_refused: 'The Excel file could not be downloaded from Wildberries.',
+};
+const sellerTabRecoveryStep = 'Open seller.wildberries.ru in the connected browser profile, or refresh the Wildberries Seller tab if it is already open. ' +
+    'Wait for the cabinet and company menu to load.';
+const COMPARISON_RELAY_MESSAGES = {
+    BROWSER_JOB_EXPIRED: 'Authorization expired before the comparison job finished.',
+    BROWSER_JOB_REQUIRED: 'The comparison authorization ended before the job finished.',
+    BROWSER_JOB_NOT_AUTHORIZED: 'The extension did not accept this comparison authorization.',
+    DUPLICATE_REQUEST_ID: 'This request is already in progress in the extension.',
+    TOO_MANY_PENDING_REQUESTS: 'The extension has too many pending requests.',
+    SESSION_CLOSED: 'The extension session closed during the comparison job.',
+    WB_FETCH_TIMEOUT: 'The seller cabinet did not answer this operation in time.',
+    SELLER_OPERATION_TIMEOUT: 'The seller operation deadline expired before dispatch.',
+    SELLER_OPERATION_NOT_AUTHORIZED: 'The extension refused this operation under the signed comparison scope.',
+    SELLER_OPERATION_FAILED: 'The admitted seller operation failed inside the extension.',
+    SELLER_OPERATION_RATE_LIMITED: 'The extension refused the operation because it arrived too soon after another seller operation.',
+    SELLER_PORT_UNAVAILABLE: 'No usable Wildberries Seller tab was available for this operation. ' + sellerTabRecoveryStep,
+    SELLER_LOGIN_REQUIRED: 'Open the Wildberries seller cabinet in the connected browser and sign in.',
+    SELLER_AUTH_UNAVAILABLE: 'The selected seller tab could not supply its authenticated cabinet session.',
+    SELLER_CABINET_UNAUTHORIZED: 'Wildberries did not accept the seller cabinet session.',
+    SELLER_CABINET_RATE_LIMITED: COMPARISON_FAILURE_MESSAGES.rate_limited,
+    SELLER_CONTEXT_CHANGED: 'The selected seller cabinet changed or its tab became unavailable during this operation. ' +
+        'If the tab was closed, reopen seller.wildberries.ru in the connected browser profile. ' +
+        'Check the active company in Wildberries Seller and confirm which cabinet you want to use.',
+    SELLER_STATE_UNAVAILABLE: 'The extension could not verify the Seller restoration state.',
+    SELLER_RESPONSE_INVALID: COMPARISON_FAILURE_MESSAGES.response_invalid,
+    ENTITY_CATALOG_UNAVAILABLE: 'The extension could not read a current list of seller companies. ' + sellerTabRecoveryStep,
+    ENTITY_SELECTION_REQUIRED: 'Choose the seller company explicitly by its canonical ID before authorizing an export. ' +
+        'If the ID is unknown, use wb_seller_list_orgs and ask the seller to choose from the returned catalog.',
+    ENTITY_NOT_AVAILABLE: 'The signed seller company is unavailable in the current Wildberries seller session.',
+};
+export const isComparisonRelayFailureCode = (code) => typeof code === 'string' && Object.hasOwn(COMPARISON_RELAY_MESSAGES, code);
+export const comparisonRelayFailureDetails = (code, reason) => {
+    const reasons = SELLER_FAILURE_REASONS;
+    if (isOneOf(reasons[code] ?? [], reason))
+        return { reason };
+};
+const COMPARISON_RESTORE_MESSAGES = {
+    storage_failed: 'The extension could not read or save the local Seller restoration state. Restart the browser. If it repeats, offer to report it to e-Comet.',
+    probe_cooling_down: 'Wait a few seconds before the extension can check restoration of the previous seller company again.',
+    restore_unresolved: 'The extension could not confirm restoration of the previous seller company. Check which company is active in the Wildberries Seller portal.',
+};
+export const comparisonRelayFailureMessage = (code, reason) => {
+    if (code === 'SELLER_STATE_UNAVAILABLE' && isOneOf(SELLER_FAILURE_REASONS.SELLER_STATE_UNAVAILABLE, reason)) {
+        return COMPARISON_RESTORE_MESSAGES[reason];
+    }
+    if (code === COMPARISON_STREAM_DEADLINE.code && reason === COMPARISON_STREAM_DEADLINE.reason) {
+        return 'The comparison workbook stream exceeded its local delivery deadline.';
+    }
+    if (code === 'ENTITY_SELECTION_REQUIRED' && reason === 'multiple_seller_documents') {
+        return ('More than one Wildberries Seller page connection is eligible. ' +
+            'Leave one Wildberries Seller tab in the connected profile and wait until it loads.');
+    }
+    if (code === 'ENTITY_SELECTION_REQUIRED' && reason === 'comparison_orphan') {
+        return ('The previous comparison tab is unavailable. Leave one ready Wildberries Seller tab in the connected profile. ' +
+            'Ask the seller to choose a company and authorize a new comparison with explicit org, or have them manually select a different company in the cabinet.');
+    }
+    return isComparisonRelayFailureCode(code) ? COMPARISON_RELAY_MESSAGES[code] : undefined;
+};
+const SELLER_CATALOG_FAILURE_MESSAGES = {
+    BROWSER_JOB_EXPIRED: 'The authorization expired before the seller company catalog could be read.',
+    BROWSER_JOB_NOT_AUTHORIZED: 'The extension did not accept this seller catalog authorization.',
+    BROWSER_JOB_REQUIRED: 'The seller catalog authorization ended before the read finished.',
+    BROWSER_JOB_REAUTHORIZATION_REQUIRED: 'The seller catalog authorization ended before the read finished.',
+    EXTENSION_DISCONNECTED: 'The browser connection closed before the seller company catalog was read.',
+    SELLER_OPERATION_NOT_AUTHORIZED: 'The extension refused the operation under the signed seller catalog scope.',
+    SELLER_CABINET_UNAUTHORIZED: 'Wildberries did not accept the Seller session. Open the cabinet in the connected browser and check sign-in.',
+};
+export const sellerCatalogFailureMessage = (code, reason) => {
+    if (reason === 'rate_limited')
+        return 'Wildberries rate limited the catalog request (HTTP 429). The read stopped.';
+    if (reason === 'response_invalid')
+        return 'The Wildberries Seller catalog response did not match the expected format. Offer to report it to e-Comet.';
+    return (SELLER_CATALOG_FAILURE_MESSAGES[code] ??
+        comparisonRelayFailureMessage(code, reason) ??
+        'The seller company catalog could not be read.');
+};

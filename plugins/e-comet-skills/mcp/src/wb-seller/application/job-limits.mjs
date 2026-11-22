@@ -1,6 +1,6 @@
 import { ToolExecutionError } from '../../shared/coded-error.mjs';
 import { validTimeout } from '../../shared/timeouts.mjs';
-import { fieldOf, hasOnlyOwnKeys, isBoundedText, isPositiveSafeInteger, isRecord, isUnknownArray } from '../../shared/values.mjs';
+import { fieldOf, hasOnlyOwnKeys, isBoundedText, isCanonicalIsoDay, isPositiveSafeInteger, isRecord, isUnknownArray, } from '../../shared/values.mjs';
 import { MAX_BROWSER_JOB_TEXT_LENGTH } from '../../transport/mcp/limits.mjs';
 import { MAX_SELLER_REVIEW_EXPORTS, MAX_SELLER_REVIEW_PHYSICAL_REPORTS } from '../domain/constants/limits.const.mjs';
 // Parse boundary: a signed descriptor as the extension attested it; the checks below read it field by field.
@@ -17,12 +17,6 @@ const invalidDescriptor = (cause) => {
     return error;
 };
 const boundedText = (value) => isBoundedText(value, MAX_BROWSER_JOB_TEXT_LENGTH);
-const validIsoDate = (value) => {
-    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value))
-        return false;
-    const date = new Date(`${value}T00:00:00.000Z`);
-    return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
-};
 const validSellerOrg = (org) => {
     if (org === undefined)
         return true;
@@ -45,7 +39,7 @@ const validSellerExport = (item) => isRecord(item) &&
     validSellerRatings(item.ratings) &&
     (item.content === undefined || item.content === 'media') &&
     ((item.dateFrom === undefined && item.dateTo === undefined) ||
-        (validIsoDate(item.dateFrom) && validIsoDate(item.dateTo) && item.dateFrom <= item.dateTo));
+        (isCanonicalIsoDay(item.dateFrom) && isCanonicalIsoDay(item.dateTo) && item.dateFrom <= item.dateTo));
 const sellerExportIdentity = (sellerExport) => JSON.stringify({
     product_id: sellerExport.product_id ?? null,
     dateFrom: sellerExport.dateFrom ?? null,

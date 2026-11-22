@@ -1,4 +1,4 @@
-import { hasExactOwnKeys, isOneOf, isRecord } from '../../shared/values.mjs';
+import { hasExactOwnKeys, hasOnlyOwnKeys, hasOwnKeys, isCanonicalIsoDay, isHttpStatus, isNonNegativeSafeInteger, isOneOf, isPositiveSafeInteger, isRecord, isUnknownArray, } from '../../shared/values.mjs';
 // Словарь протокола с расширением. Те же имена объявлены enum'ами в
 // расширении (src/local-agent-protocol.ts) и закреплены в
 // contracts/local-agent-contract.json, поэтому расхождение ловится контрактными
@@ -131,10 +131,141 @@ export const OZON_SEARCH_POSITIONS_TERMINAL_CODE_STAGES = {
     OPERATION_CANCELLED: 'cancelled',
     OPERATION_DEADLINE_EXCEEDED: 'deadline',
 };
+export const SELLER_CARD_COMPARISON_CAPABILITY = 'wb_seller_card_comparison@1';
+export const SELLER_LIST_ORGS_CAPABILITY = 'wb_seller_list_orgs@1';
+export const COMPARISON_STAGES = ['list_orgs', 'compare', 'create_xlsx', 'poll_xlsx', 'download_xlsx'];
+export const COMPARISON_PERIODS = ['today', 'week', 'month', 'quarter'];
+export const MAX_COMPARISON_PERIOD_DAYS = 90;
+export const MILLISECONDS_PER_DAY = 86_400_000;
+const COMPARISON_CALENDAR_MODES = ['calendar', 'buttons', 'unknown'];
+export const parseComparisonDates = (value) => {
+    if (!isRecord(value) || !hasExactOwnKeys(value, ['dateFrom', 'dateTo']))
+        return;
+    const { dateFrom, dateTo } = value;
+    if (isCanonicalIsoDay(dateFrom) &&
+        isCanonicalIsoDay(dateTo) &&
+        dateFrom <= dateTo &&
+        Date.parse(dateTo) - Date.parse(dateFrom) < MAX_COMPARISON_PERIOD_DAYS * MILLISECONDS_PER_DAY) {
+        return { dateFrom, dateTo };
+    }
+};
+export const parseComparisonPeriod = (value) => isOneOf(COMPARISON_PERIODS, value) ? value : parseComparisonDates(value);
+export const parseComparisonDateBasis = (value) => {
+    if (isRecord(value) &&
+        hasExactOwnKeys(value, ['localToday', 'mode']) &&
+        isCanonicalIsoDay(value.localToday) &&
+        isOneOf(COMPARISON_CALENDAR_MODES, value.mode)) {
+        return { localToday: value.localToday, mode: value.mode };
+    }
+};
+export const parseComparisonArticles = (value) => {
+    if (!isUnknownArray(value) || value.length < 2 || value.length > 5)
+        return;
+    const articles = Array.from(value);
+    if (articles.every(isPositiveSafeInteger) && new Set(articles).size === articles.length)
+        return articles;
+};
+export const COMPARISON_CREATE_OUTCOMES = ['not_sent', 'confirmed', 'rejected', 'unknown'];
+export const COMPARISON_FILE_STATUSES = ['missing', 'WAITING', 'PROCESSING', 'RETRY', 'SUCCESS', 'FAILED'];
+export const COMPARISON_ARCHIVE_MIME_TYPE = 'application/zip';
+export const COMPARISON_LOCAL_MINUTE_PATTERN = '^\\d{4}-\\d{2}-\\d{2}T(?:[01]\\d|2[0-3]):[0-5]\\d[+-](?:[01]\\d|2[0-3]):[0-5]\\d$';
+export const COMPARISON_FAILURE_CODE = 'SELLER_CARD_COMPARISON_FAILED';
+export const COMPARISON_STREAM_DEADLINE = {
+    stage: 'download_xlsx',
+    code: 'SELLER_OPERATION_FAILED',
+    reason: 'stream_deadline_expired',
+};
+export const COMPARISON_FAILURE_REASONS = [
+    'access_denied',
+    'access_unknown',
+    'period_out_of_range',
+    'period_unavailable',
+    'cards_unavailable',
+    'new_comparison_required',
+    'history_charge_required',
+    'comparison_limit',
+    'export_limit',
+    'rate_limited',
+    'wb_refused',
+    'outcome_unknown',
+    'report_failed',
+    'response_invalid',
+    'download_refused',
+];
+const parseComparisonLimits = (value) => {
+    if (!isRecord(value) ||
+        !hasOwnKeys(value, ['availableComparisons']) ||
+        !hasOnlyOwnKeys(value, ['availableComparisons', 'remainingInPeriod']) ||
+        !isNonNegativeSafeInteger(value.availableComparisons))
+        return;
+    const { availableComparisons, remainingInPeriod } = value;
+    if (!Object.hasOwn(value, 'remainingInPeriod'))
+        return { availableComparisons };
+    if (isNonNegativeSafeInteger(remainingInPeriod))
+        return { availableComparisons, remainingInPeriod };
+};
+/** The comparison-only failure evidence carried by wb_fetch_result.response. */
+export const parseComparisonFailure = (value) => {
+    if (!isRecord(value) || !hasOwnKeys(value, ['code', 'reason', 'stage', 'createOutcome', 'orderOutcome']))
+        return;
+    const { code, reason, stage, createOutcome, orderOutcome } = value;
+    if (code === COMPARISON_FAILURE_CODE &&
+        isOneOf(COMPARISON_FAILURE_REASONS, reason) &&
+        isOneOf(COMPARISON_STAGES, stage) &&
+        isOneOf(COMPARISON_CREATE_OUTCOMES, createOutcome) &&
+        isOneOf(COMPARISON_CREATE_OUTCOMES, orderOutcome)) {
+        const hasLimits = Object.hasOwn(value, 'comparisonLimits');
+        const beforeCompareWrite = stage === 'compare' && createOutcome === 'not_sent' && orderOutcome === 'not_sent';
+        if (!beforeCompareWrite && (hasLimits || reason === 'history_charge_required'))
+            return;
+        const periodRefused = reason === 'period_out_of_range' || reason === 'period_unavailable';
+        const hasBasis = Object.hasOwn(value, 'periodBasis');
+        const hasDates = Object.hasOwn(value, 'dates');
+        if (!hasBasis &&
+            (hasDates || Object.hasOwn(value, 'nmIds') || periodRefused || (stage === 'compare' && createOutcome === 'confirmed')))
+            return;
+        const periodBasis = hasBasis ? parseComparisonDateBasis(value.periodBasis) : undefined;
+        const nmIds = hasBasis ? parseComparisonArticles(value.nmIds) : undefined;
+        const dates = hasDates ? parseComparisonDates(value.dates) : undefined;
+        if (hasBasis &&
+            (!periodBasis ||
+                !nmIds ||
+                !hasOwnKeys(value, ['org', 'nmIds']) ||
+                stage !== 'compare' ||
+                orderOutcome !== 'not_sent' ||
+                (hasDates
+                    ? !dates || periodRefused || beforeCompareWrite
+                    : !beforeCompareWrite || (!periodRefused && reason !== 'access_unknown'))))
+            return;
+        const hasStatus = Object.hasOwn(value, 'httpStatus');
+        const httpStatus = hasStatus ? value.httpStatus : undefined;
+        if (hasStatus && !isHttpStatus(httpStatus))
+            return;
+        const failure = {
+            code,
+            reason,
+            stage,
+            createOutcome,
+            orderOutcome,
+            ...(periodBasis && nmIds ? { periodBasis, nmIds } : {}),
+            ...(dates ? { dates } : {}),
+            ...(typeof httpStatus === 'number' ? { httpStatus } : {}),
+        };
+        if (!hasLimits)
+            return failure;
+        if (reason !== 'new_comparison_required' && reason !== 'history_charge_required' && reason !== 'comparison_limit')
+            return;
+        const comparisonLimits = parseComparisonLimits(value.comparisonLimits);
+        if (comparisonLimits)
+            return { ...failure, comparisonLimits };
+    }
+};
 export const EXTENSION_CAPABILITIES = [
     'wb_fetch',
     'browser_job',
     'seller_reviews',
+    SELLER_LIST_ORGS_CAPABILITY,
+    SELLER_CARD_COMPARISON_CAPABILITY,
     'wb_filters_by_query@1',
     DIAGNOSTIC_SNAPSHOT_CAPABILITY,
     DIAGNOSTIC_SNAPSHOT_V2_CAPABILITY,
@@ -187,6 +318,7 @@ export const UNCLASSIFIED_FETCH_ERROR_CODE = 'WB_FETCH_FAILED';
 export const WB_FETCH_TIMEOUT_PHASES = ['no_tab', 'tab_loading', 'reload_backoff', 'reload_failed', 'not_sent', 'sent_no_answer'];
 export const SELLER_FAILURE_REASONS = {
     SELLER_STATE_UNAVAILABLE: ['probe_cooling_down', 'restore_unresolved', 'storage_failed'],
+    ENTITY_SELECTION_REQUIRED: ['multiple_seller_documents', 'comparison_orphan'],
     SELLER_AUTH_UNAVAILABLE: ['access_token_missing', 'seller_token_missing', 'both_missing', 'header_too_long', 'reader_failed'],
 };
 export const SELLER_FAILURE_CLASSES = ['network', 'status', 'envelope', 'script'];

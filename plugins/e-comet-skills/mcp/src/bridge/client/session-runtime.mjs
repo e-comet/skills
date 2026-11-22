@@ -5,6 +5,7 @@
 import { createTransportEvents } from '../broker/events.mjs';
 import { bridgeFrameRefusal, extensionDisconnectedError } from '../broker/messages.mjs';
 import { chooseBridgeCause, chosenBrowser, shouldWaitForBroker } from '../cause.mjs';
+import { isRequestNotSent } from '../../shared/coded-error.mjs';
 import { isOneOf, isRecord } from '../../shared/values.mjs';
 import { bridgeOwner } from '../../transport/diagnostics/bridge-codes.mjs';
 import { EXTENSION_INSTALL_VOCABULARY } from '../../transport/diagnostics/facts.mjs';
@@ -345,6 +346,12 @@ export function createBridgeClientRuntime({ brokerClient, registration, extensio
             // docs/architecture/residuals/native-bridge.md.
             return connections.extensionReady ? { ok: true } : { ok: false, ...cause() };
         },
+        sellerCardComparisonSupported() {
+            return connections.extensionReady ? connections.extensionSellerCardComparisonReady : undefined;
+        },
+        sellerListOrgsSupported() {
+            return connections.extensionReady ? connections.extensionSellerListOrgsReady : undefined;
+        },
         sendExtension(message) {
             const session = connections.extensionSession;
             if (!session)
@@ -353,7 +360,7 @@ export function createBridgeClientRuntime({ brokerClient, registration, extensio
                 session.send(message);
             }
             catch (error) {
-                if (errorCode(error) === 'FRAME_TOO_LARGE')
+                if (isRequestNotSent(error) && errorCode(error) === 'FRAME_TOO_LARGE')
                     throw bridgeFrameRefusal('FRAME_TOO_LARGE');
                 throw error;
             }

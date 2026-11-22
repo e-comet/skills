@@ -1,4 +1,5 @@
-import { isRecord as isObject } from '../../shared/values.mjs';
+import { isOneOf, isRecord as isObject } from '../../shared/values.mjs';
+import { COMPARISON_FAILURE_CODE, COMPARISON_FAILURE_REASONS } from '../extension/wire.mjs';
 import { FAILURE_DETAIL_VALUES } from '../failures/vocabulary.mjs';
 import { MAX_BROWSER_JOB_TOKEN_BYTES, MAX_MCP_MESSAGE_BYTES } from './limits.mjs';
 import { array, boolean, described, nonNegativeInteger, object, objectUnion, positiveInteger, string } from './schema.mjs';
@@ -210,7 +211,8 @@ export const closedOutcomeFields = (value) => {
         stage: closedField(value.stage, OUTCOME_LOWER) ?? closedField(error?.stage, OUTCOME_LOWER),
         // The native DeepSeek adapter classifies a failed call (network, timeout, http_4xx, http_5xx, protocol, unknown).
         cause: closedField(value.cause, OUTCOME_CAUSE) ?? closedField(error?.cause, OUTCOME_CAUSE),
-        reason: causeOf(details) ??
+        reason: (value.code === COMPARISON_FAILURE_CODE && isOneOf(COMPARISON_FAILURE_REASONS, value.reason) ? value.reason : undefined) ??
+            causeOf(details) ??
             closedField(isObject(details?.browserJobRejection) ? details.browserJobRejection.reason : undefined, OUTCOME_CAUSE) ??
             causeOf(isObject(item?.details) ? item.details : item),
         bridgeCode: closedField(details?.bridgeCode, OUTCOME_CODE),

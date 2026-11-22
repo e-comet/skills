@@ -17,11 +17,19 @@ export const hasExactOwnKeys = (value, expected) => {
 export const hasOwnKeys = (value, expected) => expected.every((key) => Object.hasOwn(value, key));
 export const isBoundedText = (value, maxLength) => typeof value === 'string' && value.length > 0 && value.length <= maxLength;
 export const isNonNegativeSafeInteger = (value) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+export const isHttpStatus = (value) => isNonNegativeSafeInteger(value) && value >= 100 && value <= 599;
 export const isPositiveSafeInteger = (value) => typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 // One of `values`, compared with SameValueZero as Array.prototype.includes does.
 export const isOneOf = (values, value) => values.includes(value);
 // Every own key is one of `allowed`; an allowed key may be absent.
 export const hasOnlyOwnKeys = (value, allowed) => Object.keys(value).every((key) => allowed.includes(key));
+// A real calendar day in YYYY-MM-DD form.
+export const isCanonicalIsoDay = (value) => {
+    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value))
+        return false;
+    const time = Date.parse(value);
+    return Number.isFinite(time) && new Date(time).toISOString().slice(0, 10) === value;
+};
 // A canonical 24-character UTC timestamp, the only time form every report consumer accepts.
 export const isCanonicalTimestamp = (value) => {
     if (typeof value !== 'string' || value.length !== 24 || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value))

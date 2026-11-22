@@ -9,6 +9,8 @@ import { createAuthorization } from '../ozon-seller/out/extension/authorization.
 import { isRecord } from '../shared/values.mjs';
 import { validateAuthorizedJobLimits as validateBuyerJobLimits } from '../wb-client/application/job-limits.mjs';
 import { BUYER_JOB_TYPES } from '../wb-client/domain/constants/descriptors.const.mjs';
+import { validateCardComparisonGrant } from '../wb-seller/application/card-comparison-job-limits.mjs';
+import { validateListOrgsGrant } from '../wb-seller/application/list-orgs-job-limits.mjs';
 import { validateAuthorizedJobLimits as validateSellerJobLimits } from '../wb-seller/application/job-limits.mjs';
 // The buyer, filters and seller descriptor checks an Ozon job reads for a foreign signed job (ozon-seller's foreign-jobs
 // port): each context checks its own job types.
@@ -21,6 +23,14 @@ export const foreignJobs = {
         }
         if (jobType === 'seller_reviews') {
             validateSellerJobLimits(authorization);
+            return true;
+        }
+        if (jobType === 'seller_card_comparison') {
+            validateCardComparisonGrant(authorization);
+            return true;
+        }
+        if (jobType === 'seller_list_orgs') {
+            validateListOrgsGrant(authorization);
             return true;
         }
         return false;

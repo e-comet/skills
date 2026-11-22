@@ -1,13 +1,18 @@
 import { REQUEST_TIMEOUT_GRACE_MS } from '../../../bridge/limits.mjs';
-import { ToolExecutionError } from '../../../shared/coded-error.mjs';
+import { markRequestNotSent, ToolExecutionError } from '../../../shared/coded-error.mjs';
 import { validTimeout } from '../../../shared/timeouts.mjs';
-import { fieldOf, isNonNegativeSafeInteger } from '../../../shared/values.mjs';
+import { fieldOf, isNonNegativeSafeInteger, isOneOf } from '../../../shared/values.mjs';
 import { ARTIFACT_MAX_FILE_BYTES } from '../../../storage/limits.mjs';
-import { SELLER_OPERATION_STAGES } from '../../../transport/extension/wire.mjs';
+import { COMPARISON_ARCHIVE_MIME_TYPE, COMPARISON_STAGES, SELLER_OPERATION_STAGES, } from '../../../transport/extension/wire.mjs';
 import { MAX_SELLER_REVIEW_PHYSICAL_REPORTS } from '../../domain/constants/limits.const.mjs';
-import { isValidSellerOperation, isValidSellerStreamEnd } from './validators.mjs';
+import { isValidComparisonOperation, isValidSellerOperation, isValidSellerListOrgsOperation, isValidSellerStreamEnd, parseComparisonResponse, SELLER_XLSX_MIME_TYPE, } from './validators.mjs';
 // The correlation type of a seller operation; its frames are routed and delivered by the request broker under it.
 export const SELLER_OPERATION = 'seller_operation';
+export const pendingComparisonStage = (correlation, id) => {
+    const stage = fieldOf(correlation.stateOf(id), 'comparisonStage');
+    return isOneOf(COMPARISON_STAGES, stage) ? stage : undefined;
+};
+const comparisonStreamDone = { stage: 'download_xlsx' };
 /**
  * The Seller state machine over the correlation broker (refactor spec §7.4): one typed seller operation per request,
  * checked against the lease's active scope, its authorization and the attested job type before it is sent; a download
@@ -64,6 +69,8 @@ export const createSellerOperations = ({ correlation, maxPending = MAX_SELLER_RE
         // instead of being reported as an out-of-order frame.
         const declaredSize = fieldOf(metadata, 'declaredSize');
         const mimeType = fieldOf(metadata, 'mimeType');
+        if (pending.streamMimeType === undefined || mimeType !== pending.streamMimeType)
+            return rejectInvalidSellerStream(requestId, pending, 'Seller stream format does not match the requested operation.');
         if (declaredSize !== undefined && (!isNonNegativeSafeInteger(declaredSize) || declaredSize > ARTIFACT_MAX_FILE_BYTES)) {
             return rejectInvalidSellerStream(requestId, pending, 'Seller stream declared an unusable artifact size.');
         }
@@ -98,12 +105,13 @@ export const createSellerOperations = ({ correlation, maxPending = MAX_SELLER_RE
             return rejectInvalidSellerStream(requestId, pending);
         }
         pending.state = 'ending';
-        return enqueueSellerHandler(requestId, pending, pending.streamHandlers.onEnd, [metadata], () => settleSellerOperation(requestId, pending, (value) => pending.resolve(value), metadata));
+        return enqueueSellerHandler(requestId, pending, pending.streamHandlers.onEnd, [metadata], () => settleSellerOperation(requestId, pending, pending.resolve, pending.comparisonStage ? comparisonStreamDone : metadata));
     };
     // Every frame of one seller operation, by its id.
     const sellerFrame = (requestId, pending, { type, payload }) => {
         if (type === 'result') {
-            if (pending.state !== 'awaiting-result')
+            const interruptedComparisonStream = pending.comparisonStage === 'download_xlsx' && pending.state === 'streaming';
+            if (pending.state !== 'awaiting-result' && !interruptedComparisonStream)
                 return reportUnsettled('seller-result', requestId);
             settleSellerOperation(requestId, pending, (value) => pending.resolve(value), payload);
             return true;
@@ -118,9 +126,9 @@ export const createSellerOperations = ({ correlation, maxPending = MAX_SELLER_RE
             return appendSellerStreamChunk(requestId, pending, fieldOf(payload, 'index'), fieldOf(payload, 'data'));
         return endSellerStream(requestId, pending, payload);
     };
-    // One typed seller operation under `lease`: the lease's scope must be active, its authorization the scope's and its
-    // attested job type seller_reviews (spec §7.4 lease binding); a download needs its three stream handlers.
+    // The operation, active scope and lease must all belong to the same seller job family.
     const run = (operation, streamHandlers, timeout, lease) => {
+        const rejectBeforeSend = (error) => Promise.reject(markRequestNotSent(error));
         const authorizationId = lease?.id;
         // Scopes are kept by string ids, so any other value names no scope.
         const authorizationScopeId = typeof lease?.scopeId === 'string' ? lease.scopeId : undefined;
@@ -128,25 +136,29 @@ export const createSellerOperations = ({ correlation, maxPending = MAX_SELLER_RE
         if (authorizationScopeId === undefined ||
             !authorizationScope ||
             !correlation.scopeIsActive(authorizationScopeId, authorizationScope)) {
-            return Promise.reject(correlation.scopeEnded(authorizationScopeId));
+            return rejectBeforeSend(correlation.scopeEnded(authorizationScopeId));
         }
+        const comparison = isValidComparisonOperation(operation) ? operation : undefined;
+        const listOrgs = isValidSellerListOrgsOperation(operation);
+        const jobType = comparison ? 'seller_card_comparison' : listOrgs ? 'seller_list_orgs' : 'seller_reviews';
         if (authorizationScope.authorizationId !== authorizationId ||
-            lease?.jobType !== 'seller_reviews' ||
-            !isValidSellerOperation(operation)) {
-            return Promise.reject(new ToolExecutionError('SELLER_OPERATION_NOT_ALLOWED', 'Only a valid typed seller operation may be requested through its signed authorization scope.', 'arguments', false));
+            authorizationScope.jobType !== jobType ||
+            lease?.jobType !== jobType ||
+            (!comparison && !listOrgs && !isValidSellerOperation(operation))) {
+            return rejectBeforeSend(new ToolExecutionError('SELLER_OPERATION_NOT_ALLOWED', 'Only a valid typed seller operation may be requested through its signed authorization scope.', 'arguments', false));
         }
-        const requiresStreamHandlers = operation.stage === SELLER_OPERATION_STAGES.download;
+        const requiresStreamHandlers = ('stage' in operation && operation.stage === SELLER_OPERATION_STAGES.download) || comparison?.stage === 'download_xlsx';
         if (requiresStreamHandlers && !streamHandlers) {
-            return Promise.reject(new TypeError('Seller stream handlers must provide onStart, onChunk, and onEnd functions.'));
+            return rejectBeforeSend(new TypeError('Seller stream handlers must provide onStart, onChunk, and onEnd functions.'));
         }
         const normalizedStreamHandlers = requiresStreamHandlers && streamHandlers
             ? streamHandlers
             : { onStart: () => undefined, onChunk: () => undefined, onEnd: () => undefined };
         if (timeout === undefined || !validTimeout(timeout)) {
-            return Promise.reject(new ToolExecutionError('SELLER_OPERATION_TIMEOUT_INVALID', 'Seller operation timeout is outside the allowed bounds.', 'arguments', false));
+            return rejectBeforeSend(new ToolExecutionError('SELLER_OPERATION_TIMEOUT_INVALID', 'Seller operation timeout is outside the allowed bounds.', 'arguments', false));
         }
         if (correlation.count(SELLER_OPERATION) >= maxPending) {
-            return Promise.reject(new ToolExecutionError('SELLER_OPERATION_CAPACITY_EXCEEDED', 'Too many seller operations are pending.', 'local', true));
+            return rejectBeforeSend(new ToolExecutionError('SELLER_OPERATION_CAPACITY_EXCEEDED', 'Too many seller operations are pending.', 'local', true));
         }
         // The operation's own record, which its frames find; the request's settlement joins it once the request opens.
         const pending = {
@@ -158,6 +170,8 @@ export const createSellerOperations = ({ correlation, maxPending = MAX_SELLER_RE
             declaredStreamBytes: null,
             maxStreamBytes: ARTIFACT_MAX_FILE_BYTES,
             streamHandlers: normalizedStreamHandlers,
+            comparisonStage: listOrgs ? 'list_orgs' : comparison?.stage,
+            streamMimeType: requiresStreamHandlers ? (comparison ? COMPARISON_ARCHIVE_MIME_TYPE : SELLER_XLSX_MIME_TYPE) : undefined,
             handlerChain: Promise.resolve(),
             authorizationScopeId,
         };
@@ -177,5 +191,19 @@ export const createSellerOperations = ({ correlation, maxPending = MAX_SELLER_RE
             onSendError: (error, control) => settleSellerOperation(control.id, pending, (reason) => control.reject(reason), error),
         }).result;
     };
-    return { run };
+    return {
+        run,
+        async runComparison(operation, handlers, timeout, lease) {
+            const response = await run(operation, handlers, timeout, lease);
+            const result = response === comparisonStreamDone ? comparisonStreamDone : parseComparisonResponse(response, operation.stage);
+            if (result?.stage !== 'list_orgs')
+                return result;
+        },
+        async listOrgs(timeout, lease) {
+            const response = await run({ kind: 'list_orgs' }, undefined, timeout, lease);
+            const result = parseComparisonResponse(response, 'list_orgs');
+            if (result?.stage === 'list_orgs')
+                return result;
+        },
+    };
 };

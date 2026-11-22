@@ -89,3 +89,19 @@ For feedback sending or feedback-specific recovery, call `describe_e_comet_tool(
 4. Read [DIAGNOSTICS.md](../../mcp/DIAGNOSTICS.md) for exact field and enum meanings and [TROUBLESHOOTING.md](../../mcp/TROUBLESHOOTING.md) for the typed-result cases. After the host is observed, read only [Codex](references/codex.md) or [Claude](references/claude.md).
 
 `BROWSER_JOB_HANDOFF_REQUIRED`, or the Ozon message about the hook not providing authorization, is the symptom that the hooks did not provide the authorization: on an observed Codex host run `hook_permissions` before anything else, never repeat `browser_job`, and read the DIAGNOSTICS.md section Missing authorization handoff. A successful Codex `hook_permissions` result is a configuration snapshot for the checked installation context, not proof that a hook ran in this task. `ready` means all expected native handlers are enabled and trusted. `disabled` means at least one trusted handler is off. `review_required` means at least one handler is new or changed and awaits review. Name the affected safe handler roles. A `not_checked` result with `facts.context:"configuration_probe"` means the bounded inspector failed before a hook inventory was available; use its closed `failure.reason` and `failure.phase` as probe evidence, and do not describe hooks as missing, disabled, or untrusted. For observed ChatGPT Desktop with Codex, direct the user to Settings → Plugins → Personal → e-Comet MCP Tools → Hooks only when a snapshot observed a disabled or review-required handler, and ask to enable and trust all e-Comet handlers in one pass, not only the affected ones: these are the e-Comet plugin's own handlers, and Codex asks to trust them again after the plugin is installed or updated (the README step is Trust all). For observed Codex CLI, use `/hooks` for the corresponding observed action with the same explanation. Do not expose paths, commands, hashes, or raw inspector errors. Do not use a local Codex snapshot to explain Claude Code or Cowork. Missing native hook context is unavailable evidence; missing Cowork cloud context is not device evidence.
+
+For `wb_seller_card_comparison`, use the [comparison diagnostics](../../mcp/DIAGNOSTICS.md#wb-seller-card-comparison).
+For `wb_seller_list_orgs`, use the [company catalog diagnostics](../../mcp/DIAGNOSTICS.md#wb-seller-company-catalog).
+For `SELLER_PORT_UNAVAILABLE` or `ENTITY_CATALOG_UNAVAILABLE` on either tool, ask the seller to open
+`seller.wildberries.ru` in the connected browser profile or refresh the open tab. Wait for the cabinet and company menu
+to load. For `SELLER_CONTEXT_CHANGED`, the selected cabinet changed or its tab became unavailable. If the tab was
+closed, ask the seller to reopen it in the connected profile. Check the active company with the seller and confirm
+which cabinet they want to use. Ask before requesting another `browser_job`.
+`multiple_seller_documents` means leave one Wildberries Seller tab in the connected profile and wait until it loads.
+For a comparison with `comparison_orphan`, use one ready Seller tab. Ask the seller to choose before authorizing with
+explicit `org`, or ask them to select a different company manually in the cabinet.
+For `period_out_of_range`, show `periodWindow`. For `period_unavailable`, offer the today, week, month and quarter
+buttons or their exact dates. If calendar access is unconfirmed, ask the seller to check the periods in their WB Seller cabinet.
+If a write may have happened, preserve the full article set, company, dates, requested `sizeDetails` and pinned file status. Use the existing workbook
+link or the same WB file in «Загрузки». Use company history if only the comparison may have been created. A new order
+needs the seller's specific decision. Continue a running job with its existing `runId`.

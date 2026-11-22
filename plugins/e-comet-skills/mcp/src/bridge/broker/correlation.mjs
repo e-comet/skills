@@ -209,8 +209,12 @@ export function createCorrelationBroker({ send, limits = CORRELATION_LIMITS, now
                 entry.control.reject(scopeEnded(scopeId));
             }
         }
-        if (notifyRoute && scope.releaseRoute !== undefined)
-            await scope.releaseRoute(scope.authorizationId);
+        const releaseRoute = scope.releaseRoute;
+        if (notifyRoute && releaseRoute !== undefined) {
+            // The lease can still join this acknowledgement after expiry removes its active scope.
+            scope.releaseAcknowledgement = (async () => releaseRoute(scope.authorizationId))();
+            await scope.releaseAcknowledgement;
+        }
         return true;
     };
     const releaseScopeInBackground = (scopeId, notifyRoute) => {
@@ -295,6 +299,10 @@ export function createCorrelationBroker({ send, limits = CORRELATION_LIMITS, now
                     authorization,
                     isActive: () => scopeIsActive(scopeId, scope),
                     release: () => releaseScope(scopeId, true, 'released'),
+                    releaseAndWait: async () => {
+                        await releaseScope(scopeId, true, 'released');
+                        return (await scope.releaseAcknowledgement) === true;
+                    },
                 };
             },
         }).result;
